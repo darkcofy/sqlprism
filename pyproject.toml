@@ -33,6 +33,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/darkcofy/sqlprism"
+Documentation = "https://darkcofy.github.io/sqlprism/"
 Repository = "https://github.com/darkcofy/sqlprism"
 Issues = "https://github.com/darkcofy/sqlprism/issues"
 
