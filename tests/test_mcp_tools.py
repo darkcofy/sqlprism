@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 
+import sqlprism.core.mcp_tools as _mcp_mod
 from sqlprism.core.mcp_tools import (
     FindColumnUsageInput,
     FindReferencesInput,
@@ -23,6 +24,14 @@ from sqlprism.core.mcp_tools import (
     trace_column_lineage,
     trace_dependencies,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_mcp_state():
+    """Reset global MCP state between tests to prevent leakage."""
+    _mcp_mod._state = None
+    yield
+    _mcp_mod._state = None
 
 # ── 5.1: Pydantic validation and field aliases ──
 
