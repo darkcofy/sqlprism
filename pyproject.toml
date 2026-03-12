@@ -53,8 +53,8 @@ select = ["E", "F", "I", "N", "W", "UP"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest-asyncio>=0.24.0",
     "pytest>=8.0.0",
     "pytest-cov>=6.0.0",
