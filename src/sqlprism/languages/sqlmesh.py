@@ -156,7 +156,8 @@ class SqlMeshRenderer:
         """Run the inline render script via subprocess. Returns ({model_name: sql}, errors)."""
         _validate_command(sqlmesh_command, allowed_keywords={"python", "sqlmesh", "uv"})
         cmd = shlex.split(sqlmesh_command) + [
-            "-c", _RENDER_SCRIPT,
+            "-c",
+            _RENDER_SCRIPT,
             str(project_path),
             dialect,
             gateway,
@@ -173,9 +174,7 @@ class SqlMeshRenderer:
         )
 
         if result.returncode != 0:
-            raise RuntimeError(
-                f"sqlmesh render failed (exit {result.returncode}):\n{result.stderr}"
-            )
+            raise RuntimeError(f"sqlmesh render failed (exit {result.returncode}):\n{result.stderr}")
 
         output = json.loads(result.stdout)
         return output.get("rendered", {}), output.get("errors", [])
@@ -190,9 +189,7 @@ def _validate_command(command: str, allowed_keywords: set[str]) -> None:
     # Reject shell metacharacters
     dangerous_chars = set(";|&`$(){}!")
     if dangerous_chars & set(command):
-        raise ValueError(
-            f"Command contains disallowed shell characters: {command!r}"
-        )
+        raise ValueError(f"Command contains disallowed shell characters: {command!r}")
 
     parts = shlex.split(command)
     if not parts:
@@ -202,8 +199,5 @@ def _validate_command(command: str, allowed_keywords: set[str]) -> None:
     base = parts[0].rsplit("/", 1)[-1]  # strip path prefix
     if base not in allowed_keywords:
         raise ValueError(
-            f"Command {parts[0]!r} not in allowlist. "
-            f"Base command must be one of: {', '.join(sorted(allowed_keywords))}"
+            f"Command {parts[0]!r} not in allowlist. Base command must be one of: {', '.join(sorted(allowed_keywords))}"
         )
-
-

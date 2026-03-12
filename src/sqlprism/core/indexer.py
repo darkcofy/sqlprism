@@ -1,4 +1,3 @@
-
 """Indexer orchestrator.
 
 The only component that connects parsers to storage. It:
@@ -17,12 +16,12 @@ import subprocess
 from collections import OrderedDict
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
 from sqlprism.core.graph import GraphDB
 from sqlprism.languages import SQL_EXTENSIONS, is_sql_file
 from sqlprism.languages.sql import SqlParser
 from sqlprism.types import ParseResult
+
+logger = logging.getLogger(__name__)
 
 
 class Indexer:
@@ -57,6 +56,7 @@ class Indexer:
     def get_sqlmesh_renderer(self, dialect: str | None = None):
         """Get or create a SqlMeshRenderer with the correct dialect parser."""
         from sqlprism.languages.sqlmesh import SqlMeshRenderer
+
         if self._sqlmesh_renderer is None or (dialect and self._sqlmesh_renderer.sql_parser.dialect != dialect):
             self._sqlmesh_renderer = SqlMeshRenderer(sql_parser=self.get_parser(dialect))
         return self._sqlmesh_renderer
@@ -65,6 +65,7 @@ class Indexer:
     def dbt_renderer(self):
         if self._dbt_renderer is None:
             from sqlprism.languages.dbt import DbtRenderer
+
             self._dbt_renderer = DbtRenderer(sql_parser=self.get_parser())
         return self._dbt_renderer
 
@@ -116,10 +117,18 @@ class Indexer:
         deleted = [p for p in stored_checksums if p not in current_files]
 
         # Parse and insert changed/added files
-        stats = {"files_scanned": len(current_files), "files_added": len(added),
-                 "files_changed": len(changed), "files_removed": len(deleted),
-                 "nodes_added": 0, "edges_added": 0, "column_usage_added": 0,
-                 "lineage_chains": 0, "column_usage_dropped": 0, "parse_errors": []}
+        stats = {
+            "files_scanned": len(current_files),
+            "files_added": len(added),
+            "files_changed": len(changed),
+            "files_removed": len(deleted),
+            "nodes_added": 0,
+            "edges_added": 0,
+            "column_usage_added": 0,
+            "lineage_chains": 0,
+            "column_usage_dropped": 0,
+            "parse_errors": [],
+        }
 
         # Delete truly removed files in a transaction
         if deleted:
@@ -331,8 +340,12 @@ class Indexer:
         if result.nodes:
             node_rows = [
                 (
-                    file_id, node.kind, node.name, result.language,
-                    node.line_start, node.line_end,
+                    file_id,
+                    node.kind,
+                    node.name,
+                    result.language,
+                    node.line_start,
+                    node.line_end,
                     json.dumps(node.metadata) if node.metadata else None,
                     (node.metadata or {}).get("schema") if node.metadata else None,
                 )
@@ -349,17 +362,28 @@ class Indexer:
             edge_rows = []
             for edge in result.edges:
                 source_id = self._resolve_edge_endpoint(
-                    edge.source_name, edge.source_kind, node_id_map, repo_id,
+                    edge.source_name,
+                    edge.source_kind,
+                    node_id_map,
+                    repo_id,
                     schema=(edge.metadata or {}).get("source_schema") if edge.metadata else None,
                 )
                 target_id = self._resolve_edge_endpoint(
-                    edge.target_name, edge.target_kind, node_id_map, repo_id,
+                    edge.target_name,
+                    edge.target_kind,
+                    node_id_map,
+                    repo_id,
                     schema=(edge.metadata or {}).get("target_schema") if edge.metadata else None,
                 )
-                edge_rows.append((
-                    source_id, target_id, edge.relationship, edge.context,
-                    json.dumps(edge.metadata) if edge.metadata else None,
-                ))
+                edge_rows.append(
+                    (
+                        source_id,
+                        target_id,
+                        edge.relationship,
+                        edge.context,
+                        json.dumps(edge.metadata) if edge.metadata else None,
+                    )
+                )
             self.graph.insert_edges_batch(edge_rows)
             stats["edges_added"] += len(edge_rows)
 
@@ -378,15 +402,25 @@ class Indexer:
                 if not cu_node_id:
                     cu_node_id = self.graph.resolve_node(cu.node_name, cu.node_kind, repo_id)
                 if cu_node_id:
-                    cu_rows.append((
-                        cu_node_id, cu.table_name, cu.column_name,
-                        cu.usage_type, file_id, cu.alias, cu.transform,
-                    ))
+                    cu_rows.append(
+                        (
+                            cu_node_id,
+                            cu.table_name,
+                            cu.column_name,
+                            cu.usage_type,
+                            file_id,
+                            cu.alias,
+                            cu.transform,
+                        )
+                    )
                 else:
                     stats["column_usage_dropped"] = stats.get("column_usage_dropped", 0) + 1
                     logger.warning(
                         "Dropped column_usage: node %s/%s not found (table=%s col=%s)",
-                        cu.node_name, cu.node_kind, cu.table_name, cu.column_name,
+                        cu.node_name,
+                        cu.node_kind,
+                        cu.table_name,
+                        cu.column_name,
                     )
             if cu_rows:
                 self.graph.insert_column_usage_batch(cu_rows)
@@ -402,10 +436,18 @@ class Indexer:
                 chain_idx = chain_counters.get(key, 0)
                 chain_counters[key] = chain_idx + 1
                 for i, hop in enumerate(cl.chain):
-                    lineage_rows.append((
-                        file_id, cl.output_node, cl.output_column,
-                        chain_idx, i, hop.column, hop.table, hop.expression,
-                    ))
+                    lineage_rows.append(
+                        (
+                            file_id,
+                            cl.output_node,
+                            cl.output_column,
+                            chain_idx,
+                            i,
+                            hop.column,
+                            hop.table,
+                            hop.expression,
+                        )
+                    )
                 stats["lineage_chains"] += 1
             if lineage_rows:
                 self.graph.insert_column_lineage_batch(lineage_rows)
@@ -450,8 +492,10 @@ class Indexer:
                 continue
             # Skip common non-source directories
             parts = file_path.relative_to(repo_path).parts
-            if any(p.startswith(".") or p in ("node_modules", "__pycache__", "venv", ".venv",
-                                               "target", "build") for p in parts):
+            if any(
+                p.startswith(".") or p in ("node_modules", "__pycache__", "venv", ".venv", "target", "build")
+                for p in parts
+            ):
                 continue
 
             rel_path = str(file_path.relative_to(repo_path))
@@ -489,11 +533,17 @@ class Indexer:
         try:
             commit = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
-                cwd=repo_path, capture_output=True, text=True, timeout=5,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             branch = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=repo_path, capture_output=True, text=True, timeout=5,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             return (
                 commit.stdout.strip() if commit.returncode == 0 else None,
@@ -502,7 +552,13 @@ class Indexer:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return None, None
 
-    def parse_file(self, file_path: str, content: str, dialect: str | None = None, schema: dict | None = None) -> ParseResult:
+    def parse_file(
+        self,
+        file_path: str,
+        content: str,
+        dialect: str | None = None,
+        schema: dict | None = None,
+    ) -> ParseResult:
         """Parse a single SQL file without writing to the database.
 
         Args:
@@ -520,7 +576,11 @@ class Indexer:
         return self.get_parser(dialect).parse(file_path, content, schema=schema)
 
     def parse_file_at_commit(
-        self, repo_path: Path, file_path: str, commit: str, dialect: str | None = None,
+        self,
+        repo_path: Path,
+        file_path: str,
+        commit: str,
+        dialect: str | None = None,
     ) -> ParseResult | None:
         """Parse a file at a specific git commit.
 
@@ -542,7 +602,10 @@ class Indexer:
         try:
             result = subprocess.run(
                 ["git", "show", f"{commit}:{file_path}"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if result.returncode != 0:
                 return None
@@ -565,14 +628,14 @@ class Indexer:
         try:
             result = subprocess.run(
                 ["git", "diff", "--name-only", f"{base_commit}..HEAD"],
-                cwd=repo_path, capture_output=True, text=True, timeout=10,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if result.returncode != 0:
                 return []
-            return [
-                f.strip() for f in result.stdout.strip().split("\n")
-                if f.strip() and is_sql_file(f.strip())
-            ]
+            return [f.strip() for f in result.stdout.strip().split("\n") if f.strip() and is_sql_file(f.strip())]
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return []
 

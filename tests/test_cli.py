@@ -1,7 +1,6 @@
 """Tests for the CLI entry point (task 5.9)."""
 
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -13,9 +12,7 @@ def test_reindex_with_sql_file(tmp_path):
     """reindex command indexes a temp directory containing a SQL file."""
     repo_dir = tmp_path / "myrepo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
 
     db_path = str(tmp_path / "test.duckdb")
     config = {
@@ -60,9 +57,7 @@ def test_reindex_with_parse_errors_exits_nonzero(tmp_path):
     repo_dir = tmp_path / "badrepo"
     repo_dir.mkdir()
     # Write invalid SQL that will trigger parse errors
-    (repo_dir / "broken.sql").write_text(
-        "CREATE TABLE SELECTFROM WHEREJOIN INVALID GARBAGE ))) ((( ;"
-    )
+    (repo_dir / "broken.sql").write_text("CREATE TABLE SELECTFROM WHEREJOIN INVALID GARBAGE ))) ((( ;")
 
     db_path = str(tmp_path / "test.duckdb")
     config = {
@@ -95,9 +90,16 @@ def test_reindex_unknown_repo_exits_nonzero(tmp_path):
     config_path.write_text(json.dumps(config))
 
     runner = CliRunner()
-    result = runner.invoke(cli, [
-        "reindex", "--config", str(config_path), "--repo", "nonexistent",
-    ])
+    result = runner.invoke(
+        cli,
+        [
+            "reindex",
+            "--config",
+            str(config_path),
+            "--repo",
+            "nonexistent",
+        ],
+    )
     assert result.exit_code != 0
     assert "not in config" in result.output
 
@@ -135,8 +137,7 @@ def test_serve_with_mocked_mcp_run(tmp_path):
     config_path.write_text(json.dumps(config))
 
     runner = CliRunner()
-    with patch("sqlprism.cli.mcp") as mock_mcp, \
-         patch("sqlprism.cli.configure") as mock_configure:
+    with patch("sqlprism.cli.mcp"), patch("sqlprism.cli.configure") as mock_configure:
         result = runner.invoke(cli, ["serve", "--config", str(config_path)])
 
     assert result.exit_code == 0, f"stdout={result.output}"

@@ -22,16 +22,14 @@ Thread-safety model (read/write separation):
       for the full ``BEGIN .. COMMIT`` scope.
 """
 
-import warnings
 import json
 import threading
+import warnings
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
-
 import duckdb
-
 
 _MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB – skip snippets for oversized files
 
@@ -50,6 +48,7 @@ def _read_file_lines(path: str) -> tuple[str, ...] | None:
         return tuple(p.read_text(errors="replace").splitlines())
     except Exception:
         return None
+
 
 SCHEMA_SQL = """
 CREATE SEQUENCE IF NOT EXISTS seq_repo_id START 1;
@@ -296,9 +295,7 @@ class GraphDB:
             The ``repo_id`` (existing or newly created).
         """
         with self._write_lock:
-            existing = self._execute_write(
-                "SELECT repo_id, path FROM repos WHERE name = ?", [name]
-            ).fetchone()
+            existing = self._execute_write("SELECT repo_id, path FROM repos WHERE name = ?", [name]).fetchone()
             if existing:
                 if existing[1] != str(path):
                     self._execute_write(
@@ -312,14 +309,11 @@ class GraphDB:
             ).fetchone()
             return result[0]
 
-    def update_repo_metadata(
-        self, repo_id: int, commit: str | None = None, branch: str | None = None
-    ) -> None:
+    def update_repo_metadata(self, repo_id: int, commit: str | None = None, branch: str | None = None) -> None:
         """Update the last indexed commit/branch for a repo."""
         with self._write_lock:
             self._execute_write(
-                "UPDATE repos SET last_commit = ?, last_branch = ?, indexed_at = now() "
-                "WHERE repo_id = ?",
+                "UPDATE repos SET last_commit = ?, last_branch = ?, indexed_at = now() WHERE repo_id = ?",
                 [commit, branch, repo_id],
             )
 
@@ -340,14 +334,12 @@ class GraphDB:
         """Inner impl -- caller must hold ``_write_lock`` (via write_transaction)."""
         # Delete column_lineage for all files in repo
         self._execute_write(
-            "DELETE FROM column_lineage WHERE file_id IN "
-            "(SELECT file_id FROM files WHERE repo_id = ?)",
+            "DELETE FROM column_lineage WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ?)",
             [repo_id],
         )
         # Delete column_usage for all nodes in repo's files
         self._execute_write(
-            "DELETE FROM column_usage WHERE file_id IN "
-            "(SELECT file_id FROM files WHERE repo_id = ?)",
+            "DELETE FROM column_usage WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ?)",
             [repo_id],
         )
         # Delete edges referencing repo's nodes
@@ -365,8 +357,7 @@ class GraphDB:
         )
         # Delete nodes
         self._execute_write(
-            "DELETE FROM nodes WHERE file_id IN "
-            "(SELECT file_id FROM files WHERE repo_id = ?)",
+            "DELETE FROM nodes WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ?)",
             [repo_id],
         )
         # Delete files
@@ -378,9 +369,7 @@ class GraphDB:
 
     def get_file_checksums(self, repo_id: int) -> dict[str, str]:
         """Get {path: checksum} for all files in a repo."""
-        rows = self._execute_read(
-            "SELECT path, checksum FROM files WHERE repo_id = ?", [repo_id]
-        ).fetchall()
+        rows = self._execute_read("SELECT path, checksum FROM files WHERE repo_id = ?", [repo_id]).fetchall()
         return {path: checksum for path, checksum in rows}
 
     def delete_file_data(self, repo_id: int, path: str) -> None:
@@ -411,8 +400,7 @@ class GraphDB:
 
         # Delete edges where source is in this file's nodes (outbound from this file)
         self._execute_write(
-            "DELETE FROM edges WHERE source_id IN "
-            "(SELECT node_id FROM nodes WHERE file_id = ?)",
+            "DELETE FROM edges WHERE source_id IN (SELECT node_id FROM nodes WHERE file_id = ?)",
             [file_id],
         )
 
@@ -439,8 +427,7 @@ class GraphDB:
         # Delete edges where target is in this file's non-phantom nodes
         # (edges from other files now point to phantoms, so they're safe)
         self._execute_write(
-            "DELETE FROM edges WHERE target_id IN "
-            "(SELECT node_id FROM nodes WHERE file_id = ?)",
+            "DELETE FROM edges WHERE target_id IN (SELECT node_id FROM nodes WHERE file_id = ?)",
             [file_id],
         )
 
@@ -448,9 +435,7 @@ class GraphDB:
         self._execute_write("DELETE FROM nodes WHERE file_id = ?", [file_id])
         self._execute_write("DELETE FROM files WHERE file_id = ?", [file_id])
 
-    def insert_file(
-        self, repo_id: int, path: str, language: str, checksum: str
-    ) -> int:
+    def insert_file(self, repo_id: int, path: str, language: str, checksum: str) -> int:
         """Insert a file record.
 
         Args:
@@ -464,8 +449,7 @@ class GraphDB:
         """
         with self._write_lock:
             result = self._execute_write(
-                "INSERT INTO files (repo_id, path, language, checksum) "
-                "VALUES (?, ?, ?, ?) RETURNING file_id",
+                "INSERT INTO files (repo_id, path, language, checksum) VALUES (?, ?, ?, ?) RETURNING file_id",
                 [repo_id, path, language, checksum],
             ).fetchone()
             return result[0]
@@ -500,7 +484,8 @@ class GraphDB:
         """
         with self._write_lock:
             result = self._execute_write(
-                "INSERT INTO nodes (file_id, kind, name, language, line_start, line_end, metadata, schema) "
+                "INSERT INTO nodes (file_id, kind, name, language, "
+                "line_start, line_end, metadata, schema) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING node_id",
                 [
                     file_id,
@@ -516,7 +501,11 @@ class GraphDB:
             return result[0]
 
     def resolve_node(
-        self, name: str, kind: str, repo_id: int | None = None, schema: str | None = None,
+        self,
+        name: str,
+        kind: str,
+        repo_id: int | None = None,
+        schema: str | None = None,
     ) -> int | None:
         """Find a node by name and kind.
 
@@ -545,8 +534,7 @@ class GraphDB:
             row = self._execute_read(
                 "SELECT n.node_id FROM nodes n "
                 "JOIN files f ON n.file_id = f.file_id "
-                "WHERE n.name = ? AND n.kind = ? AND f.repo_id = ?"
-                + schema_clause + " LIMIT 1",
+                "WHERE n.name = ? AND n.kind = ? AND f.repo_id = ?" + schema_clause + " LIMIT 1",
                 [name, kind, repo_id] + schema_params,
             ).fetchone()
             if row:
@@ -554,8 +542,7 @@ class GraphDB:
 
         # Cross-repo search (use alias so schema_clause referencing 'n.' works)
         row = self._execute_read(
-            "SELECT n.node_id FROM nodes n WHERE n.name = ? AND n.kind = ?"
-            + schema_clause + " LIMIT 1",
+            "SELECT n.node_id FROM nodes n WHERE n.name = ? AND n.kind = ?" + schema_clause + " LIMIT 1",
             [name, kind] + schema_params,
         ).fetchone()
         return row[0] if row else None
@@ -570,9 +557,7 @@ class GraphDB:
             if row:
                 return row[0]
             # insert_node acquires _write_lock (RLock is re-entrant)
-            return self.insert_node(
-                file_id=None, kind=kind, name=name, language=language
-        )
+            return self.insert_node(file_id=None, kind=kind, name=name, language=language)
 
     def cleanup_phantoms(self) -> int:
         """Repoint edges from phantom nodes to real counterparts, then delete phantoms.
@@ -619,8 +604,7 @@ class GraphDB:
                     placeholders = ",".join(["?"] * len(delete_ids))
                     # Remove edges referencing stale phantoms before deleting nodes
                     self._execute_write(
-                        f"DELETE FROM edges WHERE source_id IN ({placeholders}) "
-                        f"OR target_id IN ({placeholders})",
+                        f"DELETE FROM edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
                         delete_ids + delete_ids,
                     )
                     self._execute_write(
@@ -632,9 +616,7 @@ class GraphDB:
 
             # Batch repoint edges: single UPDATE per direction using a mapping table
             # instead of O(phantoms) individual UPDATEs.
-            mapping_values = ", ".join(
-                [f"({phantom_id}, {real_id})" for phantom_id, real_id in phantoms]
-            )
+            mapping_values = ", ".join([f"({phantom_id}, {real_id})" for phantom_id, real_id in phantoms])
             self._execute_write(
                 f"UPDATE edges SET source_id = m.real_id "
                 f"FROM (VALUES {mapping_values}) AS m(phantom_id, real_id) "
@@ -714,15 +696,16 @@ class GraphDB:
         """
         if not rows:
             return []
-        CHUNK_SIZE = 200
+        chunk_size = 200
         all_ids = []
         with self._write_lock:
-            for i in range(0, len(rows), CHUNK_SIZE):
-                chunk = rows[i:i + CHUNK_SIZE]
+            for i in range(0, len(rows), chunk_size):
+                chunk = rows[i : i + chunk_size]
                 placeholders = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
                 flat = [v for row in chunk for v in row]
                 result = self.conn.execute(
-                    f"INSERT INTO nodes (file_id, kind, name, language, line_start, line_end, metadata, schema) "
+                    "INSERT INTO nodes (file_id, kind, name, language, "
+                    "line_start, line_end, metadata, schema) "
                     f"VALUES {placeholders} RETURNING node_id",
                     flat,
                 ).fetchall()
@@ -740,8 +723,7 @@ class GraphDB:
             return
         with self._write_lock:
             self.conn.executemany(
-                "INSERT INTO edges (source_id, target_id, relationship, context, metadata) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO edges (source_id, target_id, relationship, context, metadata) VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
 
@@ -756,7 +738,8 @@ class GraphDB:
             return
         with self._write_lock:
             self.conn.executemany(
-                "INSERT INTO column_usage (node_id, table_name, column_name, usage_type, file_id, alias, transform) "
+                "INSERT INTO column_usage (node_id, table_name, column_name, "
+                "usage_type, file_id, alias, transform) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
@@ -774,7 +757,8 @@ class GraphDB:
         with self._write_lock:
             self.conn.executemany(
                 "INSERT INTO column_lineage "
-                "(file_id, output_node, output_column, chain_index, hop_index, hop_column, hop_table, hop_expression) "
+                "(file_id, output_node, output_column, chain_index, "
+                "hop_index, hop_column, hop_table, hop_expression) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
@@ -794,7 +778,8 @@ class GraphDB:
         """Insert a column usage record."""
         with self._write_lock:
             self._execute_write(
-                "INSERT INTO column_usage (node_id, table_name, column_name, usage_type, file_id, alias, transform) "
+                "INSERT INTO column_usage (node_id, table_name, column_name, "
+                "usage_type, file_id, alias, transform) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [node_id, table_name, column_name, usage_type, file_id, alias, transform],
             )
@@ -816,9 +801,19 @@ class GraphDB:
         with self._write_lock:
             self._execute_write(
                 "INSERT INTO column_lineage "
-                "(file_id, output_node, output_column, chain_index, hop_index, hop_column, hop_table, hop_expression) "
+                "(file_id, output_node, output_column, chain_index, "
+                "hop_index, hop_column, hop_table, hop_expression) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [file_id, output_node, output_column, chain_index, hop_index, hop_column, hop_table, hop_expression],
+                [
+                    file_id,
+                    output_node,
+                    output_column,
+                    chain_index,
+                    hop_index,
+                    hop_column,
+                    hop_table,
+                    hop_expression,
+                ],
             )
 
     def query_column_lineage(
@@ -929,12 +924,21 @@ class GraphDB:
             key = (r[0], r[1], r[2])
             if key not in chains:
                 chains[key] = {
-                    "output_node": r[0], "output_column": r[1],
-                    "chain_index": r[2], "hops": [], "file": r[7], "repo": r[8],
+                    "output_node": r[0],
+                    "output_column": r[1],
+                    "chain_index": r[2],
+                    "hops": [],
+                    "file": r[7],
+                    "repo": r[8],
                 }
-            chains[key]["hops"].append({
-                "index": r[3], "column": r[4], "table": r[5], "expression": r[6],
-            })
+            chains[key]["hops"].append(
+                {
+                    "index": r[3],
+                    "column": r[4],
+                    "table": r[5],
+                    "expression": r[6],
+                }
+            )
 
         return {"chains": list(chains.values()), "total_count": total_count}
 
@@ -964,8 +968,7 @@ class GraphDB:
             ).fetchall()
         else:
             rows = self._execute_read(
-                "SELECT DISTINCT table_name, column_name "
-                "FROM column_usage WHERE column_name != '*'"
+                "SELECT DISTINCT table_name, column_name FROM column_usage WHERE column_name != '*'"
             ).fetchall()
 
         schema: dict[str, dict[str, str]] = {}
@@ -1001,9 +1004,7 @@ class GraphDB:
 
         # Get repo base path
         if repo_name:
-            row = self._execute_read(
-                "SELECT path FROM repos WHERE name = ?", [repo_name]
-            ).fetchone()
+            row = self._execute_read("SELECT path FROM repos WHERE name = ?", [repo_name]).fetchone()
             if not row:
                 return None
             base = Path(row[0])
@@ -1028,10 +1029,7 @@ class GraphDB:
 
         snippet_lines = lines[start:end]
         # Add line numbers
-        numbered = [
-            f"{start + i + 1:4d} | {line}"
-            for i, line in enumerate(snippet_lines)
-        ]
+        numbered = [f"{start + i + 1:4d} | {line}" for i, line in enumerate(snippet_lines)]
         return "\n".join(numbered)
 
     # ── Query methods (used by MCP tools) ──
@@ -1076,7 +1074,8 @@ class GraphDB:
             where_clauses.append("n.schema = ?")
             params.append(schema)
 
-        node_query = f"SELECT n.node_id, n.kind, n.name FROM nodes n WHERE {' AND '.join(where_clauses)}"
+        where_str = " AND ".join(where_clauses)
+        node_query = f"SELECT n.node_id, n.kind, n.name FROM nodes n WHERE {where_str}"
         target_nodes = self._execute_read(node_query, params).fetchall()
 
         if not target_nodes:
@@ -1104,8 +1103,13 @@ class GraphDB:
             )
             for r in self._execute_read(inbound_sql, node_ids + [limit, offset]).fetchall():
                 entry = {
-                    "name": r[0], "kind": r[1], "relationship": r[2],
-                    "context": r[3], "file": r[4], "repo": r[5], "line": r[6],
+                    "name": r[0],
+                    "kind": r[1],
+                    "relationship": r[2],
+                    "context": r[3],
+                    "file": r[4],
+                    "repo": r[5],
+                    "line": r[6],
                 }
                 if include_snippets:
                     snippet = self._read_snippet(r[5], r[4], r[6], r[7])
@@ -1126,8 +1130,13 @@ class GraphDB:
             )
             for r in self._execute_read(outbound_sql, node_ids + [limit, offset]).fetchall():
                 entry = {
-                    "name": r[0], "kind": r[1], "relationship": r[2],
-                    "context": r[3], "file": r[4], "repo": r[5], "line": r[6],
+                    "name": r[0],
+                    "kind": r[1],
+                    "relationship": r[2],
+                    "context": r[3],
+                    "file": r[4],
+                    "repo": r[5],
+                    "line": r[6],
                 }
                 if include_snippets:
                     snippet = self._read_snippet(r[5], r[4], r[6], r[7])
@@ -1196,18 +1205,22 @@ class GraphDB:
         usage = []
         for r in rows:
             entry = {
-                "table": r[0], "column": r[1], "usage_type": r[2], "alias": r[3],
-                "node_name": r[4], "node_kind": r[5], "file": r[6], "repo": r[7], "line": r[8],
+                "table": r[0],
+                "column": r[1],
+                "usage_type": r[2],
+                "alias": r[3],
+                "node_name": r[4],
+                "node_kind": r[5],
+                "file": r[6],
+                "repo": r[7],
+                "line": r[8],
             }
             if r[9]:
                 entry["transform"] = r[9]
             usage.append(entry)
 
         # True total count (before pagination)
-        count_sql = (
-            f"SELECT COUNT(*) FROM column_usage cu {joins} "
-            f"WHERE {' AND '.join(where)}"
-        )
+        count_sql = f"SELECT COUNT(*) FROM column_usage cu {joins} WHERE {' AND '.join(where)}"
         total_count = self._execute_read(count_sql, params).fetchone()[0]
 
         # Summary by usage_type
@@ -1259,10 +1272,7 @@ class GraphDB:
             where.append("n.schema = ?")
             params.append(schema)
 
-        joins = (
-            "LEFT JOIN files f ON n.file_id = f.file_id "
-            "LEFT JOIN repos r ON f.repo_id = r.repo_id"
-        )
+        joins = "LEFT JOIN files f ON n.file_id = f.file_id LEFT JOIN repos r ON f.repo_id = r.repo_id"
         if repo:
             where.append("r.name = ?")
             params.append(repo)
@@ -1283,8 +1293,13 @@ class GraphDB:
         matches = []
         for r in rows:
             match = {
-                "name": r[0], "kind": r[1], "language": r[2],
-                "file": r[3], "repo": r[4], "line_start": r[5], "line_end": r[6],
+                "name": r[0],
+                "kind": r[1],
+                "language": r[2],
+                "file": r[3],
+                "repo": r[4],
+                "line_start": r[5],
+                "line_end": r[6],
             }
             if include_snippets:
                 snippet = self._read_snippet(r[4], r[3], r[5], r[6])
@@ -1356,8 +1371,26 @@ class GraphDB:
             source_col, target_col = "target_id", "source_id"
         else:
             # Both — run downstream and upstream separately and merge
-            down = self.query_trace(name, kind, "downstream", max_depth, repo, include_snippets, limit, exclude_edges)
-            up = self.query_trace(name, kind, "upstream", max_depth, repo, include_snippets, limit, exclude_edges)
+            down = self.query_trace(
+                name,
+                kind,
+                "downstream",
+                max_depth,
+                repo,
+                include_snippets,
+                limit,
+                exclude_edges,
+            )
+            up = self.query_trace(
+                name,
+                kind,
+                "upstream",
+                max_depth,
+                repo,
+                include_snippets,
+                limit,
+                exclude_edges,
+            )
             return {
                 "root": down["root"],
                 "downstream": down["paths"],
@@ -1375,17 +1408,14 @@ class GraphDB:
             excluded_id_pairs: set[tuple[int, int]] = set()
             for src_name, tgt_name in exclude_edges:
                 rows_ex = self._execute_read(
-                    "SELECT s.node_id, t.node_id FROM nodes s, nodes t "
-                    "WHERE s.name = ? AND t.name = ?",
+                    "SELECT s.node_id, t.node_id FROM nodes s, nodes t WHERE s.name = ? AND t.name = ?",
                     [src_name, tgt_name],
                 ).fetchall()
                 for row_ex in rows_ex:
                     excluded_id_pairs.add((row_ex[0], row_ex[1]))
             if excluded_id_pairs:
                 pairs_sql = ", ".join(f"({s}, {t})" for s, t in excluded_id_pairs)
-                exclude_clause = (
-                    f"AND (e.source_id, e.target_id) NOT IN (VALUES {pairs_sql})"
-                )
+                exclude_clause = f"AND (e.source_id, e.target_id) NOT IN (VALUES {pairs_sql})"
 
         recursive_sql = f"""
         WITH RECURSIVE trace AS (
@@ -1431,9 +1461,14 @@ class GraphDB:
         paths = []
         for r in rows:
             entry = {
-                "name": r[4], "kind": r[5], "language": r[6],
-                "relationship": r[1], "context": r[2], "depth": r[3],
-                "file": r[7], "repo": r[8],
+                "name": r[4],
+                "kind": r[5],
+                "language": r[6],
+                "relationship": r[1],
+                "context": r[2],
+                "depth": r[3],
+                "file": r[7],
+                "repo": r[8],
             }
             if include_snippets:
                 snippet = self._read_snippet(r[8], r[7], r[9], r[10])
@@ -1490,15 +1525,21 @@ class GraphDB:
         return {
             "repos": [
                 {
-                    "name": r[0], "path": r[1], "last_commit": r[2],
-                    "last_branch": r[3], "indexed_at": str(r[4]) if r[4] else None,
-                    "file_count": r[5], "node_count": r[6],
+                    "name": r[0],
+                    "path": r[1],
+                    "last_commit": r[2],
+                    "last_branch": r[3],
+                    "indexed_at": str(r[4]) if r[4] else None,
+                    "file_count": r[5],
+                    "node_count": r[6],
                 }
                 for r in repos
             ],
             "totals": {
-                "files": totals[0], "nodes": totals[1],
-                "edges": totals[2], "column_usage_records": totals[3],
+                "files": totals[0],
+                "nodes": totals[1],
+                "edges": totals[2],
+                "column_usage_records": totals[3],
                 "column_lineage_chains": totals[5],
             },
             "phantom_nodes": totals[4],

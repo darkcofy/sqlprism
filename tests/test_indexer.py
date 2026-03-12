@@ -6,7 +6,10 @@ from sqlprism.core.indexer import _resolve_dialect
 from sqlprism.core.mcp_tools import _compute_structural_diff
 from sqlprism.languages.sqlmesh import _validate_command
 from sqlprism.types import (
-    ColumnUsageResult, EdgeResult, NodeResult, ParseResult,
+    ColumnUsageResult,
+    EdgeResult,
+    NodeResult,
+    ParseResult,
 )
 
 
@@ -114,26 +117,35 @@ def test_checksum_parse_result_content_based():
 def test_structural_diff_unchanged_nodes_not_modified():
     """Nodes that exist in both old and new with same edges/columns should NOT be modified."""
     edge = EdgeResult(
-        source_name="q", source_kind="query",
-        target_name="orders", target_kind="table",
+        source_name="q",
+        source_kind="query",
+        target_name="orders",
+        target_kind="table",
         relationship="references",
     )
     col = ColumnUsageResult(
-        node_name="q", node_kind="query",
-        table_name="orders", column_name="id", usage_type="select",
+        node_name="q",
+        node_kind="query",
+        table_name="orders",
+        column_name="id",
+        usage_type="select",
     )
-    old = {"f.sql": ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="orders"), NodeResult(kind="query", name="q")],
-        edges=[edge],
-        column_usage=[col],
-    )}
-    new = {"f.sql": ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="orders"), NodeResult(kind="query", name="q")],
-        edges=[edge],
-        column_usage=[col],
-    )}
+    old = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="table", name="orders"), NodeResult(kind="query", name="q")],
+            edges=[edge],
+            column_usage=[col],
+        )
+    }
+    new = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="table", name="orders"), NodeResult(kind="query", name="q")],
+            edges=[edge],
+            column_usage=[col],
+        )
+    }
 
     diff = _compute_structural_diff(old, new)
     assert diff["nodes_added"] == []
@@ -144,25 +156,33 @@ def test_structural_diff_unchanged_nodes_not_modified():
 def test_structural_diff_detects_actual_modification():
     """Nodes with changed edges/columns should show as modified."""
     old_edge = EdgeResult(
-        source_name="q", source_kind="query",
-        target_name="orders", target_kind="table",
+        source_name="q",
+        source_kind="query",
+        target_name="orders",
+        target_kind="table",
         relationship="references",
     )
     new_edge = EdgeResult(
-        source_name="q", source_kind="query",
-        target_name="customers", target_kind="table",
+        source_name="q",
+        source_kind="query",
+        target_name="customers",
+        target_kind="table",
         relationship="references",
     )
-    old = {"f.sql": ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="query", name="q")],
-        edges=[old_edge],
-    )}
-    new = {"f.sql": ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="query", name="q")],
-        edges=[new_edge],
-    )}
+    old = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="query", name="q")],
+            edges=[old_edge],
+        )
+    }
+    new = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="query", name="q")],
+            edges=[new_edge],
+        )
+    }
 
     diff = _compute_structural_diff(old, new)
     assert len(diff["nodes_modified"]) == 1
@@ -174,18 +194,20 @@ def test_structural_diff_detects_actual_modification():
 
 def test_parse_dotenv_matching_quotes():
     """parse_dotenv strips matching quotes, not mismatched ones."""
-    from sqlprism.languages.utils import parse_dotenv
-    import tempfile, os
+    import os
+    import tempfile
     from pathlib import Path
+
+    from sqlprism.languages.utils import parse_dotenv
 
     content = (
         "SIMPLE=hello\n"
-        "DOUBLE_QUOTED=\"world\"\n"
+        'DOUBLE_QUOTED="world"\n'
         "SINGLE_QUOTED='value'\n"
-        "PARTIAL_QUOTE=\"not closed\n"
+        'PARTIAL_QUOTE="not closed\n'
         "EMPTY=\n"
         "# comment\n"
-        "STARTS_WITH_QUOTE=\"abc\n"
+        'STARTS_WITH_QUOTE="abc\n'
     )
     with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
         f.write(content)
@@ -207,9 +229,10 @@ def test_parse_dotenv_matching_quotes():
 
 def test_find_venv_dir_fallback():
     """find_venv_dir falls back to project_path when no .venv found."""
-    from sqlprism.languages.utils import find_venv_dir
-    from pathlib import Path
     import tempfile
+    from pathlib import Path
+
+    from sqlprism.languages.utils import find_venv_dir
 
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "deep" / "project"
@@ -229,10 +252,42 @@ def test_chain_index_disambiguates_multi_path():
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
 
     # Two chains for the same output column (e.g. COALESCE(a.x, b.x) AS x)
-    db.insert_column_lineage(file_id, "v", "x", hop_index=0, hop_column="x", hop_table="v", chain_index=0)
-    db.insert_column_lineage(file_id, "v", "x", hop_index=1, hop_column="x", hop_table="a", chain_index=0)
-    db.insert_column_lineage(file_id, "v", "x", hop_index=0, hop_column="x", hop_table="v", chain_index=1)
-    db.insert_column_lineage(file_id, "v", "x", hop_index=1, hop_column="x", hop_table="b", chain_index=1)
+    db.insert_column_lineage(
+        file_id,
+        "v",
+        "x",
+        hop_index=0,
+        hop_column="x",
+        hop_table="v",
+        chain_index=0,
+    )
+    db.insert_column_lineage(
+        file_id,
+        "v",
+        "x",
+        hop_index=1,
+        hop_column="x",
+        hop_table="a",
+        chain_index=0,
+    )
+    db.insert_column_lineage(
+        file_id,
+        "v",
+        "x",
+        hop_index=0,
+        hop_column="x",
+        hop_table="v",
+        chain_index=1,
+    )
+    db.insert_column_lineage(
+        file_id,
+        "v",
+        "x",
+        hop_index=1,
+        hop_column="x",
+        hop_table="b",
+        chain_index=1,
+    )
 
     result = db.query_column_lineage(output_node="v", column="x")
     assert result["total_count"] == 2
@@ -252,12 +307,8 @@ def test_full_reindex_cycle(tmp_path):
     # Setup repo directory with SQL files
     repo_dir = tmp_path / "myrepo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)"
-    )
-    (repo_dir / "customers.sql").write_text(
-        "CREATE TABLE customers (id INT, name TEXT)"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)")
+    (repo_dir / "customers.sql").write_text("CREATE TABLE customers (id INT, name TEXT)")
     (repo_dir / "report.sql").write_text(
         "SELECT o.id, c.name, o.amount FROM orders o JOIN customers c ON o.customer_id = c.id"
     )
@@ -304,9 +355,7 @@ def test_full_reindex_cycle(tmp_path):
     assert status2["totals"]["files"] == 4
 
     # Modify a file
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL, status TEXT)"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL, status TEXT)")
 
     # Fourth reindex (detect change)
     stats4 = indexer.reindex_repo("test", str(repo_dir))
@@ -358,7 +407,8 @@ def test_reindex_with_dialect_overrides(tmp_path):
     db = GraphDB()
     indexer = Indexer(db)
     stats = indexer.reindex_repo(
-        "multi", str(repo_dir),
+        "multi",
+        str(repo_dir),
         dialect="postgres",
         dialect_overrides={"athena/": "athena", "starrocks/": "starrocks"},
     )
@@ -406,8 +456,15 @@ def test_mcp_find_column_usage_integration():
 
     db.insert_column_usage(node_id, "orders", "id", "select", file_id)
     db.insert_column_usage(node_id, "orders", "amount", "where", file_id, transform="amount > 100")
-    db.insert_column_usage(node_id, "orders", "created_at", "select", file_id,
-                           alias="order_date", transform="CAST(created_at AS DATE)")
+    db.insert_column_usage(
+        node_id,
+        "orders",
+        "created_at",
+        "select",
+        file_id,
+        alias="order_date",
+        transform="CAST(created_at AS DATE)",
+    )
 
     result = db.query_column_usage("orders")
     assert result["total_count"] == 3
@@ -468,9 +525,34 @@ def test_mcp_column_lineage_integration():
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
 
     # created_date traced through: dim_users -> base -> users.created_at
-    db.insert_column_lineage(file_id, "dim_users", "created_date", 0, "created_date", "dim_users", "CAST(created_at AS DATE)", chain_index=0)
-    db.insert_column_lineage(file_id, "dim_users", "created_date", 1, "created_at", "base", chain_index=0)
-    db.insert_column_lineage(file_id, "dim_users", "created_date", 2, "created_at", "users", chain_index=0)
+    db.insert_column_lineage(
+        file_id,
+        "dim_users",
+        "created_date",
+        0,
+        "created_date",
+        "dim_users",
+        "CAST(created_at AS DATE)",
+        chain_index=0,
+    )
+    db.insert_column_lineage(
+        file_id,
+        "dim_users",
+        "created_date",
+        1,
+        "created_at",
+        "base",
+        chain_index=0,
+    )
+    db.insert_column_lineage(
+        file_id,
+        "dim_users",
+        "created_date",
+        2,
+        "created_at",
+        "users",
+        chain_index=0,
+    )
 
     result = db.query_column_lineage(output_node="dim_users", column="created_date")
     assert result["total_count"] == 1
@@ -488,14 +570,18 @@ def test_mcp_column_lineage_integration():
 
 def test_structural_diff_added_and_removed():
     """Structural diff detects added and removed nodes."""
-    old = {"a.sql": ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="old_table")],
-    )}
-    new = {"a.sql": ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="new_table")],
-    )}
+    old = {
+        "a.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="table", name="old_table")],
+        )
+    }
+    new = {
+        "a.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="table", name="new_table")],
+        )
+    }
 
     diff = _compute_structural_diff(old, new)
     assert any(n["name"] == "new_table" for n in diff["nodes_added"])
@@ -505,17 +591,33 @@ def test_structural_diff_added_and_removed():
 def test_structural_diff_edge_changes():
     """Structural diff detects edge additions and removals."""
     edge_old = EdgeResult(
-        source_name="q", source_kind="query",
-        target_name="orders", target_kind="table",
+        source_name="q",
+        source_kind="query",
+        target_name="orders",
+        target_kind="table",
         relationship="references",
     )
     edge_new = EdgeResult(
-        source_name="q", source_kind="query",
-        target_name="customers", target_kind="table",
+        source_name="q",
+        source_kind="query",
+        target_name="customers",
+        target_kind="table",
         relationship="references",
     )
-    old = {"f.sql": ParseResult(language="sql", nodes=[NodeResult(kind="query", name="q")], edges=[edge_old])}
-    new = {"f.sql": ParseResult(language="sql", nodes=[NodeResult(kind="query", name="q")], edges=[edge_new])}
+    old = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="query", name="q")],
+            edges=[edge_old],
+        )
+    }
+    new = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="query", name="q")],
+            edges=[edge_new],
+        )
+    }
 
     diff = _compute_structural_diff(old, new)
     assert any(e["target"] == "customers" for e in diff["edges_added"])
@@ -525,15 +627,33 @@ def test_structural_diff_edge_changes():
 def test_structural_diff_column_usage_changes():
     """Structural diff detects column usage additions and removals."""
     col_old = ColumnUsageResult(
-        node_name="q", node_kind="query",
-        table_name="orders", column_name="id", usage_type="select",
+        node_name="q",
+        node_kind="query",
+        table_name="orders",
+        column_name="id",
+        usage_type="select",
     )
     col_new = ColumnUsageResult(
-        node_name="q", node_kind="query",
-        table_name="orders", column_name="amount", usage_type="where",
+        node_name="q",
+        node_kind="query",
+        table_name="orders",
+        column_name="amount",
+        usage_type="where",
     )
-    old = {"f.sql": ParseResult(language="sql", nodes=[NodeResult(kind="query", name="q")], column_usage=[col_old])}
-    new = {"f.sql": ParseResult(language="sql", nodes=[NodeResult(kind="query", name="q")], column_usage=[col_new])}
+    old = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="query", name="q")],
+            column_usage=[col_old],
+        )
+    }
+    new = {
+        "f.sql": ParseResult(
+            language="sql",
+            nodes=[NodeResult(kind="query", name="q")],
+            column_usage=[col_new],
+        )
+    }
 
     diff = _compute_structural_diff(old, new)
     assert len(diff["columns_added"]) == 1
@@ -552,9 +672,7 @@ def test_phantom_nodes_stable_across_reindex_cycles(tmp_path):
 
     repo_dir = tmp_path / "phantom_repo"
     repo_dir.mkdir()
-    (repo_dir / "report.sql").write_text(
-        "SELECT id, name FROM orders WHERE active = 1"
-    )
+    (repo_dir / "report.sql").write_text("SELECT id, name FROM orders WHERE active = 1")
 
     db = GraphDB()
     indexer = Indexer(db)
@@ -593,7 +711,7 @@ def test_phantom_cleanup_graph_layer():
     assert db.get_index_status()["phantom_nodes"] >= 1
 
     # Now create a real node with the same name+kind
-    real_id = db.insert_node(file_id, "table", "orders", "sql")
+    db.insert_node(file_id, "table", "orders", "sql")
     cleaned = db.cleanup_phantoms()
     assert cleaned >= 1
 
@@ -635,8 +753,10 @@ def test_column_usage_dropped_counter(tmp_path):
     )
 
     stats = {
-        "nodes_added": 0, "edges_added": 0,
-        "column_usage_added": 0, "column_usage_dropped": 0,
+        "nodes_added": 0,
+        "edges_added": 0,
+        "column_usage_added": 0,
+        "column_usage_dropped": 0,
         "lineage_chains": 0,
     }
 
@@ -644,9 +764,7 @@ def test_column_usage_dropped_counter(tmp_path):
         file_id = db.insert_file(repo_id, "test.sql", "sql", "abc")
         indexer._insert_parse_result(result, file_id, repo_id, stats)
 
-    assert stats["column_usage_dropped"] > 0, (
-        f"Expected drops but got: {stats}"
-    )
+    assert stats["column_usage_dropped"] > 0, f"Expected drops but got: {stats}"
     db.close()
 
 
@@ -666,13 +784,9 @@ def test_cross_file_edges_survive_incremental_reindex(tmp_path):
     repo_dir.mkdir()
 
     # File A defines a table
-    (repo_dir / "a_orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
+    (repo_dir / "a_orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
     # File B references file A's table
-    (repo_dir / "b_report.sql").write_text(
-        "SELECT id, amount FROM orders WHERE amount > 100"
-    )
+    (repo_dir / "b_report.sql").write_text("SELECT id, amount FROM orders WHERE amount > 100")
 
     db = GraphDB()
     indexer = Indexer(db)
@@ -687,9 +801,7 @@ def test_cross_file_edges_survive_incremental_reindex(tmp_path):
     assert inbound_before >= 1, "File B should reference orders"
 
     # Now modify ONLY file A (the target of B's edge)
-    (repo_dir / "a_orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL, status TEXT)"
-    )
+    (repo_dir / "a_orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL, status TEXT)")
 
     # Re-index — only file A should change
     stats2 = indexer.reindex_repo("test", str(repo_dir))
@@ -699,9 +811,7 @@ def test_cross_file_edges_survive_incremental_reindex(tmp_path):
     # CRITICAL: B's edge to orders must still exist
     refs_after = db.query_references("orders", kind="table")
     inbound_after = len(refs_after["inbound"])
-    assert inbound_after >= 1, (
-        "Cross-file edge from B → orders should survive incremental reindex of A"
-    )
+    assert inbound_after >= 1, "Cross-file edge from B → orders should survive incremental reindex of A"
 
     db.close()
 
@@ -716,18 +826,14 @@ def test_subquery_alias_column_usage_not_dropped(tmp_path):
 
     repo_dir = tmp_path / "subquery_repo"
     repo_dir.mkdir()
-    (repo_dir / "query.sql").write_text(
-        "SELECT x.id FROM (SELECT id FROM orders WHERE id > 0) x"
-    )
+    (repo_dir / "query.sql").write_text("SELECT x.id FROM (SELECT id FROM orders WHERE id > 0) x")
 
     db = GraphDB()
     indexer = Indexer(db)
     stats = indexer.reindex_repo("test", str(repo_dir))
 
     # Subquery alias 'x' should now have a node, so column_usage should resolve
-    assert stats["column_usage_dropped"] == 0, (
-        "Subquery alias column_usage should not be dropped"
-    )
+    assert stats["column_usage_dropped"] == 0, "Subquery alias column_usage should not be dropped"
 
     db.close()
 
@@ -742,20 +848,15 @@ def test_schema_qualified_nodes_no_collision(tmp_path):
 
     repo_dir = tmp_path / "schema_repo"
     repo_dir.mkdir()
-    (repo_dir / "query.sql").write_text(
-        "SELECT s.id FROM staging.orders s "
-        "JOIN production.orders p ON s.id = p.id"
-    )
+    (repo_dir / "query.sql").write_text("SELECT s.id FROM staging.orders s JOIN production.orders p ON s.id = p.id")
 
     db = GraphDB()
     indexer = Indexer(db)
-    stats = indexer.reindex_repo("test", str(repo_dir))
+    indexer.reindex_repo("test", str(repo_dir))
 
     # Both schema-qualified orders nodes should exist
     results = db.query_search("orders")
-    assert results["total_count"] == 2, (
-        "staging.orders and production.orders should be separate nodes"
-    )
+    assert results["total_count"] == 2, "staging.orders and production.orders should be separate nodes"
 
     db.close()
 
@@ -768,15 +869,16 @@ def test_cte_dedup_across_statements():
     from sqlprism.languages.sql import SqlParser
 
     parser = SqlParser()
-    result = parser.parse("test.sql", """
+    result = parser.parse(
+        "test.sql",
+        """
         WITH base AS (SELECT 1 AS id) SELECT * FROM base;
         WITH base AS (SELECT 2 AS id) SELECT * FROM base;
-    """)
+    """,
+    )
 
     cte_nodes = [n for n in result.nodes if n.kind == "cte" and n.name == "base"]
-    assert len(cte_nodes) == 1, (
-        f"Expected 1 CTE node for 'base', got {len(cte_nodes)}"
-    )
+    assert len(cte_nodes) == 1, f"Expected 1 CTE node for 'base', got {len(cte_nodes)}"
 
 
 # ── v1.2: Task 2.2 — upsert_repo updates path ──
@@ -807,18 +909,19 @@ def test_insert_select_resolves_table_aliases():
     from sqlprism.languages.sql import SqlParser
 
     parser = SqlParser()
-    result = parser.parse("test.sql", """
+    result = parser.parse(
+        "test.sql",
+        """
         INSERT INTO target (col_a, col_b)
         SELECT o.id, o.amount
         FROM orders o
-    """)
+    """,
+    )
 
     # Column usage for the INSERT should reference 'orders', not 'o'
     insert_usage = [cu for cu in result.column_usage if cu.usage_type == "insert"]
     for cu in insert_usage:
-        assert cu.table_name == "orders", (
-            f"Expected table_name='orders', got '{cu.table_name}' (alias not resolved)"
-        )
+        assert cu.table_name == "orders", f"Expected table_name='orders', got '{cu.table_name}' (alias not resolved)"
 
 
 # ── 5.9/5.10: Edge case tests ──
@@ -850,15 +953,20 @@ def test_checksum_parse_result_stability():
         ],
         edges=[
             EdgeResult(
-                source_name="report", source_kind="query",
-                target_name="orders", target_kind="table",
+                source_name="report",
+                source_kind="query",
+                target_name="orders",
+                target_kind="table",
                 relationship="references",
             ),
         ],
         column_usage=[
             ColumnUsageResult(
-                node_name="report", node_kind="query",
-                table_name="orders", column_name="id", usage_type="select",
+                node_name="report",
+                node_kind="query",
+                table_name="orders",
+                column_name="id",
+                usage_type="select",
             ),
         ],
     )
