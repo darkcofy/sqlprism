@@ -5,6 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/sqlprism)](https://pypi.org/project/sqlprism/)
 [![Python](https://img.shields.io/pypi/pyversions/sqlprism)](https://pypi.org/project/sqlprism/)
 [![License](https://img.shields.io/github/license/darkcofy/sqlprism)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://darkcofy.github.io/sqlprism/)
 
 An MCP server that indexes SQL codebases into a queryable knowledge graph backed by DuckDB. Instead of grepping through files, ask structural questions: *what touches this table, where is this column transformed, what's the blast radius of this PR.*
 
@@ -391,6 +392,10 @@ uv run pytest                          # run tests (235 tests)
 uv run pytest --cov=sqlprism        # run with coverage report
 uv run pytest --cov=sqlprism --cov-report=html:coverage_html  # HTML report
 ```
+
+### Code Coverage
+
+![Coverage Grid](https://codecov.io/github/darkcofy/sqlprism/graphs/tree.svg?token=8H5XNZEFOW)
 
 ## License
 
