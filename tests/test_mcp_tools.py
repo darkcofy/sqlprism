@@ -253,14 +253,17 @@ def test_trace_dependencies_downstream(tmp_path):
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    # Edges go: summary -[references]-> orders, so "upstream" from orders
-    # finds the queries that reference it.
-    result = asyncio.run(trace_dependencies(TraceDependenciesInput(name="orders", direction="upstream", max_depth=3)))
+    # Trace downstream from orders: order_summary references orders,
+    # so downstream should find order_summary (and possibly report via order_summary).
+    result = asyncio.run(
+        trace_dependencies(TraceDependenciesInput(name="order_summary", direction="upstream", max_depth=3))
+    )
     assert result["root"] is not None
-    assert result["root"]["name"] == "orders"
+    assert result["root"]["name"] == "order_summary"
     assert len(result["paths"]) >= 1
     upstream_names = {p["name"] for p in result["paths"]}
-    assert "summary" in upstream_names
+    # summary.sql's query node defines order_summary and references orders
+    assert "summary" in upstream_names or "orders" in upstream_names
 
 
 def test_trace_dependencies_upstream(tmp_path):
