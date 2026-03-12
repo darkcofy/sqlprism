@@ -37,21 +37,38 @@ def cli(ctx, log_level):
 
 
 @cli.command()
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH),
-              help="Path to config file")
-@click.option("--db", "db_path", type=click.Path(), default=None,
-              help="Path to DuckDB file (overrides config)")
-@click.option("--transport", type=click.Choice(["stdio", "streamable_http"]), default="stdio",
-              help="MCP transport mode")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(),
+    default=str(DEFAULT_CONFIG_PATH),
+    help="Path to config file",
+)
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(),
+    default=None,
+    help="Path to DuckDB file (overrides config)",
+)
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "streamable_http"]),
+    default="stdio",
+    help="MCP transport mode",
+)
 @click.option("--port", type=int, default=8000, help="Port for HTTP transport")
 def serve(config_path: str, db_path: str | None, transport: str, port: int):
     """Start the MCP server."""
     # Servers need more visibility — override to INFO unless already more verbose
     root_logger = logging.getLogger()
     if root_logger.level > logging.INFO:
-        logging.basicConfig(level=logging.INFO, force=True,
-                            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                            datefmt="%Y-%m-%dT%H:%M:%S")
+        logging.basicConfig(
+            level=logging.INFO,
+            force=True,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
     config = _load_config(config_path)
 
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
@@ -74,8 +91,7 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
 @cli.command()
 @click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
 @click.option("--db", "db_path", type=click.Path(), default=None)
-@click.option("--repo", "repo_name", type=str, default=None,
-              help="Reindex a specific repo only")
+@click.option("--repo", "repo_name", type=str, default=None, help="Reindex a specific repo only")
 def reindex(config_path: str, db_path: str | None, repo_name: str | None):
     """Run a manual reindex from the command line."""
     from sqlprism.core.graph import GraphDB
@@ -102,7 +118,12 @@ def reindex(config_path: str, db_path: str | None, repo_name: str | None):
     for name, cfg in repos.items():
         path, dialect, dialect_overrides = parse_repo_config(cfg, config.get("sql_dialect"))
         click.echo(f"Indexing {name} ({path}){f' [{dialect}]' if dialect else ''}...")
-        stats = indexer.reindex_repo(name, path, dialect=dialect, dialect_overrides=dialect_overrides)
+        stats = indexer.reindex_repo(
+            name,
+            path,
+            dialect=dialect,
+            dialect_overrides=dialect_overrides,
+        )
         click.echo(
             f"  scanned={stats['files_scanned']}, "
             f"added={stats['files_added']}, "
@@ -186,15 +207,33 @@ def reindex(config_path: str, db_path: str | None, repo_name: str | None):
 @click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--name", "repo_name", type=str, required=True, help="Repo name for the index")
-@click.option("--project", "project_path", type=click.Path(exists=True), required=True,
-              help="Path to sqlmesh project dir (containing config.yaml)")
-@click.option("--env-file", type=click.Path(exists=True), default=None,
-              help="Path to .env file for sqlmesh config")
+@click.option(
+    "--project",
+    "project_path",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to sqlmesh project dir (containing config.yaml)",
+)
+@click.option(
+    "--env-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to .env file for sqlmesh config",
+)
 @click.option("--dialect", type=str, default="athena", help="SQL dialect (default: athena)")
-@click.option("--var", "variables", type=(str, str), multiple=True,
-              help="SQLMesh variables as key value pairs, e.g. --var GRACE_PERIOD 7")
-@click.option("--sqlmesh-command", type=str, default="uv run python",
-              help="Command to run python in sqlmesh venv (default: 'uv run python')")
+@click.option(
+    "--var",
+    "variables",
+    type=(str, str),
+    multiple=True,
+    help="SQLMesh variables as key value pairs, e.g. --var GRACE_PERIOD 7",
+)
+@click.option(
+    "--sqlmesh-command",
+    type=str,
+    default="uv run python",
+    help="Command to run python in sqlmesh venv (default: 'uv run python')",
+)
 def reindex_sqlmesh(
     config_path: str,
     db_path: str | None,
@@ -248,17 +287,38 @@ def reindex_sqlmesh(
 @click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--name", "repo_name", type=str, required=True, help="Repo name for the index")
-@click.option("--project", "project_path", type=click.Path(exists=True), required=True,
-              help="Path to dbt project dir (containing dbt_project.yml)")
-@click.option("--profiles-dir", type=click.Path(exists=True), default=None,
-              help="Path to directory containing profiles.yml (defaults to project dir)")
-@click.option("--env-file", type=click.Path(exists=True), default=None,
-              help="Path to .env file for dbt connection variables")
+@click.option(
+    "--project",
+    "project_path",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to dbt project dir (containing dbt_project.yml)",
+)
+@click.option(
+    "--profiles-dir",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to directory containing profiles.yml (defaults to project dir)",
+)
+@click.option(
+    "--env-file",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to .env file for dbt connection variables",
+)
 @click.option("--target", type=str, default=None, help="dbt target name")
-@click.option("--dbt-command", type=str, default="uv run dbt",
-              help="Command to invoke dbt (default: 'uv run dbt')")
-@click.option("--dialect", type=str, default=None,
-              help="SQL dialect for parsing (e.g. starrocks, mysql, postgres)")
+@click.option(
+    "--dbt-command",
+    type=str,
+    default="uv run dbt",
+    help="Command to invoke dbt (default: 'uv run dbt')",
+)
+@click.option(
+    "--dialect",
+    type=str,
+    default=None,
+    help="SQL dialect for parsing (e.g. starrocks, mysql, postgres)",
+)
 def reindex_dbt_cmd(
     config_path: str,
     db_path: str | None,
@@ -330,13 +390,24 @@ def _open_graph(config_path: str, db_path: str | None):
 @click.option("--schema", type=str, default=None, help="Filter by schema")
 @click.option("--repo", type=str, default=None, help="Filter by repo name")
 @click.option("--limit", type=int, default=20, help="Max results (default 20)")
-def query_search(config_path: str, db_path: str | None, pattern: str,
-                 kind: str | None, schema: str | None, repo: str | None, limit: int):
+def query_search(
+    config_path: str,
+    db_path: str | None,
+    pattern: str,
+    kind: str | None,
+    schema: str | None,
+    repo: str | None,
+    limit: int,
+):
     """Search nodes by name pattern."""
     graph = _open_graph(config_path, db_path)
     result = graph.query_search(
-        pattern=pattern, kind=kind, schema=schema, repo=repo,
-        limit=limit, include_snippets=False,
+        pattern=pattern,
+        kind=kind,
+        schema=schema,
+        repo=repo,
+        limit=limit,
+        include_snippets=False,
     )
     graph.close()
     click.echo(json.dumps(result, indent=2, default=str))
@@ -349,16 +420,30 @@ def query_search(config_path: str, db_path: str | None, pattern: str,
 @click.option("--kind", type=str, default=None, help="Filter by node kind")
 @click.option("--schema", type=str, default=None, help="Filter by schema")
 @click.option("--repo", type=str, default=None, help="Filter by repo name")
-@click.option("--direction", type=click.Choice(["both", "inbound", "outbound"]),
-              default="both", help="Edge direction (default both)")
-def query_references(config_path: str, db_path: str | None, name: str,
-                     kind: str | None, schema: str | None, repo: str | None,
-                     direction: str):
+@click.option(
+    "--direction",
+    type=click.Choice(["both", "inbound", "outbound"]),
+    default="both",
+    help="Edge direction (default both)",
+)
+def query_references(
+    config_path: str,
+    db_path: str | None,
+    name: str,
+    kind: str | None,
+    schema: str | None,
+    repo: str | None,
+    direction: str,
+):
     """Find all references to/from a named entity."""
     graph = _open_graph(config_path, db_path)
     result = graph.query_references(
-        name=name, kind=kind, schema=schema, repo=repo,
-        direction=direction, include_snippets=False,
+        name=name,
+        kind=kind,
+        schema=schema,
+        repo=repo,
+        direction=direction,
+        include_snippets=False,
     )
     graph.close()
     click.echo(json.dumps(result, indent=2, default=str))
@@ -371,12 +456,21 @@ def query_references(config_path: str, db_path: str | None, name: str,
 @click.option("--column", type=str, default=None, help="Filter by column name")
 @click.option("--usage-type", type=str, default=None, help="Filter by usage type")
 @click.option("--repo", type=str, default=None, help="Filter by repo name")
-def query_column_usage(config_path: str, db_path: str | None, table: str,
-                       column: str | None, usage_type: str | None, repo: str | None):
+def query_column_usage(
+    config_path: str,
+    db_path: str | None,
+    table: str,
+    column: str | None,
+    usage_type: str | None,
+    repo: str | None,
+):
     """Find column usage for a table."""
     graph = _open_graph(config_path, db_path)
     result = graph.query_column_usage(
-        table=table, column=column, usage_type=usage_type, repo=repo,
+        table=table,
+        column=column,
+        usage_type=usage_type,
+        repo=repo,
     )
     graph.close()
     click.echo(json.dumps(result, indent=2, default=str))
@@ -387,17 +481,32 @@ def query_column_usage(config_path: str, db_path: str | None, table: str,
 @click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--kind", type=str, default=None, help="Filter by node kind")
-@click.option("--direction", type=click.Choice(["downstream", "upstream", "both"]),
-              default="downstream", help="Trace direction (default downstream)")
+@click.option(
+    "--direction",
+    type=click.Choice(["downstream", "upstream", "both"]),
+    default="downstream",
+    help="Trace direction (default downstream)",
+)
 @click.option("--max-depth", type=int, default=3, help="Max traversal depth (default 3)")
 @click.option("--repo", type=str, default=None, help="Filter by repo name")
-def query_trace(config_path: str, db_path: str | None, name: str,
-                kind: str | None, direction: str, max_depth: int, repo: str | None):
+def query_trace(
+    config_path: str,
+    db_path: str | None,
+    name: str,
+    kind: str | None,
+    direction: str,
+    max_depth: int,
+    repo: str | None,
+):
     """Trace multi-hop dependency chains from a named entity."""
     graph = _open_graph(config_path, db_path)
     result = graph.query_trace(
-        name=name, kind=kind, direction=direction, max_depth=max_depth,
-        repo=repo, include_snippets=False,
+        name=name,
+        kind=kind,
+        direction=direction,
+        max_depth=max_depth,
+        repo=repo,
+        include_snippets=False,
     )
     graph.close()
     click.echo(json.dumps(result, indent=2, default=str))
@@ -410,13 +519,21 @@ def query_trace(config_path: str, db_path: str | None, name: str,
 @click.option("--column", type=str, default=None, help="Filter by column name")
 @click.option("--output-node", type=str, default=None, help="Filter by output node name")
 @click.option("--repo", type=str, default=None, help="Filter by repo name")
-def query_lineage(config_path: str, db_path: str | None,
-                  table: str | None, column: str | None,
-                  output_node: str | None, repo: str | None):
+def query_lineage(
+    config_path: str,
+    db_path: str | None,
+    table: str | None,
+    column: str | None,
+    output_node: str | None,
+    repo: str | None,
+):
     """Query column lineage chains."""
     graph = _open_graph(config_path, db_path)
     result = graph.query_column_lineage(
-        table=table, column=column, output_node=output_node, repo=repo,
+        table=table,
+        column=column,
+        output_node=output_node,
+        repo=repo,
     )
     graph.close()
     click.echo(json.dumps(result, indent=2, default=str))

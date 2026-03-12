@@ -71,11 +71,11 @@ def test_validate_command_empty():
 
 # ── DbtRenderer.render_project mocked tests ──
 
-import json
-import subprocess
-from unittest.mock import MagicMock, patch
+import json  # noqa: E402
+import subprocess  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
-from sqlprism.languages.sqlmesh import SqlMeshRenderer
+from sqlprism.languages.sqlmesh import SqlMeshRenderer  # noqa: E402
 
 
 def test_dbt_render_project_command_construction(tmp_path):
@@ -169,9 +169,7 @@ def test_dbt_render_project_timeout(tmp_path):
     renderer = DbtRenderer()
 
     with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
-        mock_run.side_effect = subprocess.TimeoutExpired(
-            cmd=["uv", "run", "dbt", "compile"], timeout=300
-        )
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["uv", "run", "dbt", "compile"], timeout=300)
 
         with pytest.raises(subprocess.TimeoutExpired):
             renderer.render_project(project_path=tmp_path)
@@ -186,14 +184,10 @@ def test_dbt_render_project_success(tmp_path):
     compiled_dir = tmp_path / "target" / "compiled" / "test_proj" / "models"
     compiled_dir.mkdir(parents=True)
 
-    (compiled_dir / "orders.sql").write_text(
-        "SELECT id, customer_id FROM raw.orders"
-    )
+    (compiled_dir / "orders.sql").write_text("SELECT id, customer_id FROM raw.orders")
     staging = compiled_dir / "staging"
     staging.mkdir()
-    (staging / "stg_customers.sql").write_text(
-        "SELECT id, name FROM raw.customers"
-    )
+    (staging / "stg_customers.sql").write_text("SELECT id, name FROM raw.customers")
 
     renderer = DbtRenderer()
 
@@ -280,9 +274,7 @@ def test_sqlmesh_render_project_timeout(tmp_path):
     renderer = SqlMeshRenderer()
 
     with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
-        mock_run.side_effect = subprocess.TimeoutExpired(
-            cmd=["uv", "run", "python", "-c", "..."], timeout=600
-        )
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["uv", "run", "python", "-c", "..."], timeout=600)
 
         with pytest.raises(subprocess.TimeoutExpired):
             renderer.render_project(project_path=tmp_path)
@@ -301,16 +293,14 @@ def test_sqlmesh_render_project_success(tmp_path):
     stdout_json = json.dumps({"rendered": rendered_models, "errors": []})
 
     with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout=stdout_json, stderr=""
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
 
         results = renderer.render_project(project_path=tmp_path)
 
     assert len(results) == 2, "Should have two model results"
 
     for model_name, parse_result in results.items():
-        assert model_name in rendered_models, f"Key should be original model name"
+        assert model_name in rendered_models, "Key should be original model name"
         assert len(parse_result.nodes) > 0, f"Model {model_name} should have nodes"
         for node in parse_result.nodes:
             assert "sqlmesh_model" in node.metadata, "Nodes should have sqlmesh_model metadata"

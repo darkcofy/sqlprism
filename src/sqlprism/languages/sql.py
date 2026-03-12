@@ -90,8 +90,14 @@ class SqlParser:
 
             try:
                 self._process_statement(
-                    stmt, file_stem, file_path, nodes, edges, column_usage,
-                    seen_nodes=seen_nodes, seen_ctes=seen_ctes,
+                    stmt,
+                    file_stem,
+                    file_path,
+                    nodes,
+                    edges,
+                    column_usage,
+                    seen_nodes=seen_nodes,
+                    seen_ctes=seen_ctes,
                 )
             except Exception as e:
                 errors.append(f"Statement {stmt_idx}: {type(e).__name__}: {e}")
@@ -99,9 +105,7 @@ class SqlParser:
 
             # Column lineage via sqlglot.lineage — separate pass
             try:
-                self._extract_column_lineage(
-                    stmt, file_stem, file_content, column_lineage, schema=schema
-                )
+                self._extract_column_lineage(stmt, file_stem, file_content, column_lineage, schema=schema)
             except Exception as e:
                 errors.append(f"Lineage stmt {stmt_idx}: {type(e).__name__}: {e}")
                 continue
@@ -129,10 +133,7 @@ class SqlParser:
         """Process a single SQL statement."""
         # Use persistent dedup sets across statements, or create fresh ones
         if seen_nodes is None:
-            seen_nodes = {
-                (n.name, n.kind, (n.metadata or {}).get("schema"))
-                for n in nodes
-            }
+            seen_nodes = {(n.name, n.kind, (n.metadata or {}).get("schema")) for n in nodes}
         seen_edges: set[tuple[str, str, str]] = set()
 
         # CREATE TABLE / CREATE VIEW
@@ -213,10 +214,7 @@ class SqlParser:
     ) -> None:
         """Extract all table references from a statement."""
         if seen_nodes is None:
-            seen_nodes = {
-                (n.name, n.kind, (n.metadata or {}).get("schema"))
-                for n in nodes
-            }
+            seen_nodes = {(n.name, n.kind, (n.metadata or {}).get("schema")) for n in nodes}
         if seen_edges is None:
             seen_edges = set()
 
@@ -227,7 +225,10 @@ class SqlParser:
             if isinstance(target_expr, exp.Schema):
                 target_expr = target_expr.this
             if isinstance(target_expr, exp.Table) and target_expr.name:
-                create_target = self._normalize_identifier(target_expr.name, self._is_quoted_identifier(target_expr))
+                create_target = self._normalize_identifier(
+                    target_expr.name,
+                    self._is_quoted_identifier(target_expr),
+                )
 
         for table in stmt.find_all(exp.Table):
             name = self._normalize_identifier(table.name, self._is_quoted_identifier(table))
@@ -321,7 +322,10 @@ class SqlParser:
 
             # Find tables referenced within this CTE
             for table in cte.find_all(exp.Table):
-                table_name = self._normalize_identifier(table.name, self._is_quoted_identifier(table))
+                table_name = self._normalize_identifier(
+                    table.name,
+                    self._is_quoted_identifier(table),
+                )
                 if not table_name or table_name == cte_name:
                     continue
 
@@ -406,20 +410,24 @@ class SqlParser:
                 if isinstance(table_expr, exp.Schema):
                     table_expr = table_expr.this
                 if isinstance(table_expr, exp.Table) and table_expr.name:
-                    scope_name = self._normalize_identifier(table_expr.name, self._is_quoted_identifier(table_expr))
+                    scope_name = self._normalize_identifier(
+                        table_expr.name,
+                        self._is_quoted_identifier(table_expr),
+                    )
             elif scope_kind == "query" and (scope_name, "query", None) not in {
                 (n.name, n.kind, (n.metadata or {}).get("schema")) for n in nodes
             }:
                 # Bare SELECT root scope — create a query node so column_usage resolves
-                nodes.append(
-                    NodeResult(kind="query", name=scope_name, metadata={"bare_query": True})
-                )
+                nodes.append(NodeResult(kind="query", name=scope_name, metadata={"bare_query": True}))
 
             # Build alias → real table name mapping
             alias_map: dict[str, str] = {}
             for source_name, source in scope.sources.items():
                 if isinstance(source, exp.Table):
-                    alias_map[source_name] = self._normalize_identifier(source.name, self._is_quoted_identifier(source))
+                    alias_map[source_name] = self._normalize_identifier(
+                        source.name,
+                        self._is_quoted_identifier(source),
+                    )
 
             # When there's exactly one source and no table qualifier, infer the table
             single_table = ""
@@ -552,28 +560,42 @@ class SqlParser:
         """
         # Wrapping expression types that constitute a "transform"
         transform_types = (
-            exp.Cast, exp.TryCast,
+            exp.Cast,
+            exp.TryCast,
             exp.Coalesce,
-            exp.If, exp.Case,
+            exp.If,
+            exp.Case,
             exp.Anonymous,  # function calls like NVL, IFNULL, etc.
-            exp.Func,       # base class for all functions (UPPER, LOWER, etc.)
-            exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod,
+            exp.Func,  # base class for all functions (UPPER, LOWER, etc.)
+            exp.Add,
+            exp.Sub,
+            exp.Mul,
+            exp.Div,
+            exp.Mod,
             exp.Concat,
-            exp.DPipe,      # || concat operator
+            exp.DPipe,  # || concat operator
             exp.Substring,
             exp.Trim,
-            exp.Extract,    # EXTRACT(YEAR FROM ...)
-            exp.DateAdd, exp.DateSub, exp.DateDiff,
+            exp.Extract,  # EXTRACT(YEAR FROM ...)
+            exp.DateAdd,
+            exp.DateSub,
+            exp.DateDiff,
             exp.Between,
             exp.In,
             exp.Like,
-            exp.Neg,        # unary minus
+            exp.Neg,  # unary minus
         )
 
         # Comparison types — include as transforms but don't traverse past
         comparison_types = (
-            exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE,
-            exp.Is, exp.Not,
+            exp.EQ,
+            exp.NEQ,
+            exp.GT,
+            exp.GTE,
+            exp.LT,
+            exp.LTE,
+            exp.Is,
+            exp.Not,
         )
 
         parent = col.parent
@@ -587,9 +609,20 @@ class SqlParser:
                 break  # comparisons are the natural boundary for WHERE/JOIN
             elif isinstance(parent, (exp.And, exp.Or)):
                 break  # don't capture the full AND/OR chain
-            elif isinstance(parent, (exp.Select, exp.Where, exp.Group,
-                                     exp.Order, exp.Having, exp.Join,
-                                     exp.From, exp.Subquery, exp.CTE)):
+            elif isinstance(
+                parent,
+                (
+                    exp.Select,
+                    exp.Where,
+                    exp.Group,
+                    exp.Order,
+                    exp.Having,
+                    exp.Join,
+                    exp.From,
+                    exp.Subquery,
+                    exp.CTE,
+                ),
+            ):
                 # Stop at clause boundaries
                 break
             parent = parent.parent
@@ -613,8 +646,7 @@ class SqlParser:
         while parent:
             if isinstance(parent, exp.Alias):
                 return parent.alias
-            if isinstance(parent, (exp.Select, exp.Where, exp.Group,
-                                   exp.Order, exp.Having)):
+            if isinstance(parent, (exp.Select, exp.Where, exp.Group, exp.Order, exp.Having)):
                 break
             parent = parent.parent
         return None
@@ -659,8 +691,7 @@ class SqlParser:
         # Try exact match first, then match by name only (handles query→table/view mapping)
         # Use enumerate to avoid O(N) nodes.index() and wrong-match-on-duplicates bug
         for idx, node in enumerate(nodes):
-            if node.name == scope_name and (node.kind == scope_kind or
-                    node.kind in ("table", "view", "cte")):
+            if node.name == scope_name and (node.kind == scope_kind or node.kind in ("table", "view", "cte")):
                 existing_meta = dict(node.metadata) if node.metadata else {}
                 existing_meta["filters"] = filters
                 # NodeResult is frozen, so we need to replace it
@@ -767,7 +798,12 @@ class SqlParser:
                 # Can't trace SELECT * without schema catalog
                 continue
             try:
-                root = sqlglot_lineage(col_name, qualified_stmt, dialect=self.dialect, schema=schema)
+                root = sqlglot_lineage(
+                    col_name,
+                    qualified_stmt,
+                    dialect=self.dialect,
+                    schema=schema,
+                )
             except Exception:
                 continue
 
@@ -812,7 +848,9 @@ class SqlParser:
         # Extract info from this node
         name = node.name if hasattr(node, "name") else ""
         source = node.source.sql() if hasattr(node, "source") and node.source else ""
-        expr_str = node.expression.sql(dialect=self.dialect) if hasattr(node, "expression") and node.expression else None
+        expr_str = (
+            node.expression.sql(dialect=self.dialect) if hasattr(node, "expression") and node.expression else None
+        )
 
         # Parse column and table from the node name (format: "table.column" or just "column")
         parts = name.split(".") if name else []
@@ -845,9 +883,7 @@ class SqlParser:
         for child in downstream:
             if _chain_count[0] >= max_chains:
                 break
-            all_chains.extend(
-                self._walk_lineage_tree(child, new_chain, max_depth, max_chains, _chain_count)
-            )
+            all_chains.extend(self._walk_lineage_tree(child, new_chain, max_depth, max_chains, _chain_count))
         return all_chains
 
     def _extract_insert_select_mapping(
@@ -888,7 +924,10 @@ class SqlParser:
         # Build alias → real table name mapping from the SELECT's FROM/JOIN sources
         alias_map: dict[str, str] = {}
         for table_ref in select.find_all(exp.Table):
-            tbl_name = self._normalize_identifier(table_ref.name, self._is_quoted_identifier(table_ref))
+            tbl_name = self._normalize_identifier(
+                table_ref.name,
+                self._is_quoted_identifier(table_ref),
+            )
             if tbl_name:
                 alias_map[tbl_name] = tbl_name
                 if table_ref.alias:

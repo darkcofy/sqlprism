@@ -61,9 +61,13 @@ def enrich_nodes(result: ParseResult, metadata_key: str, metadata_value: str) ->
     for node in result.nodes:
         meta = dict(node.metadata) if node.metadata else {}
         meta[metadata_key] = metadata_value
-        enriched.append(NodeResult(
-            kind=node.kind, name=node.name,
-            line_start=node.line_start, line_end=node.line_end,
-            metadata=meta,
-        ))
+        enriched.append(
+            NodeResult(
+                kind=node.kind,
+                name=node.name,
+                line_start=node.line_start,
+                line_end=node.line_end,
+                metadata=meta,
+            )
+        )
     result.nodes = enriched
