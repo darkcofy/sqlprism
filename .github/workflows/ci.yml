@@ -25,8 +25,11 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
-      - name: Lint
-        run: uv run ruff check src/ tests/
+      - name: Format
+        run: uv run ruff format src/ tests/
+
+      - name: Lint (auto-fix)
+        run: uv run ruff check --fix src/ tests/
 
       - name: Test with coverage
         run: uv run pytest --cov=sqlprism --cov-report=xml

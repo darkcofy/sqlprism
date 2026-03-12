@@ -84,7 +84,7 @@ class DbtRenderer:
 
         # Use dialect-specific parser if needed (e.g. starrocks uses backticks)
         parser = self.sql_parser
-        if dialect and dialect != getattr(parser, 'dialect', None):
+        if dialect and dialect != getattr(parser, "dialect", None):
             parser = SqlParser(dialect=dialect)
 
         env = build_env(env_file)
@@ -119,7 +119,8 @@ class DbtRenderer:
             # Derive model name from file stem, schema from parent directory.
             path_parts = rel_path.removesuffix(".sql").split("/")
             model_name = path_parts[-1]  # e.g. "orders"
-            model_schema = "/".join(path_parts[:-1]) if len(path_parts) > 1 else None  # e.g. "staging"
+            # e.g. "staging"
+            model_schema = "/".join(path_parts[:-1]) if len(path_parts) > 1 else None
 
             # Quote names to handle dashes and special chars
             safe_name = model_name.replace('"', '""')
@@ -149,8 +150,10 @@ class DbtRenderer:
         _validate_command(dbt_command, allowed_keywords={"dbt", "uv", "uvx"})
         cmd = shlex.split(dbt_command) + [
             "compile",
-            "--project-dir", str(project_path),
-            "--profiles-dir", str(profiles_dir),
+            "--project-dir",
+            str(project_path),
+            "--profiles-dir",
+            str(profiles_dir),
         ]
         if target:
             cmd.extend(["--target", target])
@@ -165,23 +168,20 @@ class DbtRenderer:
         )
 
         if result.returncode != 0:
-            raise RuntimeError(
-                f"dbt compile failed (exit {result.returncode}):\n{result.stderr}"
-            )
+            raise RuntimeError(f"dbt compile failed (exit {result.returncode}):\n{result.stderr}")
 
     def _get_project_name(self, project_path: Path) -> str:
         """Read project name from dbt_project.yml."""
         dbt_project_file = project_path / "dbt_project.yml"
         if not dbt_project_file.exists():
-            raise FileNotFoundError(
-                f"No dbt_project.yml found in {project_path}"
-            )
+            raise FileNotFoundError(f"No dbt_project.yml found in {project_path}")
 
         content = dbt_project_file.read_text()
 
         # Try proper YAML parsing first (pyyaml may be available via dbt)
         try:
             import yaml
+
             data = yaml.safe_load(content)
             if isinstance(data, dict) and "name" in data:
                 return str(data["name"])
@@ -197,5 +197,3 @@ class DbtRenderer:
                 return name
 
         raise ValueError(f"Could not find 'name:' in {dbt_project_file}")
-
-
