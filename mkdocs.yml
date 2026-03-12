@@ -1,6 +1,7 @@
 site_name: SQLPrism
 site_description: MCP server that indexes SQL codebases into a queryable knowledge graph
-# repo_url: https://github.com/your-org/sqlprism
+site_url: https://darkcofy.github.io/sqlprism/
+repo_url: https://github.com/darkcofy/sqlprism
 
 theme:
   name: material
