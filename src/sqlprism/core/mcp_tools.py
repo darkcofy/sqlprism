@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from sqlprism.core.graph import GraphDB
 from sqlprism.core.indexer import Indexer
 from sqlprism.languages import is_sql_file
-from sqlprism.types import ParseResult, parse_repo_config
+from sqlprism.types import NodeResult, ParseResult, parse_repo_config
 
 # ── Server initialisation ──
 
@@ -108,10 +108,20 @@ def _resolve_repo_config(repo_name: str) -> tuple[str, str | None, dict[str, str
 
 class SearchInput(BaseModel):
     model_config = {"populate_by_name": True}
-    pattern: str = Field(..., description="Search pattern (partial name match, case-insensitive)")
-    kind: Optional[str] = Field(None, description="Filter by node kind: 'table', 'view', 'cte', 'query'")
-    sql_schema: Optional[str] = Field(None, alias="schema", description="Filter by SQL schema name (e.g. 'staging', 'public')")
-    repo: Optional[str] = Field(None, description="Filter by repo name. Omit to search all repos.")
+    pattern: str = Field(
+        ...,
+        description="Search pattern (partial name match, case-insensitive)",
+    )
+    kind: str | None = Field(
+        None,
+        description="Filter by node kind: 'table', 'view', 'cte', 'query'",
+    )
+    sql_schema: str | None = Field(
+        None,
+        alias="schema",
+        description="Filter by SQL schema name (e.g. 'staging', 'public')",
+    )
+    repo: str | None = Field(None, description="Filter by repo name. Omit to search all repos.")
     limit: int = Field(20, description="Max results (default 20)", ge=1, le=100)
     offset: int = Field(0, description="Number of results to skip for pagination (default 0)", ge=0)
     include_snippets: bool = Field(True, description="Include source code snippets in results")
@@ -147,10 +157,20 @@ async def search(params: SearchInput) -> dict:
 class FindReferencesInput(BaseModel):
     model_config = {"populate_by_name": True}
     name: str = Field(..., description="Entity name (table, view, CTE, etc.)")
-    kind: Optional[str] = Field(None, description="Filter by node kind to disambiguate")
-    sql_schema: Optional[str] = Field(None, alias="schema", description="Filter by SQL schema name (e.g. 'staging', 'public')")
-    repo: Optional[str] = Field(None, description="Filter by repo name. Omit to search all repos.")
-    direction: Literal["both", "inbound", "outbound"] = Field("both", description="'inbound', 'outbound', or 'both'")
+    kind: str | None = Field(None, description="Filter by node kind to disambiguate")
+    sql_schema: str | None = Field(
+        None,
+        alias="schema",
+        description="Filter by SQL schema name (e.g. 'staging', 'public')",
+    )
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to search all repos.",
+    )
+    direction: Literal["both", "inbound", "outbound"] = Field(
+        "both",
+        description="'inbound', 'outbound', or 'both'",
+    )
     include_snippets: bool = Field(True, description="Include source code snippets in results")
     limit: int = Field(100, description="Max results per direction (default 100)", ge=1, le=500)
     offset: int = Field(0, description="Number of results to skip for pagination (default 0)", ge=0)
@@ -186,9 +206,12 @@ async def find_references(params: FindReferencesInput) -> dict:
 
 class FindColumnUsageInput(BaseModel):
     table: str = Field(..., description="Table name to search column usage for")
-    column: Optional[str] = Field(None, description="Specific column name. Omit for all columns.")
-    usage_type: Optional[str] = Field(None, description="Filter: 'select', 'where', 'join_on', 'group_by', 'order_by', 'having', 'insert', 'update'")
-    repo: Optional[str] = Field(None, description="Filter by repo name. Omit to search all repos.")
+    column: str | None = Field(None, description="Specific column name. Omit for all columns.")
+    usage_type: str | None = Field(
+        None,
+        description=("Filter: 'select', 'where', 'join_on', 'group_by', 'order_by', 'having', 'insert', 'update'"),
+    )
+    repo: str | None = Field(None, description="Filter by repo name. Omit to search all repos.")
     limit: int = Field(100, description="Max results (default 100)", ge=1, le=500)
     offset: int = Field(0, description="Number of results to skip for pagination (default 0)", ge=0)
 
@@ -224,11 +247,25 @@ async def find_column_usage(params: FindColumnUsageInput) -> dict:
 
 class TraceDependenciesInput(BaseModel):
     name: str = Field(..., description="Starting entity name")
-    kind: Optional[str] = Field(None, description="Filter by node kind to disambiguate")
-    direction: Literal["upstream", "downstream", "both"] = Field("downstream", description="'upstream', 'downstream', or 'both'")
-    max_depth: int = Field(3, description="Maximum hops to traverse (default 3, max 6)", ge=1, le=6)
-    repo: Optional[str] = Field(None, description="Filter by repo name. Omit to trace across all repos.")
-    include_snippets: bool = Field(False, description="Include source code snippets (default false for trace, can be large)")
+    kind: str | None = Field(None, description="Filter by node kind to disambiguate")
+    direction: Literal["upstream", "downstream", "both"] = Field(
+        "downstream",
+        description="'upstream', 'downstream', or 'both'",
+    )
+    max_depth: int = Field(
+        3,
+        description="Maximum hops to traverse (default 3, max 6)",
+        ge=1,
+        le=6,
+    )
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to trace across all repos.",
+    )
+    include_snippets: bool = Field(
+        False,
+        description="Include source code snippets (default false for trace, can be large)",
+    )
     limit: int = Field(100, description="Max results (default 100)", ge=1, le=500)
 
 
@@ -260,10 +297,19 @@ async def trace_dependencies(params: TraceDependenciesInput) -> dict:
 
 
 class TraceColumnLineageInput(BaseModel):
-    table: Optional[str] = Field(None, description="Source or intermediate table name to trace lineage for")
-    column: Optional[str] = Field(None, description="Column name to trace")
-    output_node: Optional[str] = Field(None, description="Output entity name (table/view/query) to trace lineage from")
-    repo: Optional[str] = Field(None, description="Filter by repo name. Omit to search all repos.")
+    table: str | None = Field(
+        None,
+        description="Source or intermediate table name to trace lineage for",
+    )
+    column: str | None = Field(
+        None,
+        description="Column name to trace",
+    )
+    output_node: str | None = Field(
+        None,
+        description="Output entity name (table/view/query) to trace lineage from",
+    )
+    repo: str | None = Field(None, description="Filter by repo name. Omit to search all repos.")
     limit: int = Field(100, description="Max lineage chains to return (default 100)", ge=1, le=500)
     offset: int = Field(0, description="Number of chains to skip for pagination (default 0)", ge=0)
 
@@ -302,12 +348,23 @@ async def trace_column_lineage(params: TraceColumnLineageInput) -> dict:
 
 
 class PrImpactInput(BaseModel):
-    base_commit: str = Field(..., description="Git commit hash or ref to compare against (e.g., 'main', 'abc123f')")
-    repo: Optional[str] = Field(None, description="Repo to analyse. Required if multiple repos configured.")
-    max_blast_radius_depth: int = Field(3, description="Hops to trace from changed nodes (default 3)", ge=1, le=6)
+    base_commit: str = Field(
+        ...,
+        description="Git commit hash or ref to compare against (e.g., 'main', 'abc123f')",
+    )
+    repo: str | None = Field(
+        None,
+        description="Repo to analyse. Required if multiple repos configured.",
+    )
+    max_blast_radius_depth: int = Field(
+        3,
+        description="Hops to trace from changed nodes (default 3)",
+        ge=1,
+        le=6,
+    )
     compare_mode: Literal["delta", "absolute"] = Field(
         "delta",
-        description="'delta' = net-new impact vs base (default), 'absolute' = total blast radius (v1 behavior)",
+        description=("'delta' = net-new impact vs base (default), 'absolute' = total blast radius (v1 behavior)"),
     )
 
 
@@ -379,9 +436,7 @@ async def pr_impact(params: PrImpactInput) -> dict:
         added_names = {n["name"] for n in diff["nodes_added"]}
 
         # Build exclude set: edges added in HEAD that did not exist at base
-        edges_added_set: set[tuple[str, str]] = {
-            (e["source"], e["target"]) for e in diff.get("edges_added", [])
-        }
+        edges_added_set: set[tuple[str, str]] = {(e["source"], e["target"]) for e in diff.get("edges_added", [])}
 
         is_delta = params.compare_mode == "delta"
 
@@ -397,26 +452,24 @@ async def pr_impact(params: PrImpactInput) -> dict:
             for node_name in affected_node_names[:20]:
                 # HEAD blast radius (current graph)
                 head_trace = graph.query_trace(
-                    name=node_name, direction="downstream",
+                    name=node_name,
+                    direction="downstream",
                     max_depth=params.max_blast_radius_depth,
                 )
                 head_paths = head_trace.get("paths", [])
-                head_affected.update(
-                    (p["name"], p["kind"]) for p in head_paths
-                )
+                head_affected.update((p["name"], p["kind"]) for p in head_paths)
                 all_head_paths.extend(head_paths)
                 repos_hit.update(head_trace.get("repos_affected", []))
 
                 # Base blast radius approximation (exclude new edges)
                 if is_delta and node_name not in added_names:
                     base_trace = graph.query_trace(
-                        name=node_name, direction="downstream",
+                        name=node_name,
+                        direction="downstream",
                         max_depth=params.max_blast_radius_depth,
                         exclude_edges=edges_added_set,
                     )
-                    base_affected.update(
-                        (p["name"], p["kind"]) for p in base_trace.get("paths", [])
-                    )
+                    base_affected.update((p["name"], p["kind"]) for p in base_trace.get("paths", []))
 
             if is_delta:
                 newly_affected = head_affected - base_affected
@@ -427,14 +480,8 @@ async def pr_impact(params: PrImpactInput) -> dict:
                     "head_total": len(head_affected),
                     "base_total": len(base_affected),
                     "delta": len(head_affected) - len(base_affected),
-                    "newly_affected": [
-                        {"name": n, "kind": k}
-                        for n, k in sorted(newly_affected)
-                    ],
-                    "no_longer_affected": [
-                        {"name": n, "kind": k}
-                        for n, k in sorted(no_longer_affected)
-                    ],
+                    "newly_affected": [{"name": n, "kind": k} for n, k in sorted(newly_affected)],
+                    "no_longer_affected": [{"name": n, "kind": k} for n, k in sorted(no_longer_affected)],
                     "unchanged_affected": len(head_affected & base_affected),
                     "note": (
                         "Delta mode approximates the base blast radius by "
@@ -453,10 +500,7 @@ async def pr_impact(params: PrImpactInput) -> dict:
                 blast_radius = {
                     "compare_mode": "absolute",
                     "transitively_affected": len(all_head_paths),
-                    "affected_by_repo": {
-                        r: sum(1 for a in all_head_paths if a.get("repo") == r)
-                        for r in repos_hit
-                    },
+                    "affected_by_repo": {r: sum(1 for a in all_head_paths if a.get("repo") == r) for r in repos_hit},
                     "repos_affected": sorted(repos_hit),
                     "truncated": truncated,
                     "total_affected_nodes": len(affected_node_names),
@@ -465,7 +509,8 @@ async def pr_impact(params: PrImpactInput) -> dict:
             if truncated:
                 blast_radius["truncation_message"] = (
                     f"Blast radius incomplete — {len(affected_node_names)} affected nodes, "
-                    f"only first 20 traced. Use trace_dependencies on specific nodes for full picture."
+                    "only first 20 traced. Use trace_dependencies "
+                    "on specific nodes for full picture."
                 )
 
         return {
@@ -481,7 +526,7 @@ async def pr_impact(params: PrImpactInput) -> dict:
 
 
 class ReindexInput(BaseModel):
-    repo: Optional[str] = Field(None, description="Specific repo to reindex. Omit for all repos.")
+    repo: str | None = Field(None, description="Specific repo to reindex. Omit for all repos.")
 
 
 @mcp.tool(
@@ -525,6 +570,7 @@ async def reindex(params: ReindexInput) -> dict:
         async def _background_reindex():
             global _reindex_status
             try:
+
                 def _blocking():
                     global _reindex_status
                     results = {}
@@ -532,7 +578,10 @@ async def reindex(params: ReindexInput) -> dict:
                         _reindex_status = {**_reindex_status, "current_repo": name}
                         path, dialect, dialect_overrides = _resolve_repo_config(name)
                         results[name] = indexer.reindex_repo(
-                            name, path, dialect=dialect, dialect_overrides=dialect_overrides,
+                            name,
+                            path,
+                            dialect=dialect,
+                            dialect_overrides=dialect_overrides,
                         )
                     return results
 
@@ -561,18 +610,33 @@ async def reindex(params: ReindexInput) -> dict:
 
     return {
         "status": "started",
-        "message": "Reindex running in background. Queries remain available. Call index_status to check progress.",
+        "message": ("Reindex running in background. Queries remain available. Call index_status to check progress."),
         "repos": repo_names,
     }
 
 
 class ReindexSqlmeshInput(BaseModel):
     name: str = Field(..., description="Repo name for the index")
-    project_path: str = Field(..., description="Path to sqlmesh project dir (containing config.yaml)")
-    env_file: Optional[str] = Field(None, description="Path to .env file for sqlmesh config variables")
-    dialect: str = Field("athena", description="SQL dialect for rendering (default: athena)")
-    variables: Optional[dict[str, str]] = Field(None, description="SQLMesh variables, e.g. {\"GRACE_PERIOD\": \"7\"}")
-    sqlmesh_command: str = Field("uv run python", description="Command to run python in sqlmesh venv")
+    project_path: str = Field(
+        ...,
+        description="Path to sqlmesh project dir (containing config.yaml)",
+    )
+    env_file: str | None = Field(
+        None,
+        description="Path to .env file for sqlmesh config variables",
+    )
+    dialect: str = Field(
+        "athena",
+        description="SQL dialect for rendering (default: athena)",
+    )
+    variables: dict[str, str] | None = Field(
+        None,
+        description='SQLMesh variables, e.g. {"GRACE_PERIOD": "7"}',
+    )
+    sqlmesh_command: str = Field(
+        "uv run python",
+        description="Command to run python in sqlmesh venv",
+    )
 
 
 @mcp.tool(
@@ -649,19 +713,36 @@ async def reindex_sqlmesh(params: ReindexSqlmeshInput) -> dict:
 
     return {
         "status": "started",
-        "message": "SQLMesh reindex running in background. Queries remain available. Call index_status to check progress.",
+        "message": (
+            "SQLMesh reindex running in background. Queries remain available. Call index_status to check progress."
+        ),
         "repos": [params.name],
     }
 
 
 class ReindexDbtInput(BaseModel):
     name: str = Field(..., description="Repo name for the index")
-    project_path: str = Field(..., description="Path to dbt project dir (containing dbt_project.yml)")
-    profiles_dir: Optional[str] = Field(None, description="Path to directory containing profiles.yml")
-    env_file: Optional[str] = Field(None, description="Path to .env file for dbt connection variables")
-    target: Optional[str] = Field(None, description="dbt target name")
-    dbt_command: str = Field("uv run dbt", description="Command to invoke dbt")
-    dialect: Optional[str] = Field(None, description="SQL dialect for parsing (e.g. 'starrocks', 'mysql', 'postgres')")
+    project_path: str = Field(
+        ...,
+        description="Path to dbt project dir (containing dbt_project.yml)",
+    )
+    profiles_dir: str | None = Field(
+        None,
+        description="Path to directory containing profiles.yml",
+    )
+    env_file: str | None = Field(
+        None,
+        description="Path to .env file for dbt connection variables",
+    )
+    target: str | None = Field(None, description="dbt target name")
+    dbt_command: str = Field(
+        "uv run dbt",
+        description="Command to invoke dbt",
+    )
+    dialect: str | None = Field(
+        None,
+        description="SQL dialect for parsing (e.g. 'starrocks', 'mysql', 'postgres')",
+    )
 
 
 @mcp.tool(
@@ -731,7 +812,9 @@ async def reindex_dbt(params: ReindexDbtInput) -> dict:
 
     return {
         "status": "started",
-        "message": "dbt reindex running in background. Queries remain available. Call index_status to check progress.",
+        "message": (
+            "dbt reindex running in background. Queries remain available. Call index_status to check progress."
+        ),
         "repos": [params.name],
     }
 
@@ -762,7 +845,7 @@ async def index_status() -> dict:
 # ── Internal helpers ──
 
 
-def _node_fingerprint(node: "NodeResult") -> str:
+def _node_fingerprint(node: NodeResult) -> str:
     """Create a comparable fingerprint for a node including metadata."""
     return json.dumps(node.metadata, sort_keys=True) if node.metadata else ""
 
@@ -801,15 +884,23 @@ def _compute_structural_diff(
             old_node_meta[key] = _node_fingerprint(n)
             old_schema_lookup[(n.name, n.kind)] = schema
         for e in result.edges:
-            edge_tuple = (e.source_name, e.source_kind, e.target_name, e.target_kind, e.relationship)
+            edge_tuple = (
+                e.source_name,
+                e.source_kind,
+                e.target_name,
+                e.target_kind,
+                e.relationship,
+            )
             old_edges.add(edge_tuple)
             src_schema = old_schema_lookup.get((e.source_name, e.source_kind))
-            old_node_edges.setdefault((e.source_name, e.source_kind, src_schema), set()).add(edge_tuple)
+            src_key = (e.source_name, e.source_kind, src_schema)
+            old_node_edges.setdefault(src_key, set()).add(edge_tuple)
         for c in result.column_usage:
             col_tuple = (c.node_name, c.table_name, c.column_name, c.usage_type)
             old_columns.add(col_tuple)
             col_schema = old_schema_lookup.get((c.node_name, c.node_kind))
-            old_node_columns.setdefault((c.node_name, c.node_kind, col_schema), set()).add(col_tuple)
+            col_key = (c.node_name, c.node_kind, col_schema)
+            old_node_columns.setdefault(col_key, set()).add(col_tuple)
 
     for result in new_results.values():
         for n in result.nodes:
@@ -821,22 +912,32 @@ def _compute_structural_diff(
             new_node_meta[key] = _node_fingerprint(n)
             new_schema_lookup[(n.name, n.kind)] = schema
         for e in result.edges:
-            edge_tuple = (e.source_name, e.source_kind, e.target_name, e.target_kind, e.relationship)
+            edge_tuple = (
+                e.source_name,
+                e.source_kind,
+                e.target_name,
+                e.target_kind,
+                e.relationship,
+            )
             new_edges.add(edge_tuple)
             src_schema = new_schema_lookup.get((e.source_name, e.source_kind))
-            new_node_edges.setdefault((e.source_name, e.source_kind, src_schema), set()).add(edge_tuple)
+            src_key = (e.source_name, e.source_kind, src_schema)
+            new_node_edges.setdefault(src_key, set()).add(edge_tuple)
         for c in result.column_usage:
             col_tuple = (c.node_name, c.table_name, c.column_name, c.usage_type)
             new_columns.add(col_tuple)
             col_schema = new_schema_lookup.get((c.node_name, c.node_kind))
-            new_node_columns.setdefault((c.node_name, c.node_kind, col_schema), set()).add(col_tuple)
+            col_key = (c.node_name, c.node_kind, col_schema)
+            new_node_columns.setdefault(col_key, set()).add(col_tuple)
 
     # A node present in both is "modified" if its edges, columns, or metadata changed
     nodes_modified = []
     for key in old_nodes & new_nodes:
-        if (old_node_edges.get(key, set()) != new_node_edges.get(key, set())
-                or old_node_columns.get(key, set()) != new_node_columns.get(key, set())
-                or old_node_meta.get(key, "") != new_node_meta.get(key, "")):
+        if (
+            old_node_edges.get(key, set()) != new_node_edges.get(key, set())
+            or old_node_columns.get(key, set()) != new_node_columns.get(key, set())
+            or old_node_meta.get(key, "") != new_node_meta.get(key, "")
+        ):
             entry = {"name": key[0], "kind": key[1]}
             if key[2] is not None:
                 entry["schema"] = key[2]
@@ -853,19 +954,29 @@ def _compute_structural_diff(
         "nodes_removed": [_node_dict(n) for n in old_nodes - new_nodes],
         "nodes_modified": nodes_modified,
         "edges_added": [
-            {"source": e[0], "source_kind": e[1], "target": e[2], "target_kind": e[3], "relationship": e[4]}
+            {
+                "source": e[0],
+                "source_kind": e[1],
+                "target": e[2],
+                "target_kind": e[3],
+                "relationship": e[4],
+            }
             for e in new_edges - old_edges
         ],
         "edges_removed": [
-            {"source": e[0], "source_kind": e[1], "target": e[2], "target_kind": e[3], "relationship": e[4]}
+            {
+                "source": e[0],
+                "source_kind": e[1],
+                "target": e[2],
+                "target_kind": e[3],
+                "relationship": e[4],
+            }
             for e in old_edges - new_edges
         ],
         "columns_added": [
-            {"node": c[0], "table": c[1], "column": c[2], "usage_type": c[3]}
-            for c in new_columns - old_columns
+            {"node": c[0], "table": c[1], "column": c[2], "usage_type": c[3]} for c in new_columns - old_columns
         ],
         "columns_removed": [
-            {"node": c[0], "table": c[1], "column": c[2], "usage_type": c[3]}
-            for c in old_columns - new_columns
+            {"node": c[0], "table": c[1], "column": c[2], "usage_type": c[3]} for c in old_columns - new_columns
         ],
     }

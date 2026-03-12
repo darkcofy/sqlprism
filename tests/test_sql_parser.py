@@ -14,7 +14,7 @@ def test_parse_result_is_returned():
 def test_create_table_emits_node_and_edge():
     parser = SqlParser()
     result = parser.parse("schema.sql", "CREATE TABLE orders (id INT, total DECIMAL)")
-    
+
     table_nodes = [n for n in result.nodes if n.kind == "table" and n.name == "orders"]
     assert len(table_nodes) >= 1
 
@@ -47,10 +47,7 @@ def test_cte_is_first_class_node():
     assert len(cte_nodes) == 1
 
     # CTE should reference the orders table
-    cte_edges = [
-        e for e in result.edges
-        if e.source_name == "recent_orders" and e.target_name == "orders"
-    ]
+    cte_edges = [e for e in result.edges if e.source_name == "recent_orders" and e.target_name == "orders"]
     assert len(cte_edges) >= 1
 
 
@@ -233,23 +230,29 @@ def test_window_function_classification():
     result = parser.parse("window_test.sql", sql)
 
     # customer_id in PARTITION BY should be 'partition_by'
-    partition_usage = [cu for cu in result.column_usage
-                       if cu.column_name == "customer_id" and cu.usage_type == "partition_by"]
+    partition_usage = [
+        cu for cu in result.column_usage if cu.column_name == "customer_id" and cu.usage_type == "partition_by"
+    ]
     assert len(partition_usage) >= 1
 
     # created_at in ORDER BY within window should be 'window_order'
-    window_order_usage = [cu for cu in result.column_usage
-                          if cu.column_name == "created_at" and cu.usage_type == "window_order"]
+    window_order_usage = [
+        cu for cu in result.column_usage if cu.column_name == "created_at" and cu.usage_type == "window_order"
+    ]
     assert len(window_order_usage) >= 1
 
     # region in PARTITION BY
-    region_partition = [cu for cu in result.column_usage
-                        if cu.column_name == "region" and cu.usage_type == "partition_by"]
+    region_partition = [
+        cu for cu in result.column_usage if cu.column_name == "region" and cu.usage_type == "partition_by"
+    ]
     assert len(region_partition) >= 1
 
     # amount in SUM() window should have a transform containing SUM
-    amount_window = [cu for cu in result.column_usage
-                     if cu.column_name == "amount" and cu.transform and "SUM" in cu.transform.upper()]
+    amount_window = [
+        cu
+        for cu in result.column_usage
+        if cu.column_name == "amount" and cu.transform and "SUM" in cu.transform.upper()
+    ]
     assert len(amount_window) >= 1
 
 
@@ -268,18 +271,27 @@ def test_aggregate_transform():
     result = parser.parse("agg_test.sql", sql)
 
     # order_id should have COUNT transform
-    count_usage = [cu for cu in result.column_usage
-                   if cu.column_name == "order_id" and cu.transform and "COUNT" in cu.transform.upper()]
+    count_usage = [
+        cu
+        for cu in result.column_usage
+        if cu.column_name == "order_id" and cu.transform and "COUNT" in cu.transform.upper()
+    ]
     assert len(count_usage) >= 1
 
     # amount with SUM
-    sum_usage = [cu for cu in result.column_usage
-                 if cu.column_name == "amount" and cu.transform and "SUM" in cu.transform.upper()]
+    sum_usage = [
+        cu
+        for cu in result.column_usage
+        if cu.column_name == "amount" and cu.transform and "SUM" in cu.transform.upper()
+    ]
     assert len(sum_usage) >= 1
 
     # amount with AVG
-    avg_usage = [cu for cu in result.column_usage
-                 if cu.column_name == "amount" and cu.transform and "AVG" in cu.transform.upper()]
+    avg_usage = [
+        cu
+        for cu in result.column_usage
+        if cu.column_name == "amount" and cu.transform and "AVG" in cu.transform.upper()
+    ]
     assert len(avg_usage) >= 1
 
 
@@ -307,20 +319,17 @@ def test_cte_chain_edges():
     assert cte_names == {"base", "enriched", "final"}
 
     # base -> orders should be cte -> table
-    base_to_orders = [e for e in result.edges
-                      if e.source_name == "base" and e.target_name == "orders"]
+    base_to_orders = [e for e in result.edges if e.source_name == "base" and e.target_name == "orders"]
     assert len(base_to_orders) >= 1
     assert base_to_orders[0].target_kind == "table"
 
     # enriched -> base should be cte -> cte
-    enriched_to_base = [e for e in result.edges
-                        if e.source_name == "enriched" and e.target_name == "base"]
+    enriched_to_base = [e for e in result.edges if e.source_name == "enriched" and e.target_name == "base"]
     assert len(enriched_to_base) >= 1
     assert enriched_to_base[0].target_kind == "cte"
 
     # final -> enriched should be cte -> cte
-    final_to_enriched = [e for e in result.edges
-                         if e.source_name == "final" and e.target_name == "enriched"]
+    final_to_enriched = [e for e in result.edges if e.source_name == "final" and e.target_name == "enriched"]
     assert len(final_to_enriched) >= 1
     assert final_to_enriched[0].target_kind == "cte"
 
@@ -531,10 +540,12 @@ def test_union_column_usage():
     assert "suppliers" in tables
 
     # Each branch selects exactly id and name
-    cust_cols = {cu.column_name for cu in result.column_usage
-                 if cu.table_name == "customers" and cu.usage_type == "select"}
-    supp_cols = {cu.column_name for cu in result.column_usage
-                 if cu.table_name == "suppliers" and cu.usage_type == "select"}
+    cust_cols = {
+        cu.column_name for cu in result.column_usage if cu.table_name == "customers" and cu.usage_type == "select"
+    }
+    supp_cols = {
+        cu.column_name for cu in result.column_usage if cu.table_name == "suppliers" and cu.usage_type == "select"
+    }
     assert "id" in cust_cols
     assert "name" in cust_cols
     assert "id" in supp_cols
@@ -1090,10 +1101,7 @@ def test_duplicate_from_table_no_duplicate_edges():
     result = parser.parse("dup.sql", sql)
 
     # Should only have one FROM edge to 'a', not two
-    from_edges = [
-        e for e in result.edges
-        if e.target_name == "a" and e.context == "FROM clause"
-    ]
+    from_edges = [e for e in result.edges if e.target_name == "a" and e.context == "FROM clause"]
     assert len(from_edges) == 1
 
 
@@ -1246,10 +1254,7 @@ def test_qualify_column_classification():
     assert result.errors == []
 
     # hire_date in QUALIFY's window ORDER BY should be 'window_order'
-    hire_usage = [
-        cu for cu in result.column_usage
-        if cu.column_name == "HIRE_DATE" and cu.usage_type == "window_order"
-    ]
+    hire_usage = [cu for cu in result.column_usage if cu.column_name == "HIRE_DATE" and cu.usage_type == "window_order"]
     assert len(hire_usage) >= 1, "ORDER BY hire_date in QUALIFY not classified as window_order"
 
     # department appears in SELECT (as 'select') — the PARTITION BY reference
@@ -1282,10 +1287,7 @@ def test_case_when_column_classification():
     assert len(amount_usage) >= 1, "amount column not captured in CASE WHEN"
 
     # At least one of them should have a CASE transform
-    case_transforms = [
-        cu for cu in result.column_usage
-        if cu.transform and "CASE" in cu.transform.upper()
-    ]
+    case_transforms = [cu for cu in result.column_usage if cu.transform and "CASE" in cu.transform.upper()]
     assert len(case_transforms) >= 1, "CASE transform not captured"
 
 
@@ -1301,9 +1303,7 @@ def test_case_when_in_where():
     # region and amount should be classified as 'where'
     where_usage = [cu for cu in result.column_usage if cu.usage_type == "where"]
     where_cols = {cu.column_name for cu in where_usage}
-    assert "region" in where_cols or "amount" in where_cols, (
-        "CASE WHEN columns in WHERE not classified as 'where'"
-    )
+    assert "region" in where_cols or "amount" in where_cols, "CASE WHEN columns in WHERE not classified as 'where'"
 
 
 def test_union_lineage_different_column_names_all_branches():

@@ -95,7 +95,8 @@ class ColumnUsageResult:
     node_kind: str
     table_name: str
     column_name: str
-    usage_type: str  # 'select', 'where', 'join_on', 'group_by', 'order_by', 'having', 'insert', 'update'
+    # 'select', 'where', 'join_on', 'group_by', 'order_by', 'having', 'insert', 'update'
+    usage_type: str
     alias: str | None = None
     transform: str | None = None  # wrapping expression e.g. "CAST(a.updated AS DATETIME)"
 
@@ -143,7 +144,8 @@ def parse_repo_config(
     Supports both simple string paths and full config dicts::
 
         "my-repo": "/path/to/repo"
-        "my-repo": {"path": "/path", "dialect": "starrocks", "dialect_overrides": {"athena/": "athena"}}
+        "my-repo": {"path": "/path", "dialect": "starrocks",
+                    "dialect_overrides": {"athena/": "athena"}}
     """
     if isinstance(cfg, str):
         return cfg, global_dialect, None

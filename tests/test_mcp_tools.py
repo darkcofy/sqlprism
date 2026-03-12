@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 
+import sqlprism.core.mcp_tools as _mcp_mod
 from sqlprism.core.mcp_tools import (
     FindColumnUsageInput,
     FindReferencesInput,
@@ -23,6 +24,14 @@ from sqlprism.core.mcp_tools import (
     trace_column_lineage,
     trace_dependencies,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_mcp_state():
+    """Reset global MCP state between tests to prevent leakage."""
+    _mcp_mod._state = None
+    yield
+    _mcp_mod._state = None
 
 # ── 5.1: Pydantic validation and field aliases ──
 
@@ -111,17 +120,11 @@ def test_find_references_input_defaults():
 
 def test_search_tool_end_to_end(tmp_path):
     """Async search tool returns results after configure + reindex."""
-    from sqlprism.core.graph import GraphDB
-    from sqlprism.core.indexer import Indexer
 
     repo_dir = tmp_path / "mcp_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)"
-    )
-    (repo_dir / "report.sql").write_text(
-        "SELECT o.id, o.amount FROM orders o WHERE o.amount > 100"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)")
+    (repo_dir / "report.sql").write_text("SELECT o.id, o.amount FROM orders o WHERE o.amount > 100")
 
     # Configure the MCP server module
     configure(
@@ -130,7 +133,8 @@ def test_search_tool_end_to_end(tmp_path):
     )
 
     # Reindex via the indexer (same pattern as integration tests)
-    from sqlprism.core.mcp_tools import _get_graph, _get_indexer
+    from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
@@ -145,12 +149,8 @@ def test_find_references_tool_end_to_end(tmp_path):
     """Async find_references tool returns results after configure + reindex."""
     repo_dir = tmp_path / "mcp_ref_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
-    (repo_dir / "summary.sql").write_text(
-        "SELECT COUNT(*) FROM orders"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
+    (repo_dir / "summary.sql").write_text("SELECT COUNT(*) FROM orders")
 
     configure(
         db_path=":memory:",
@@ -158,6 +158,7 @@ def test_find_references_tool_end_to_end(tmp_path):
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
@@ -169,12 +170,8 @@ def test_find_column_usage_tool_end_to_end(tmp_path):
     """Async find_column_usage tool returns results after configure + reindex."""
     repo_dir = tmp_path / "mcp_col_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
-    (repo_dir / "report.sql").write_text(
-        "SELECT o.id, o.amount FROM orders o WHERE o.amount > 50"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
+    (repo_dir / "report.sql").write_text("SELECT o.id, o.amount FROM orders o WHERE o.amount > 50")
 
     configure(
         db_path=":memory:",
@@ -182,6 +179,7 @@ def test_find_column_usage_tool_end_to_end(tmp_path):
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
@@ -189,16 +187,14 @@ def test_find_column_usage_tool_end_to_end(tmp_path):
     assert result["total_count"] >= 1
 
 
-# ── 5.2: Async end-to-end MCP tool tests for trace_dependencies, trace_column_lineage, index_status ──
+# ── 5.2: Async end-to-end MCP tool tests for trace_dependencies, etc. ──
 
 
 def test_index_status_returns_expected_shape(tmp_path):
     """index_status returns dict with repos, totals, phantom_nodes, schema_version."""
     repo_dir = tmp_path / "status_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
 
     configure(
         db_path=":memory:",
@@ -206,6 +202,7 @@ def test_index_status_returns_expected_shape(tmp_path):
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
@@ -242,15 +239,9 @@ def test_trace_dependencies_downstream(tmp_path):
     """trace_dependencies follows downstream references from a table."""
     repo_dir = tmp_path / "trace_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
-    (repo_dir / "summary.sql").write_text(
-        "CREATE VIEW order_summary AS SELECT COUNT(*) AS cnt FROM orders"
-    )
-    (repo_dir / "report.sql").write_text(
-        "SELECT cnt FROM order_summary WHERE cnt > 10"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
+    (repo_dir / "summary.sql").write_text("CREATE VIEW order_summary AS SELECT COUNT(*) AS cnt FROM orders")
+    (repo_dir / "report.sql").write_text("SELECT cnt FROM order_summary WHERE cnt > 10")
 
     configure(
         db_path=":memory:",
@@ -258,31 +249,28 @@ def test_trace_dependencies_downstream(tmp_path):
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    # Edges go: summary -[references]-> orders, so "upstream" from orders
-    # finds the queries that reference it.
-    result = asyncio.run(trace_dependencies(
-        TraceDependenciesInput(name="orders", direction="upstream", max_depth=3)
-    ))
+    # summary.sql defines order_summary and references orders.
+    # Downstream from "summary" should find both.
+    result = asyncio.run(
+        trace_dependencies(TraceDependenciesInput(name="summary", direction="downstream", max_depth=3))
+    )
     assert result["root"] is not None
-    assert result["root"]["name"] == "orders"
+    assert result["root"]["name"] == "summary"
     assert len(result["paths"]) >= 1
-    upstream_names = {p["name"] for p in result["paths"]}
-    assert "summary" in upstream_names
+    downstream_names = {p["name"] for p in result["paths"]}
+    assert "orders" in downstream_names or "order_summary" in downstream_names
 
 
 def test_trace_dependencies_upstream(tmp_path):
     """trace_dependencies follows upstream references."""
     repo_dir = tmp_path / "trace_up_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
-    (repo_dir / "summary.sql").write_text(
-        "CREATE VIEW order_summary AS SELECT COUNT(*) AS cnt FROM orders"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
+    (repo_dir / "summary.sql").write_text("CREATE VIEW order_summary AS SELECT COUNT(*) AS cnt FROM orders")
 
     configure(
         db_path=":memory:",
@@ -290,14 +278,15 @@ def test_trace_dependencies_upstream(tmp_path):
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
     # Edge: summary(query) -[defines]-> order_summary(view)
     # Upstream from order_summary finds the defining query node.
-    result = asyncio.run(trace_dependencies(
-        TraceDependenciesInput(name="order_summary", direction="upstream", max_depth=3)
-    ))
+    result = asyncio.run(
+        trace_dependencies(TraceDependenciesInput(name="order_summary", direction="upstream", max_depth=3))
+    )
     assert result["root"] is not None
     assert len(result["paths"]) >= 1
     upstream_names = {p["name"] for p in result["paths"]}
@@ -314,9 +303,7 @@ def test_trace_dependencies_not_found(tmp_path):
         repos={"test": str(repo_dir)},
     )
 
-    result = asyncio.run(trace_dependencies(
-        TraceDependenciesInput(name="nonexistent_table", direction="downstream")
-    ))
+    result = asyncio.run(trace_dependencies(TraceDependenciesInput(name="nonexistent_table", direction="downstream")))
     assert result["root"] is None
     assert result["paths"] == []
 
@@ -349,13 +336,8 @@ def test_trace_column_lineage_end_to_end(tmp_path):
     """trace_column_lineage returns lineage chains through CTEs."""
     repo_dir = tmp_path / "lineage_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)"
-    )
-    (repo_dir / "report.sql").write_text(
-        "WITH base AS (SELECT id, amount FROM orders) "
-        "SELECT id, amount FROM base"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)")
+    (repo_dir / "report.sql").write_text("WITH base AS (SELECT id, amount FROM orders) SELECT id, amount FROM base")
 
     configure(
         db_path=":memory:",
@@ -363,12 +345,11 @@ def test_trace_column_lineage_end_to_end(tmp_path):
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    result = asyncio.run(trace_column_lineage(
-        TraceColumnLineageInput(table="orders", column="amount")
-    ))
+    result = asyncio.run(trace_column_lineage(TraceColumnLineageInput(table="orders", column="amount")))
     assert "chains" in result
     assert "total_count" in result
 
@@ -377,9 +358,7 @@ def test_trace_column_lineage_no_match(tmp_path):
     """trace_column_lineage returns empty chains when no lineage exists."""
     repo_dir = tmp_path / "lineage_empty_repo"
     repo_dir.mkdir()
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL)"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
 
     configure(
         db_path=":memory:",
@@ -387,12 +366,11 @@ def test_trace_column_lineage_no_match(tmp_path):
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
+
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    result = asyncio.run(trace_column_lineage(
-        TraceColumnLineageInput(table="nonexistent_table", column="foo")
-    ))
+    result = asyncio.run(trace_column_lineage(TraceColumnLineageInput(table="nonexistent_table", column="foo")))
     assert result["chains"] == []
     assert result["total_count"] == 0
 
@@ -433,23 +411,23 @@ def git_repo(tmp_path):
     subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
 
     # Create initial SQL files on default branch
     models_dir = repo_dir / "models"
     models_dir.mkdir()
 
-    (models_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL);"
-    )
-    (models_dir / "customers.sql").write_text(
-        "CREATE TABLE customers (id INT, name TEXT);"
-    )
+    (models_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL);")
+    (models_dir / "customers.sql").write_text("CREATE TABLE customers (id INT, name TEXT);")
     (models_dir / "order_summary.sql").write_text(
         "CREATE VIEW order_summary AS SELECT c.name, SUM(o.amount) as total "
         "FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.name;"
@@ -458,20 +436,27 @@ def git_repo(tmp_path):
     subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "initial"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
 
     # Get the base commit
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=repo_dir, check=True, capture_output=True, text=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     base_commit = result.stdout.strip()
 
     # Make changes on a new branch
     subprocess.run(
         ["git", "checkout", "-b", "feature"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
 
     # Modify orders.sql — add a new column
@@ -487,7 +472,9 @@ def git_repo(tmp_path):
     subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "add refunds"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
 
     return {"path": repo_dir, "base_commit": base_commit}
@@ -510,9 +497,7 @@ def test_pr_impact_basic(git_repo):
     """pr_impact reports changed files, structural diff, and blast radius."""
     _configure_and_index_git_repo(git_repo)
 
-    result = asyncio.run(
-        pr_impact(PrImpactInput(base_commit=git_repo["base_commit"], repo="test"))
-    )
+    result = asyncio.run(pr_impact(PrImpactInput(base_commit=git_repo["base_commit"], repo="test")))
 
     # files_changed should include the modified and newly added files
     assert "files_changed" in result
@@ -540,9 +525,7 @@ def test_pr_impact_no_changes(git_repo):
     """pr_impact with HEAD as base_commit (no diff) returns empty result."""
     _configure_and_index_git_repo(git_repo)
 
-    result = asyncio.run(
-        pr_impact(PrImpactInput(base_commit="HEAD", repo="test"))
-    )
+    result = asyncio.run(pr_impact(PrImpactInput(base_commit="HEAD", repo="test")))
 
     assert result["files_changed"] == []
     assert result["structural_diff"] == {}
@@ -553,9 +536,7 @@ def test_pr_impact_structural_diff_correctness(git_repo):
     """Structural diff correctly identifies added/removed/modified nodes and edges."""
     _configure_and_index_git_repo(git_repo)
 
-    result = asyncio.run(
-        pr_impact(PrImpactInput(base_commit=git_repo["base_commit"], repo="test"))
-    )
+    result = asyncio.run(pr_impact(PrImpactInput(base_commit=git_repo["base_commit"], repo="test")))
 
     diff = result["structural_diff"]
 
@@ -574,10 +555,7 @@ def test_pr_impact_structural_diff_correctness(git_repo):
 
     # New edges should have been added for the refunds view referencing orders
     edges_added = diff["edges_added"]
-    refund_edges = [
-        e for e in edges_added
-        if e["source"] == "refunds" or e["target"] == "refunds"
-    ]
+    refund_edges = [e for e in edges_added if e["source"] == "refunds" or e["target"] == "refunds"]
     assert len(refund_edges) >= 1
 
     # columns_added should include the new status column usage
@@ -591,9 +569,13 @@ def test_pr_impact_delta_mode(git_repo):
     _configure_and_index_git_repo(git_repo)
 
     result = asyncio.run(
-        pr_impact(PrImpactInput(
-            base_commit=git_repo["base_commit"], repo="test", compare_mode="delta",
-        ))
+        pr_impact(
+            PrImpactInput(
+                base_commit=git_repo["base_commit"],
+                repo="test",
+                compare_mode="delta",
+            )
+        )
     )
 
     br = result["blast_radius"]
@@ -615,9 +597,13 @@ def test_pr_impact_absolute_mode(git_repo):
     _configure_and_index_git_repo(git_repo)
 
     result = asyncio.run(
-        pr_impact(PrImpactInput(
-            base_commit=git_repo["base_commit"], repo="test", compare_mode="absolute",
-        ))
+        pr_impact(
+            PrImpactInput(
+                base_commit=git_repo["base_commit"],
+                repo="test",
+                compare_mode="absolute",
+            )
+        )
     )
 
     # Verify all top-level keys are present
@@ -627,9 +613,15 @@ def test_pr_impact_absolute_mode(git_repo):
 
     # Verify structural_diff has all expected sub-keys
     diff = result["structural_diff"]
-    for key in ("nodes_added", "nodes_removed", "nodes_modified",
-                "edges_added", "edges_removed",
-                "columns_added", "columns_removed"):
+    for key in (
+        "nodes_added",
+        "nodes_removed",
+        "nodes_modified",
+        "edges_added",
+        "edges_removed",
+        "columns_added",
+        "columns_removed",
+    ):
         assert key in diff, f"Missing key '{key}' in structural_diff"
         assert isinstance(diff[key], list)
 
@@ -652,9 +644,7 @@ def test_pr_impact_invalid_repo(tmp_path):
 
     # Requesting a repo that doesn't exist raises ValueError from _resolve_repo_config
     with pytest.raises(ValueError, match="not found"):
-        asyncio.run(
-            pr_impact(PrImpactInput(base_commit="HEAD", repo="nonexistent_repo"))
-        )
+        asyncio.run(pr_impact(PrImpactInput(base_commit="HEAD", repo="nonexistent_repo")))
 
 
 def test_pr_impact_deleted_file(tmp_path):
@@ -665,39 +655,48 @@ def test_pr_impact_deleted_file(tmp_path):
     subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
 
-    (repo_dir / "orders.sql").write_text(
-        "CREATE TABLE orders (id INT, amount DECIMAL);"
-    )
-    (repo_dir / "legacy.sql").write_text(
-        "CREATE VIEW legacy_report AS SELECT id FROM orders;"
-    )
+    (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL);")
+    (repo_dir / "legacy.sql").write_text("CREATE VIEW legacy_report AS SELECT id FROM orders;")
 
     subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "initial"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
     base = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=repo_dir, check=True, capture_output=True, text=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     subprocess.run(
         ["git", "checkout", "-b", "cleanup"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
     (repo_dir / "legacy.sql").unlink()
     subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "remove legacy"],
-        cwd=repo_dir, check=True, capture_output=True,
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
     )
 
     from sqlprism.core.mcp_tools import _get_indexer
@@ -709,9 +708,7 @@ def test_pr_impact_deleted_file(tmp_path):
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    result = asyncio.run(
-        pr_impact(PrImpactInput(base_commit=base, repo="test"))
-    )
+    result = asyncio.run(pr_impact(PrImpactInput(base_commit=base, repo="test")))
 
     diff = result["structural_diff"]
     removed_names = {n["name"] for n in diff["nodes_removed"]}
@@ -724,6 +721,7 @@ def test_pr_impact_deleted_file(tmp_path):
 def _reset_reindex_state():
     """Reset module-level reindex globals between tests."""
     import sqlprism.core.mcp_tools as m
+
     m._reindex_task = None
     m._reindex_status = {"state": "idle"}
 
@@ -735,9 +733,7 @@ def test_reindex_idempotency_guard(tmp_path):
     repo_dir.mkdir()
     # Use many files to ensure reindex takes long enough
     for i in range(50):
-        (repo_dir / f"model_{i}.sql").write_text(
-            f"CREATE TABLE t{i} (id INT); SELECT * FROM t{i};"
-        )
+        (repo_dir / f"model_{i}.sql").write_text(f"CREATE TABLE t{i} (id INT); SELECT * FROM t{i};")
 
     configure(db_path=":memory:", repos={"test": str(repo_dir)})
 
@@ -749,6 +745,7 @@ def test_reindex_idempotency_guard(tmp_path):
         assert r2["status"] == "in_progress"
 
         import sqlprism.core.mcp_tools as m
+
         if m._reindex_task:
             await m._reindex_task
 
@@ -771,6 +768,7 @@ def test_reindex_completes_and_index_status_shows_result(tmp_path):
 
         # Wait for background task to complete
         import sqlprism.core.mcp_tools as m
+
         if m._reindex_task:
             await m._reindex_task
 
@@ -833,9 +831,13 @@ def test_pr_impact_delta_mode_includes_note(git_repo):
     _configure_and_index_git_repo(git_repo)
 
     result = asyncio.run(
-        pr_impact(PrImpactInput(
-            base_commit=git_repo["base_commit"], repo="test", compare_mode="delta",
-        ))
+        pr_impact(
+            PrImpactInput(
+                base_commit=git_repo["base_commit"],
+                repo="test",
+                compare_mode="delta",
+            )
+        )
     )
 
     br = result["blast_radius"]

@@ -120,9 +120,30 @@ def test_search_by_schema():
     db = GraphDB()
     repo_id = db.upsert_repo("test", "/tmp/test")
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
-    db.insert_node(file_id, "table", "orders", "sql", metadata={"schema": "staging"}, schema="staging")
-    db.insert_node(file_id, "table", "orders", "sql", metadata={"schema": "production"}, schema="production")
-    db.insert_node(file_id, "table", "customers", "sql", metadata={"schema": "staging"}, schema="staging")
+    db.insert_node(
+        file_id,
+        "table",
+        "orders",
+        "sql",
+        metadata={"schema": "staging"},
+        schema="staging",
+    )
+    db.insert_node(
+        file_id,
+        "table",
+        "orders",
+        "sql",
+        metadata={"schema": "production"},
+        schema="production",
+    )
+    db.insert_node(
+        file_id,
+        "table",
+        "customers",
+        "sql",
+        metadata={"schema": "staging"},
+        schema="staging",
+    )
 
     # Search with schema filter
     results = db.query_search("order", schema="staging")
@@ -145,8 +166,22 @@ def test_resolve_node_with_schema():
     repo_id = db.upsert_repo("test", "/tmp/test")
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
 
-    staging_id = db.insert_node(file_id, "table", "orders", "sql", metadata={"schema": "staging"}, schema="staging")
-    prod_id = db.insert_node(file_id, "table", "orders", "sql", metadata={"schema": "production"}, schema="production")
+    staging_id = db.insert_node(
+        file_id,
+        "table",
+        "orders",
+        "sql",
+        metadata={"schema": "staging"},
+        schema="staging",
+    )
+    prod_id = db.insert_node(
+        file_id,
+        "table",
+        "orders",
+        "sql",
+        metadata={"schema": "production"},
+        schema="production",
+    )
 
     # Without schema, returns whichever comes first (non-deterministic but non-None)
     assert db.resolve_node("orders", "table", repo_id) is not None
@@ -169,11 +204,29 @@ def test_column_lineage_storage():
     repo_id = db.upsert_repo("test", "/tmp/test")
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
 
-    db.insert_column_lineage(file_id, "dim_users", "created_date", 0, "created_date", "dim_users", "CAST(created_at AS DATE)")
-    db.insert_column_lineage(file_id, "dim_users", "created_date", 1, "created_at", "users")
+    db.insert_column_lineage(
+        file_id,
+        "dim_users",
+        "created_date",
+        0,
+        "created_date",
+        "dim_users",
+        "CAST(created_at AS DATE)",
+    )
+    db.insert_column_lineage(
+        file_id,
+        "dim_users",
+        "created_date",
+        1,
+        "created_at",
+        "users",
+    )
 
     # Query by output node
-    result = db.query_column_lineage(output_node="dim_users", column="created_date")
+    result = db.query_column_lineage(
+        output_node="dim_users",
+        column="created_date",
+    )
     assert result["total_count"] == 1
     chain = result["chains"][0]
     assert chain["output_column"] == "created_date"
@@ -241,7 +294,7 @@ def test_phantom_cleanup():
     db.insert_edge(query_id, phantom_id, "references")
 
     # Now create a real node for orders
-    real_id = db.insert_node(file_id, "table", "orders", "sql")
+    db.insert_node(file_id, "table", "orders", "sql")
 
     # Run cleanup
     cleaned = db.cleanup_phantoms()
@@ -253,9 +306,7 @@ def test_phantom_cleanup():
     assert refs["inbound"][0]["name"] == "my_query"
 
     # Phantom should be gone
-    phantom_check = db.conn.execute(
-        "SELECT COUNT(*) FROM nodes WHERE node_id = ?", [phantom_id]
-    ).fetchone()[0]
+    phantom_check = db.conn.execute("SELECT COUNT(*) FROM nodes WHERE node_id = ?", [phantom_id]).fetchone()[0]
     assert phantom_check == 0
     db.close()
 
@@ -268,9 +319,7 @@ def test_cleanup_orphaned_phantoms():
     phantom_id = db.get_or_create_phantom("orphan_table", "table", "sql")
 
     # Verify it exists
-    count = db.conn.execute(
-        "SELECT COUNT(*) FROM nodes WHERE node_id = ?", [phantom_id]
-    ).fetchone()[0]
+    count = db.conn.execute("SELECT COUNT(*) FROM nodes WHERE node_id = ?", [phantom_id]).fetchone()[0]
     assert count == 1
 
     # Run cleanup
@@ -278,9 +327,7 @@ def test_cleanup_orphaned_phantoms():
     assert cleaned == 1
 
     # Phantom should be gone
-    count = db.conn.execute(
-        "SELECT COUNT(*) FROM nodes WHERE node_id = ?", [phantom_id]
-    ).fetchone()[0]
+    count = db.conn.execute("SELECT COUNT(*) FROM nodes WHERE node_id = ?", [phantom_id]).fetchone()[0]
     assert count == 0
     db.close()
 
@@ -426,10 +473,12 @@ def test_insert_edges_batch():
     n2 = db.insert_node(file_id, "table", "orders", "sql")
     n3 = db.insert_node(file_id, "table", "customers", "sql")
 
-    db.insert_edges_batch([
-        (n1, n2, "references", "FROM clause", None),
-        (n1, n3, "references", "JOIN clause", None),
-    ])
+    db.insert_edges_batch(
+        [
+            (n1, n2, "references", "FROM clause", None),
+            (n1, n3, "references", "JOIN clause", None),
+        ]
+    )
 
     refs = db.query_references("orders", kind="table")
     assert len(refs["inbound"]) == 1
@@ -444,11 +493,13 @@ def test_insert_column_usage_batch():
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
     node_id = db.insert_node(file_id, "query", "my_query", "sql")
 
-    db.insert_column_usage_batch([
-        (node_id, "orders", "id", "select", file_id, None, None),
-        (node_id, "orders", "total", "where", file_id, None, "total > 100"),
-        (node_id, "customers", "name", "select", file_id, "customer_name", None),
-    ])
+    db.insert_column_usage_batch(
+        [
+            (node_id, "orders", "id", "select", file_id, None, None),
+            (node_id, "orders", "total", "where", file_id, None, "total > 100"),
+            (node_id, "customers", "name", "select", file_id, "customer_name", None),
+        ]
+    )
 
     result = db.query_column_usage("orders")
     assert result["total_count"] == 2
@@ -460,13 +511,34 @@ def test_insert_column_lineage_batch():
     repo_id = db.upsert_repo("test", "/tmp/test")
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
 
-    # Each row: (file_id, output_node, output_column, chain_index, hop_index, hop_column, hop_table, hop_expression)
-    db.insert_column_lineage_batch([
-        (file_id, "dim_users", "created_date", 0, 0, "created_date", "dim_users", "CAST(created_at AS DATE)"),
-        (file_id, "dim_users", "created_date", 0, 1, "created_at", "users", None),
-        (file_id, "dim_users", "user_name", 0, 0, "user_name", "dim_users", None),
-        (file_id, "dim_users", "user_name", 0, 1, "name", "users", None),
-    ])
+    # Each row: (file_id, output_node, output_column, chain_index,
+    #            hop_index, hop_column, hop_table, hop_expression)
+    db.insert_column_lineage_batch(
+        [
+            (
+                file_id,
+                "dim_users",
+                "created_date",
+                0,
+                0,
+                "created_date",
+                "dim_users",
+                "CAST(created_at AS DATE)",
+            ),
+            (
+                file_id,
+                "dim_users",
+                "created_date",
+                0,
+                1,
+                "created_at",
+                "users",
+                None,
+            ),
+            (file_id, "dim_users", "user_name", 0, 0, "user_name", "dim_users", None),
+            (file_id, "dim_users", "user_name", 0, 1, "name", "users", None),
+        ]
+    )
 
     result = db.query_column_lineage(output_node="dim_users")
     assert result["total_count"] == 2
@@ -484,8 +556,13 @@ def test_column_lineage_limit_by_chain_count():
         col = f"col_{chain_idx}"
         for hop_idx in range(3):
             db.insert_column_lineage(
-                file_id, "dim_users", col, chain_idx,
-                hop_idx, f"src_{hop_idx}", f"table_{hop_idx}",
+                file_id,
+                "dim_users",
+                col,
+                chain_idx,
+                hop_idx,
+                f"src_{hop_idx}",
+                f"table_{hop_idx}",
             )
 
     # Limit=2 should return exactly 2 chains with all their hops
@@ -518,8 +595,13 @@ def test_column_lineage_limit_preserves_full_chains():
         col = f"col_{chain_idx}"
         for hop_idx in range(n_hops):
             db.insert_column_lineage(
-                file_id, "wide_table", col, chain_idx,
-                hop_idx, f"src_{hop_idx}", f"tbl_{hop_idx}",
+                file_id,
+                "wide_table",
+                col,
+                chain_idx,
+                hop_idx,
+                f"src_{hop_idx}",
+                f"tbl_{hop_idx}",
             )
 
     # Limit=1: one chain, all its hops intact
@@ -582,7 +664,9 @@ def test_read_file_lines_cache():
     # Clear cache to avoid interference from other tests
     _read_file_lines.cache_clear()
 
-    import tempfile, os
+    import os
+    import tempfile
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False) as f:
         f.write("SELECT 1;\nSELECT 2;\n")
         f.flush()
@@ -657,8 +741,6 @@ def test_concurrent_sequential_access():
     repo_id = db.upsert_repo("test", "/tmp/test")
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
 
-    result_holder: list[dict] = []
-
     def insert_from_thread():
         for i in range(5):
             db.insert_node(file_id, "table", f"threaded_table_{i}", "sql")
@@ -692,8 +774,12 @@ def test_read_snippet_with_real_file():
         file_id = db.insert_file(repo_id, "example.sql", "sql", "snap1")
         # Node on lines 4-6
         db.insert_node(
-            file_id, "table", "my_snippet_table", "sql",
-            line_start=4, line_end=6,
+            file_id,
+            "table",
+            "my_snippet_table",
+            "sql",
+            line_start=4,
+            line_end=6,
         )
 
         # Use query_search with include_snippets=True
@@ -728,8 +814,12 @@ def test_read_snippet_context_padding():
         file_id = db.insert_file(repo_id, "padded.sql", "sql", "snap2")
         # Node on line 10 only
         db.insert_node(
-            file_id, "table", "padded_table", "sql",
-            line_start=10, line_end=10,
+            file_id,
+            "table",
+            "padded_table",
+            "sql",
+            line_start=10,
+            line_end=10,
         )
 
         # Test directly: context_lines=2 means lines 8..12
@@ -753,7 +843,7 @@ def test_read_snippet_nonexistent_file():
     _read_file_lines.cache_clear()
     with tempfile.TemporaryDirectory() as tmpdir:
         db = GraphDB()
-        repo_id = db.upsert_repo("ghost-test", tmpdir)
+        db.upsert_repo("ghost-test", tmpdir)
 
         result = db._read_snippet("ghost-test", "no_such_file.sql", 1, 1)
         assert result is None
@@ -791,14 +881,14 @@ def test_concurrent_read_during_write_transaction():
             # Insert inside transaction but don't commit yet
             db.insert_node(file_id, "table", "new_table", "sql")
             barrier.wait()  # signal reader to go
-            import time; time.sleep(0.1)  # hold transaction open briefly
+            import time
+
+            time.sleep(0.1)  # hold transaction open briefly
 
     def reader():
         barrier.wait()  # wait for writer to be mid-transaction
         try:
-            result = db._execute_read(
-                "SELECT COUNT(*) FROM nodes WHERE name = 'existing'"
-            ).fetchone()
+            result = db._execute_read("SELECT COUNT(*) FROM nodes WHERE name = 'existing'").fetchone()
             read_result.append(result[0])
         except Exception as e:
             read_error.append(e)
@@ -828,14 +918,14 @@ def test_in_transaction_thread_local():
     def writer():
         with db.write_transaction():
             barrier.wait()
-            import time; time.sleep(0.1)
+            import time
+
+            time.sleep(0.1)
 
     def reader():
         barrier.wait()
         # Thread B should NOT see in_transaction=True
-        thread_b_saw_transaction.append(
-            getattr(db._tlocal, "in_transaction", False)
-        )
+        thread_b_saw_transaction.append(getattr(db._tlocal, "in_transaction", False))
         # And reads should use cursor path (not main connection)
         result = db._execute_read("SELECT COUNT(*) FROM nodes").fetchone()
         assert result[0] >= 1
@@ -847,8 +937,7 @@ def test_in_transaction_thread_local():
     t_write.join(timeout=10)
     t_read.join(timeout=10)
 
-    assert thread_b_saw_transaction == [False], \
-        "Thread B should not see thread A's in_transaction flag"
+    assert thread_b_saw_transaction == [False], "Thread B should not see thread A's in_transaction flag"
     db.close()
 
 
@@ -913,21 +1002,15 @@ def test_cleanup_phantoms_removes_phantom_only_referenced_by_phantoms():
     assert cleaned >= 2
 
     # phantom_a should still exist
-    row = db._execute_read(
-        "SELECT node_id FROM nodes WHERE node_id = ?", [phantom_a_id]
-    ).fetchone()
+    row = db._execute_read("SELECT node_id FROM nodes WHERE node_id = ?", [phantom_a_id]).fetchone()
     assert row is not None, "phantom_a should survive (has real inbound edge)"
 
     # phantom_b should be gone
-    row_b = db._execute_read(
-        "SELECT node_id FROM nodes WHERE node_id = ?", [phantom_b_id]
-    ).fetchone()
+    row_b = db._execute_read("SELECT node_id FROM nodes WHERE node_id = ?", [phantom_b_id]).fetchone()
     assert row_b is None, "phantom_b should be deleted (only phantom inbound edges)"
 
     # phantom_c should be gone (no inbound edges at all, orphaned after B's edges removed
     # or was already identified as stale/orphaned)
-    row_c = db._execute_read(
-        "SELECT node_id FROM nodes WHERE node_id = ?", [phantom_c_id]
-    ).fetchone()
+    row_c = db._execute_read("SELECT node_id FROM nodes WHERE node_id = ?", [phantom_c_id]).fetchone()
     assert row_c is None, "phantom_c should be deleted (no real inbound edges)"
     db.close()
