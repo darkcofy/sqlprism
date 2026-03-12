@@ -1,0 +1,32 @@
+# Claude
+.claude/
+.mcp.json
+
+# Coverage
+.coverage
+coverage_html/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# IDE
+.vscode/
+.idea/
+
+# Docs
+site/
+
+# OS
+.DS_Store
