@@ -1,0 +1,1506 @@
+"""DuckDB graph storage layer.
+
+This module owns the database. It initialises the schema, handles inserts,
+resolves edges (name/kind pairs → node IDs), manages phantom nodes, and
+provides the query methods that MCP tools call.
+
+No other module touches DuckDB directly.
+
+Thread-safety model (read/write separation):
+    DuckDB provides MVCC, so concurrent reads are safe without locking.
+    Only write operations need serialisation via ``_write_lock``.
+
+    - **Read path** (``_execute_read``): creates a fresh cursor, executes,
+      returns results via ``fetchall()``, then closes the cursor.  No lock
+      needed -- safe for concurrent access from MCP query handlers while a
+      reindex is in progress.
+
+    - **Write path** (``_execute_write``): uses ``self.conn.execute()``
+      directly.  Caller must hold ``_write_lock``.
+
+    - **Transactions** (``write_transaction``): acquires ``_write_lock``
+      for the full ``BEGIN .. COMMIT`` scope.
+"""
+
+import warnings
+import json
+import threading
+from contextlib import contextmanager
+from functools import lru_cache
+from pathlib import Path
+
+
+import duckdb
+
+
+_MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB – skip snippets for oversized files
+
+
+@lru_cache(maxsize=128)
+def _read_file_lines(path: str) -> tuple[str, ...] | None:
+    """Read and cache file lines for snippet extraction.
+
+    Returns a tuple of lines (hashable for lru_cache), or None on error.
+    Files exceeding *_MAX_FILE_SIZE* bytes are skipped to keep memory bounded.
+    """
+    try:
+        p = Path(path)
+        if p.stat().st_size > _MAX_FILE_SIZE:
+            return None
+        return tuple(p.read_text(errors="replace").splitlines())
+    except Exception:
+        return None
+
+SCHEMA_SQL = """
+CREATE SEQUENCE IF NOT EXISTS seq_repo_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_file_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_node_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_edge_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_usage_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_lineage_id START 1;
+
+CREATE TABLE IF NOT EXISTS repos (
+    repo_id     INTEGER PRIMARY KEY DEFAULT nextval('seq_repo_id'),
+    name        TEXT NOT NULL UNIQUE,
+    path        TEXT NOT NULL,
+    last_commit TEXT,
+    last_branch TEXT,
+    indexed_at  TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS files (
+    file_id     INTEGER PRIMARY KEY DEFAULT nextval('seq_file_id'),
+    repo_id     INTEGER NOT NULL,  -- logical FK to repos(repo_id)
+    path        TEXT NOT NULL,
+    language    TEXT NOT NULL,
+    checksum    TEXT NOT NULL,
+    indexed_at  TIMESTAMP DEFAULT now(),
+    UNIQUE(repo_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id     INTEGER PRIMARY KEY DEFAULT nextval('seq_node_id'),
+    file_id     INTEGER,  -- NULL for phantom nodes; logical FK to files(file_id)
+    kind        TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    schema      TEXT,
+    language    TEXT NOT NULL,
+    line_start  INTEGER,
+    line_end    INTEGER,
+    metadata    JSON,
+    UNIQUE(file_id, kind, name, schema)
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    edge_id       INTEGER PRIMARY KEY DEFAULT nextval('seq_edge_id'),
+    source_id     INTEGER NOT NULL,  -- logical FK to nodes(node_id)
+    target_id     INTEGER NOT NULL,  -- logical FK to nodes(node_id)
+    relationship  TEXT NOT NULL,
+    context       TEXT,
+    metadata      JSON
+);
+
+CREATE TABLE IF NOT EXISTS column_usage (
+    usage_id    INTEGER PRIMARY KEY DEFAULT nextval('seq_usage_id'),
+    node_id     INTEGER NOT NULL,   -- logical FK to nodes(node_id)
+    table_name  TEXT NOT NULL,
+    column_name TEXT NOT NULL,
+    usage_type  TEXT NOT NULL,
+    alias       TEXT,
+    transform   TEXT,
+    file_id     INTEGER NOT NULL    -- logical FK to files(file_id)
+);
+
+CREATE TABLE IF NOT EXISTS column_lineage (
+    lineage_id      INTEGER PRIMARY KEY DEFAULT nextval('seq_lineage_id'),
+    file_id         INTEGER NOT NULL,  -- logical FK to files(file_id)
+    output_node     TEXT NOT NULL,
+    output_column   TEXT NOT NULL,
+    chain_index     INTEGER NOT NULL DEFAULT 0,
+    hop_index       INTEGER NOT NULL,
+    hop_column      TEXT NOT NULL,
+    hop_table       TEXT NOT NULL,
+    hop_expression  TEXT
+);
+
+"""
+
+INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
+CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_kind_name ON nodes(kind, name);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_edges_relationship ON edges(relationship);
+CREATE INDEX IF NOT EXISTS idx_col_table ON column_usage(table_name);
+CREATE INDEX IF NOT EXISTS idx_col_column ON column_usage(column_name);
+CREATE INDEX IF NOT EXISTS idx_col_table_column ON column_usage(table_name, column_name);
+CREATE INDEX IF NOT EXISTS idx_col_usage_type ON column_usage(usage_type);
+CREATE INDEX IF NOT EXISTS idx_lineage_output ON column_lineage(output_node, output_column);
+CREATE INDEX IF NOT EXISTS idx_lineage_hop ON column_lineage(hop_table, hop_column);
+CREATE INDEX IF NOT EXISTS idx_lineage_file ON column_lineage(file_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_schema ON nodes(schema);
+"""
+
+
+class GraphDB:
+    """DuckDB-backed knowledge graph storage.
+
+    The sole storage layer for the SQL indexer. Manages a DuckDB database
+    containing repos, files, nodes, edges, column usage, and column lineage
+    tables. Provides insert/upsert methods for the indexer and query methods
+    consumed by the MCP tool layer.
+
+    Thread-safety (read/write separation):
+        Write operations are serialised through ``_write_lock`` (a
+        ``threading.RLock``).  Read operations use a fresh cursor and
+        require no lock -- DuckDB MVCC ensures snapshot isolation.
+
+        The ``write_transaction()`` context manager holds the lock for the
+        full ``BEGIN .. COMMIT`` scope so no other thread can interleave
+        write statements.  ``asyncio.to_thread()`` callers are safe because
+        reads are lock-free and writes acquire the lock internally.
+    """
+
+    def __init__(self, db_path: str | Path | None = None):
+        """Initialise the database.
+
+        Args:
+            db_path: Path to DuckDB file. None for in-memory (testing).
+        """
+        self.db_path = str(db_path) if db_path else ":memory:"
+        self.conn = duckdb.connect(self.db_path)
+        self._write_lock = threading.RLock()
+        # Thread-local flag: only the thread holding _write_lock inside
+        # write_transaction() sets this to True.  _execute_read checks it
+        # to decide whether to use the main connection (to see uncommitted
+        # writes) or a fresh cursor (snapshot isolation).
+        self._tlocal = threading.local()
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        """Create tables and indices if they don't exist."""
+        with self._write_lock:
+            self._execute_write(SCHEMA_SQL)
+            self._execute_write(INDEX_SQL)
+
+    def _execute_read(self, sql: str, params=None):
+        """Execute a read-only SQL statement.
+
+        When called **outside** a write transaction, creates a fresh cursor
+        for snapshot isolation so reads never block writes.
+
+        When called **inside** a write transaction (``_in_transaction`` is
+        ``True``), uses the main connection so the read can see uncommitted
+        writes from the current transaction.
+        """
+        if getattr(self._tlocal, "in_transaction", False):
+            # Inside a write transaction — must read from the same
+            # connection to see uncommitted data.
+            if params:
+                return self.conn.execute(sql, params)
+            return self.conn.execute(sql)
+        cursor = self.conn.cursor()
+        try:
+            if params:
+                return cursor.execute(sql, params)
+            return cursor.execute(sql)
+        except Exception:
+            cursor.close()
+            raise
+
+    def _execute_write(self, sql: str, params=None):
+        """Execute a write SQL statement on the main connection.
+
+        The caller **must** already hold ``_write_lock`` (either directly
+        or via ``write_transaction()``).  Uses ``self.conn.execute()``
+        directly so that writes participate in the current transaction.
+        """
+        if params:
+            return self.conn.execute(sql, params)
+        return self.conn.execute(sql)
+
+    def close(self) -> None:
+        """Close the underlying DuckDB connection."""
+        with self._write_lock:
+            self.conn.close()
+
+    def __enter__(self) -> "GraphDB":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    @staticmethod
+    def clear_snippet_cache() -> None:
+        """Clear the cached file contents used for snippet extraction.
+
+        Should be called after reindex to avoid serving stale content.
+        """
+        _read_file_lines.cache_clear()
+
+    @contextmanager
+    def write_transaction(self):
+        """Context manager that holds ``_write_lock`` for a full transaction.
+
+        Acquires the write lock, issues ``BEGIN TRANSACTION``, yields, then
+        ``COMMIT`` on success or ``ROLLBACK`` on exception.
+
+        Re-entrant: if the current thread already holds the lock and is
+        inside a transaction, yields without starting a nested one (DuckDB
+        does not support nested transactions).
+        """
+        if getattr(self._tlocal, "in_transaction", False):
+            yield
+            return
+        with self._write_lock:
+            self.conn.execute("BEGIN TRANSACTION")
+            self._tlocal.in_transaction = True
+            try:
+                yield
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+            finally:
+                self._tlocal.in_transaction = False
+
+    @contextmanager
+    def transaction(self):
+        """Backward-compatible alias for :meth:`write_transaction`.
+
+        .. deprecated:: 0.6
+            Use :meth:`write_transaction` instead.
+        """
+        warnings.warn(
+            "transaction() is deprecated, use write_transaction() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        with self.write_transaction():
+            yield
+
+    # ── Repo management ──
+
+    def upsert_repo(self, name: str, path: str) -> int:
+        """Create or update a repo entry.
+
+        Updates the stored path if the repo has been moved.
+
+        Args:
+            name: Unique repo name used as the identifier across the index.
+            path: Absolute filesystem path to the repo root.
+
+        Returns:
+            The ``repo_id`` (existing or newly created).
+        """
+        with self._write_lock:
+            existing = self._execute_write(
+                "SELECT repo_id, path FROM repos WHERE name = ?", [name]
+            ).fetchone()
+            if existing:
+                if existing[1] != str(path):
+                    self._execute_write(
+                        "UPDATE repos SET path = ? WHERE repo_id = ?",
+                        [str(path), existing[0]],
+                    )
+                return existing[0]
+            result = self._execute_write(
+                "INSERT INTO repos (name, path) VALUES (?, ?) RETURNING repo_id",
+                [name, str(path)],
+            ).fetchone()
+            return result[0]
+
+    def update_repo_metadata(
+        self, repo_id: int, commit: str | None = None, branch: str | None = None
+    ) -> None:
+        """Update the last indexed commit/branch for a repo."""
+        with self._write_lock:
+            self._execute_write(
+                "UPDATE repos SET last_commit = ?, last_branch = ?, indexed_at = now() "
+                "WHERE repo_id = ?",
+                [commit, branch, repo_id],
+            )
+
+    def delete_repo(self, repo_id: int) -> None:
+        """Delete a repo and all associated data (manual cascade).
+
+        DuckDB does not support ``ON DELETE CASCADE``, so child rows are
+        deleted in dependency order: lineage, column_usage, edges, nodes,
+        files, then the repo itself.
+
+        Args:
+            repo_id: ID of the repo to delete.
+        """
+        with self.write_transaction():
+            self._delete_repo_impl(repo_id)
+
+    def _delete_repo_impl(self, repo_id: int) -> None:
+        """Inner impl -- caller must hold ``_write_lock`` (via write_transaction)."""
+        # Delete column_lineage for all files in repo
+        self._execute_write(
+            "DELETE FROM column_lineage WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?)",
+            [repo_id],
+        )
+        # Delete column_usage for all nodes in repo's files
+        self._execute_write(
+            "DELETE FROM column_usage WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?)",
+            [repo_id],
+        )
+        # Delete edges referencing repo's nodes
+        self._execute_write(
+            "DELETE FROM edges WHERE source_id IN "
+            "(SELECT node_id FROM nodes WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?))",
+            [repo_id],
+        )
+        self._execute_write(
+            "DELETE FROM edges WHERE target_id IN "
+            "(SELECT node_id FROM nodes WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?))",
+            [repo_id],
+        )
+        # Delete nodes
+        self._execute_write(
+            "DELETE FROM nodes WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?)",
+            [repo_id],
+        )
+        # Delete files
+        self._execute_write("DELETE FROM files WHERE repo_id = ?", [repo_id])
+        # Delete repo
+        self._execute_write("DELETE FROM repos WHERE repo_id = ?", [repo_id])
+
+    # ── File management ──
+
+    def get_file_checksums(self, repo_id: int) -> dict[str, str]:
+        """Get {path: checksum} for all files in a repo."""
+        rows = self._execute_read(
+            "SELECT path, checksum FROM files WHERE repo_id = ?", [repo_id]
+        ).fetchall()
+        return {path: checksum for path, checksum in rows}
+
+    def delete_file_data(self, repo_id: int, path: str) -> None:
+        """Delete all data for a file (nodes, edges, column_usage, file record).
+
+        Nodes that have inbound edges from OTHER files are converted to phantom
+        nodes (file_id=NULL) instead of being deleted, so that cross-file edges
+        survive incremental reindex. cleanup_phantoms() will later merge these
+        phantoms with the newly-inserted real nodes.
+
+        Wraps in a write_transaction if not already inside one.
+        """
+        with self.write_transaction():
+            self._delete_file_data_impl(repo_id, path)
+
+    def _delete_file_data_impl(self, repo_id: int, path: str) -> None:
+        """Inner impl -- caller must hold ``_write_lock`` (via write_transaction)."""
+        file_row = self._execute_write(
+            "SELECT file_id FROM files WHERE repo_id = ? AND path = ?",
+            [repo_id, path],
+        ).fetchone()
+        if not file_row:
+            return
+        file_id = file_row[0]
+
+        self._execute_write("DELETE FROM column_lineage WHERE file_id = ?", [file_id])
+        self._execute_write("DELETE FROM column_usage WHERE file_id = ?", [file_id])
+
+        # Delete edges where source is in this file's nodes (outbound from this file)
+        self._execute_write(
+            "DELETE FROM edges WHERE source_id IN "
+            "(SELECT node_id FROM nodes WHERE file_id = ?)",
+            [file_id],
+        )
+
+        # Find nodes in this file that have inbound edges from OTHER files' nodes.
+        # These must be preserved as phantoms so cross-file edges survive.
+        nodes_with_cross_file_edges = self._execute_write(
+            "SELECT DISTINCT n.node_id FROM nodes n "
+            "JOIN edges e ON e.target_id = n.node_id "
+            "JOIN nodes src ON e.source_id = src.node_id "
+            "WHERE n.file_id = ? AND (src.file_id IS NULL OR src.file_id != ?)",
+            [file_id, file_id],
+        ).fetchall()
+
+        if nodes_with_cross_file_edges:
+            # Convert these nodes to phantoms (preserve for edge continuity)
+            phantom_ids = [row[0] for row in nodes_with_cross_file_edges]
+            placeholders = ",".join(["?"] * len(phantom_ids))
+            self._execute_write(
+                f"UPDATE nodes SET file_id = NULL, line_start = NULL, line_end = NULL "
+                f"WHERE node_id IN ({placeholders})",
+                phantom_ids,
+            )
+
+        # Delete edges where target is in this file's non-phantom nodes
+        # (edges from other files now point to phantoms, so they're safe)
+        self._execute_write(
+            "DELETE FROM edges WHERE target_id IN "
+            "(SELECT node_id FROM nodes WHERE file_id = ?)",
+            [file_id],
+        )
+
+        # Delete remaining (non-phantom) nodes for this file
+        self._execute_write("DELETE FROM nodes WHERE file_id = ?", [file_id])
+        self._execute_write("DELETE FROM files WHERE file_id = ?", [file_id])
+
+    def insert_file(
+        self, repo_id: int, path: str, language: str, checksum: str
+    ) -> int:
+        """Insert a file record.
+
+        Args:
+            repo_id: Owning repo.
+            path: Relative file path within the repo.
+            language: Language identifier (e.g. ``"sql"``).
+            checksum: SHA-256 hex digest of the file content.
+
+        Returns:
+            The newly assigned ``file_id``.
+        """
+        with self._write_lock:
+            result = self._execute_write(
+                "INSERT INTO files (repo_id, path, language, checksum) "
+                "VALUES (?, ?, ?, ?) RETURNING file_id",
+                [repo_id, path, language, checksum],
+            ).fetchone()
+            return result[0]
+
+    # ── Node management ──
+
+    def insert_node(
+        self,
+        file_id: int | None,
+        kind: str,
+        name: str,
+        language: str,
+        line_start: int | None = None,
+        line_end: int | None = None,
+        metadata: dict | None = None,
+        schema: str | None = None,
+    ) -> int:
+        """Insert a single node.
+
+        Args:
+            file_id: Owning file, or ``None`` for phantom nodes.
+            kind: Node kind (e.g. ``"table"``, ``"view"``, ``"cte"``).
+            name: Unqualified entity name.
+            language: Language identifier.
+            line_start: First source line, if known.
+            line_end: Last source line, if known.
+            metadata: Arbitrary JSON-serialisable metadata.
+            schema: Database schema qualifier (e.g. ``"staging"``).
+
+        Returns:
+            The newly assigned ``node_id``.
+        """
+        with self._write_lock:
+            result = self._execute_write(
+                "INSERT INTO nodes (file_id, kind, name, language, line_start, line_end, metadata, schema) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING node_id",
+                [
+                    file_id,
+                    kind,
+                    name,
+                    language,
+                    line_start,
+                    line_end,
+                    json.dumps(metadata) if metadata else None,
+                    schema,
+                ],
+            ).fetchone()
+            return result[0]
+
+    def resolve_node(
+        self, name: str, kind: str, repo_id: int | None = None, schema: str | None = None,
+    ) -> int | None:
+        """Find a node by name and kind.
+
+        Matches on short name (e.g. ``"orders"``) which covers both
+        unqualified references and qualified ones (stored as short name
+        plus schema column). Search order: same repo first, then cross-repo.
+
+        Args:
+            name: Unqualified entity name.
+            kind: Node kind to match.
+            repo_id: Prefer nodes from this repo. Falls back to cross-repo
+                search if not found.
+            schema: Optional schema qualifier. When provided, only nodes
+                with a matching ``schema`` column are returned.
+
+        Returns:
+            The ``node_id`` if found, otherwise ``None``.
+        """
+        schema_clause = ""
+        schema_params: list = []
+        if schema is not None:
+            schema_clause = " AND n.schema = ?"
+            schema_params = [schema]
+
+        if repo_id:
+            row = self._execute_read(
+                "SELECT n.node_id FROM nodes n "
+                "JOIN files f ON n.file_id = f.file_id "
+                "WHERE n.name = ? AND n.kind = ? AND f.repo_id = ?"
+                + schema_clause + " LIMIT 1",
+                [name, kind, repo_id] + schema_params,
+            ).fetchone()
+            if row:
+                return row[0]
+
+        # Cross-repo search (use alias so schema_clause referencing 'n.' works)
+        row = self._execute_read(
+            "SELECT n.node_id FROM nodes n WHERE n.name = ? AND n.kind = ?"
+            + schema_clause + " LIMIT 1",
+            [name, kind] + schema_params,
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_or_create_phantom(self, name: str, kind: str, language: str) -> int:
+        """Get an existing phantom node or create one. Returns node_id."""
+        with self._write_lock:
+            row = self._execute_write(
+                "SELECT node_id FROM nodes WHERE name = ? AND kind = ? AND file_id IS NULL LIMIT 1",
+                [name, kind],
+            ).fetchone()
+            if row:
+                return row[0]
+            # insert_node acquires _write_lock (RLock is re-entrant)
+            return self.insert_node(
+                file_id=None, kind=kind, name=name, language=language
+        )
+
+    def cleanup_phantoms(self) -> int:
+        """Repoint edges from phantom nodes to real counterparts, then delete phantoms.
+
+        A phantom node (file_id IS NULL) can be replaced when a real node with
+        the same name+kind exists. Edges pointing to/from the phantom are updated
+        to reference the real node, then the phantom is deleted.
+
+        Returns the number of phantom nodes cleaned up.
+        """
+        with self._write_lock:
+            # Find phantoms that have a real counterpart
+            phantoms = self._execute_write(
+                "SELECT p.node_id AS phantom_id, r.node_id AS real_id "
+                "FROM nodes p "
+                "JOIN nodes r ON p.name = r.name AND p.kind = r.kind "
+                "AND COALESCE(p.schema, '') = COALESCE(r.schema, '') "
+                "WHERE p.file_id IS NULL AND r.file_id IS NOT NULL"
+            ).fetchall()
+
+            if not phantoms:
+                # Still check for orphaned phantoms (no edges at all)
+                orphaned = self._execute_write(
+                    "SELECT node_id FROM nodes "
+                    "WHERE file_id IS NULL "
+                    "AND node_id NOT IN (SELECT source_id FROM edges) "
+                    "AND node_id NOT IN (SELECT target_id FROM edges)"
+                ).fetchall()
+                # Also find stale phantoms: phantoms whose only inbound edges
+                # come from other phantoms (no real node references them).
+                stale = self._execute_write(
+                    "SELECT p.node_id FROM nodes p "
+                    "WHERE p.file_id IS NULL "
+                    "AND p.node_id IN (SELECT target_id FROM edges) "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM edges e "
+                    "  JOIN nodes src ON e.source_id = src.node_id "
+                    "  WHERE e.target_id = p.node_id AND src.file_id IS NOT NULL"
+                    ")"
+                ).fetchall()
+                to_delete = {row[0] for row in orphaned} | {row[0] for row in stale}
+                if to_delete:
+                    delete_ids = list(to_delete)
+                    placeholders = ",".join(["?"] * len(delete_ids))
+                    # Remove edges referencing stale phantoms before deleting nodes
+                    self._execute_write(
+                        f"DELETE FROM edges WHERE source_id IN ({placeholders}) "
+                        f"OR target_id IN ({placeholders})",
+                        delete_ids + delete_ids,
+                    )
+                    self._execute_write(
+                        f"DELETE FROM nodes WHERE node_id IN ({placeholders})",
+                        delete_ids,
+                    )
+                    return len(to_delete)
+                return 0
+
+            # Batch repoint edges: single UPDATE per direction using a mapping table
+            # instead of O(phantoms) individual UPDATEs.
+            mapping_values = ", ".join(
+                [f"({phantom_id}, {real_id})" for phantom_id, real_id in phantoms]
+            )
+            self._execute_write(
+                f"UPDATE edges SET source_id = m.real_id "
+                f"FROM (VALUES {mapping_values}) AS m(phantom_id, real_id) "
+                f"WHERE edges.source_id = m.phantom_id"
+            )
+            self._execute_write(
+                f"UPDATE edges SET target_id = m.real_id "
+                f"FROM (VALUES {mapping_values}) AS m(phantom_id, real_id) "
+                f"WHERE edges.target_id = m.phantom_id"
+            )
+
+            # Delete all phantoms that had real counterparts
+            phantom_ids = [p[0] for p in phantoms]
+            placeholders = ",".join(["?"] * len(phantom_ids))
+            self._execute_write(
+                f"DELETE FROM nodes WHERE node_id IN ({placeholders})",
+                phantom_ids,
+            )
+
+            # Clean up orphaned phantoms: phantom nodes with no edges at all
+            orphaned = self._execute_write(
+                "SELECT node_id FROM nodes "
+                "WHERE file_id IS NULL "
+                "AND node_id NOT IN (SELECT source_id FROM edges) "
+                "AND node_id NOT IN (SELECT target_id FROM edges)"
+            ).fetchall()
+
+            if orphaned:
+                orphan_ids = [row[0] for row in orphaned]
+                placeholders = ",".join(["?"] * len(orphan_ids))
+                self._execute_write(
+                    f"DELETE FROM nodes WHERE node_id IN ({placeholders})",
+                    orphan_ids,
+                )
+
+            return len(phantoms) + len(orphaned)
+
+    # ── Edge management ──
+
+    def insert_edge(
+        self,
+        source_id: int,
+        target_id: int,
+        relationship: str,
+        context: str | None = None,
+        metadata: dict | None = None,
+    ) -> int:
+        """Insert an edge. Returns edge_id."""
+        with self._write_lock:
+            result = self._execute_write(
+                "INSERT INTO edges (source_id, target_id, relationship, context, metadata) "
+                "VALUES (?, ?, ?, ?, ?) RETURNING edge_id",
+                [
+                    source_id,
+                    target_id,
+                    relationship,
+                    context,
+                    json.dumps(metadata) if metadata else None,
+                ],
+            ).fetchone()
+            return result[0]
+
+    # ── Batch inserts ──
+
+    def insert_nodes_batch(
+        self,
+        rows: list[tuple],
+    ) -> list[int]:
+        """Batch insert nodes.
+
+        Args:
+            rows: List of tuples, each containing
+                ``(file_id, kind, name, language, line_start, line_end, metadata_json, schema)``.
+
+        Returns:
+            ``node_id`` values in insertion order.
+        """
+        if not rows:
+            return []
+        CHUNK_SIZE = 200
+        all_ids = []
+        with self._write_lock:
+            for i in range(0, len(rows), CHUNK_SIZE):
+                chunk = rows[i:i + CHUNK_SIZE]
+                placeholders = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+                flat = [v for row in chunk for v in row]
+                result = self.conn.execute(
+                    f"INSERT INTO nodes (file_id, kind, name, language, line_start, line_end, metadata, schema) "
+                    f"VALUES {placeholders} RETURNING node_id",
+                    flat,
+                ).fetchall()
+                all_ids.extend(r[0] for r in result)
+        return all_ids
+
+    def insert_edges_batch(self, rows: list[tuple]) -> None:
+        """Batch insert edges.
+
+        Args:
+            rows: List of tuples, each containing
+                ``(source_id, target_id, relationship, context, metadata_json)``.
+        """
+        if not rows:
+            return
+        with self._write_lock:
+            self.conn.executemany(
+                "INSERT INTO edges (source_id, target_id, relationship, context, metadata) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def insert_column_usage_batch(self, rows: list[tuple]) -> None:
+        """Batch insert column usage records.
+
+        Args:
+            rows: List of tuples, each containing
+                ``(node_id, table_name, column_name, usage_type, file_id, alias, transform)``.
+        """
+        if not rows:
+            return
+        with self._write_lock:
+            self.conn.executemany(
+                "INSERT INTO column_usage (node_id, table_name, column_name, usage_type, file_id, alias, transform) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def insert_column_lineage_batch(self, rows: list[tuple]) -> None:
+        """Batch insert column lineage hops.
+
+        Args:
+            rows: List of tuples, each containing
+                ``(file_id, output_node, output_column, chain_index,
+                hop_index, hop_column, hop_table, hop_expression)``.
+        """
+        if not rows:
+            return
+        with self._write_lock:
+            self.conn.executemany(
+                "INSERT INTO column_lineage "
+                "(file_id, output_node, output_column, chain_index, hop_index, hop_column, hop_table, hop_expression) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    # ── Column usage ──
+
+    def insert_column_usage(
+        self,
+        node_id: int,
+        table_name: str,
+        column_name: str,
+        usage_type: str,
+        file_id: int,
+        alias: str | None = None,
+        transform: str | None = None,
+    ) -> None:
+        """Insert a column usage record."""
+        with self._write_lock:
+            self._execute_write(
+                "INSERT INTO column_usage (node_id, table_name, column_name, usage_type, file_id, alias, transform) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [node_id, table_name, column_name, usage_type, file_id, alias, transform],
+            )
+
+    # ── Column lineage ──
+
+    def insert_column_lineage(
+        self,
+        file_id: int,
+        output_node: str,
+        output_column: str,
+        hop_index: int,
+        hop_column: str,
+        hop_table: str,
+        hop_expression: str | None = None,
+        chain_index: int = 0,
+    ) -> None:
+        """Insert a single hop in a column lineage chain."""
+        with self._write_lock:
+            self._execute_write(
+                "INSERT INTO column_lineage "
+                "(file_id, output_node, output_column, chain_index, hop_index, hop_column, hop_table, hop_expression) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [file_id, output_node, output_column, chain_index, hop_index, hop_column, hop_table, hop_expression],
+            )
+
+    def query_column_lineage(
+        self,
+        table: str | None = None,
+        column: str | None = None,
+        output_node: str | None = None,
+        repo: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        """Query column lineage chains.
+
+        Can search by:
+
+        - ``output_node`` + ``column``: "where does this output column come from?"
+        - ``table`` + ``column`` at any hop: "where does this source column flow to?"
+
+        ``limit`` applies to chain count (distinct
+        ``output_node``/``output_column``/``chain_index`` combinations),
+        not raw hop rows.
+
+        Args:
+            table: Filter by hop table name.
+            column: Filter by column name (output or any hop, depending
+                on whether ``output_node`` is also set).
+            output_node: Filter by the node that produces the output column.
+            repo: Filter by repo name.
+            limit: Maximum number of lineage chains to return.
+            offset: Pagination offset (in chains).
+
+        Returns:
+            Dict with keys ``"chains"`` (list of chain dicts, each with
+            ``output_node``, ``output_column``, ``chain_index``, ``hops``,
+            ``file``, and ``repo``) and ``"total_count"`` (int).
+        """
+        # Build WHERE clauses for both outer (cl) and inner (cl2) aliases
+        outer_where: list[str] = []
+        inner_where: list[str] = []
+        params: list = []
+
+        if output_node:
+            outer_where.append("cl.output_node = ?")
+            inner_where.append("cl2.output_node = ?")
+            params.append(output_node)
+        if column:
+            if output_node:
+                outer_where.append("cl.output_column = ?")
+                inner_where.append("cl2.output_column = ?")
+                params.append(column)
+            else:
+                outer_where.append("(cl.output_column = ? OR cl.hop_column = ?)")
+                inner_where.append("(cl2.output_column = ? OR cl2.hop_column = ?)")
+                params.extend([column, column])
+        if table:
+            outer_where.append("cl.hop_table = ?")
+            inner_where.append("cl2.hop_table = ?")
+            params.append(table)
+        if repo:
+            outer_where.append("r.name = ?")
+            inner_where.append("r2.name = ?")
+            params.append(repo)
+
+        if not outer_where:
+            return {"chains": [], "total_count": 0}
+
+        # True total count of matching chains (before pagination)
+        count_sql = (
+            "SELECT COUNT(*) FROM ("
+            "  SELECT DISTINCT cl2.output_node, cl2.output_column, cl2.chain_index "
+            "  FROM column_lineage cl2 "
+            "  JOIN files f2 ON cl2.file_id = f2.file_id "
+            "  JOIN repos r2 ON f2.repo_id = r2.repo_id "
+            f"  WHERE {' AND '.join(inner_where)} "
+            ")"
+        )
+        total_count = self._execute_read(count_sql, params).fetchone()[0]
+
+        # Subquery selects distinct chains with LIMIT, then outer query
+        # fetches all hops for those chains. This ensures LIMIT counts chains,
+        # not individual hop rows.
+        sql = (
+            "SELECT cl.output_node, cl.output_column, cl.chain_index, cl.hop_index, "
+            "cl.hop_column, cl.hop_table, cl.hop_expression, "
+            "f.path, r.name as repo_name "
+            "FROM column_lineage cl "
+            "JOIN files f ON cl.file_id = f.file_id "
+            "JOIN repos r ON f.repo_id = r.repo_id "
+            "WHERE (cl.output_node, cl.output_column, cl.chain_index) IN ("
+            "  SELECT DISTINCT cl2.output_node, cl2.output_column, cl2.chain_index "
+            "  FROM column_lineage cl2 "
+            "  JOIN files f2 ON cl2.file_id = f2.file_id "
+            "  JOIN repos r2 ON f2.repo_id = r2.repo_id "
+            f"  WHERE {' AND '.join(inner_where)} "
+            "  ORDER BY cl2.output_node, cl2.output_column, cl2.chain_index "
+            "  LIMIT ? OFFSET ?"
+            ") "
+            "ORDER BY cl.output_node, cl.output_column, cl.chain_index, cl.hop_index"
+        )
+
+        # params duplicated: once for inner subquery, once not needed for outer
+        # (outer filters via the IN subquery)
+        rows = self._execute_read(sql, params + [limit, offset]).fetchall()
+
+        # Group by (output_node, output_column, chain_index) into chains
+        chains: dict[tuple[str, str, int], list] = {}
+        for r in rows:
+            key = (r[0], r[1], r[2])
+            if key not in chains:
+                chains[key] = {
+                    "output_node": r[0], "output_column": r[1],
+                    "chain_index": r[2], "hops": [], "file": r[7], "repo": r[8],
+                }
+            chains[key]["hops"].append({
+                "index": r[3], "column": r[4], "table": r[5], "expression": r[6],
+            })
+
+        return {"chains": list(chains.values()), "total_count": total_count}
+
+    # ── Schema catalog ──
+
+    def get_table_columns(self, repo_id: int | None = None) -> dict[str, dict[str, str]]:
+        """Build a schema catalog from indexed column usage.
+
+        Suitable for passing to ``sqlglot.optimizer.qualify_columns`` or
+        ``sqlglot.lineage``. All types are set to ``"TEXT"`` since the
+        indexer does not track actual column types.
+
+        Args:
+            repo_id: Restrict to columns from this repo. ``None`` returns
+                columns across all repos.
+
+        Returns:
+            ``{table_name: {column_name: "TEXT", ...}}`` mapping.
+        """
+        if repo_id:
+            rows = self._execute_read(
+                "SELECT DISTINCT cu.table_name, cu.column_name "
+                "FROM column_usage cu "
+                "JOIN files f ON cu.file_id = f.file_id "
+                "WHERE f.repo_id = ? AND cu.column_name != '*'",
+                [repo_id],
+            ).fetchall()
+        else:
+            rows = self._execute_read(
+                "SELECT DISTINCT table_name, column_name "
+                "FROM column_usage WHERE column_name != '*'"
+            ).fetchall()
+
+        schema: dict[str, dict[str, str]] = {}
+        for table, col in rows:
+            if table not in schema:
+                schema[table] = {}
+            schema[table][col] = "TEXT"
+        return schema
+
+    # ── Snippet helper ──
+
+    def _read_snippet(
+        self,
+        repo_name: str | None,
+        file_path: str | None,
+        line_start: int | None,
+        line_end: int | None,
+        context_lines: int = 2,
+        max_lines: int = 20,
+    ) -> str | None:
+        """Read a code snippet from the source file.
+
+        Args:
+            repo_name: Repo name to look up the base path
+            file_path: Relative file path within the repo
+            line_start: First line of the entity
+            line_end: Last line of the entity
+            context_lines: Extra lines before/after to include
+            max_lines: Cap total snippet length
+        """
+        if file_path is None or line_start is None:
+            return None
+
+        # Get repo base path
+        if repo_name:
+            row = self._execute_read(
+                "SELECT path FROM repos WHERE name = ?", [repo_name]
+            ).fetchone()
+            if not row:
+                return None
+            base = Path(row[0])
+        else:
+            return None
+
+        full_path = base / file_path
+        if not full_path.exists():
+            return None
+
+        lines = _read_file_lines(str(full_path))
+        if lines is None:
+            return None
+
+        start = max(0, line_start - 1 - context_lines)
+        end_line = line_end or line_start
+        end = min(len(lines), end_line + context_lines)
+
+        # Cap to max_lines
+        if end - start > max_lines:
+            end = start + max_lines
+
+        snippet_lines = lines[start:end]
+        # Add line numbers
+        numbered = [
+            f"{start + i + 1:4d} | {line}"
+            for i, line in enumerate(snippet_lines)
+        ]
+        return "\n".join(numbered)
+
+    # ── Query methods (used by MCP tools) ──
+
+    def query_references(
+        self,
+        name: str,
+        kind: str | None = None,
+        schema: str | None = None,
+        repo: str | None = None,
+        direction: str = "both",
+        include_snippets: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        """Find all references to/from a named entity.
+
+        Args:
+            name: Entity name to look up.
+            kind: Optional node kind filter.
+            schema: Optional database schema filter.
+            repo: Optional repo name filter.
+            direction: ``"both"``, ``"inbound"``, or ``"outbound"``.
+            include_snippets: Attach source code snippets when ``True``.
+            limit: Maximum edges per direction.
+            offset: Pagination offset.
+
+        Returns:
+            Dict with keys ``"entity"`` (list of matched node dicts or
+            ``None``), ``"inbound"`` (list of referencing entities), and
+            ``"outbound"`` (list of referenced entities). Each entry
+            contains ``name``, ``kind``, ``relationship``, ``context``,
+            ``file``, ``repo``, ``line``, and optionally ``snippet``.
+        """
+        # Find the target node(s)
+        where_clauses = ["n.name = ?"]
+        params: list = [name]
+        if kind:
+            where_clauses.append("n.kind = ?")
+            params.append(kind)
+        if schema:
+            where_clauses.append("n.schema = ?")
+            params.append(schema)
+
+        node_query = f"SELECT n.node_id, n.kind, n.name FROM nodes n WHERE {' AND '.join(where_clauses)}"
+        target_nodes = self._execute_read(node_query, params).fetchall()
+
+        if not target_nodes:
+            return {"entity": None, "inbound": [], "outbound": []}
+
+        node_ids = [row[0] for row in target_nodes]
+        placeholders = ",".join(["?"] * len(node_ids))
+
+        result = {
+            "entity": [{"node_id": r[0], "kind": r[1], "name": r[2]} for r in target_nodes],
+            "inbound": [],
+            "outbound": [],
+        }
+
+        if direction in ("both", "inbound"):
+            inbound_sql = (
+                f"SELECT n2.name, n2.kind, e.relationship, e.context, "
+                f"f2.path, r2.name as repo_name, n2.line_start, n2.line_end "
+                f"FROM edges e "
+                f"JOIN nodes n2 ON e.source_id = n2.node_id "
+                f"LEFT JOIN files f2 ON n2.file_id = f2.file_id "
+                f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
+                f"WHERE e.target_id IN ({placeholders}) "
+                f"LIMIT ? OFFSET ?"
+            )
+            for r in self._execute_read(inbound_sql, node_ids + [limit, offset]).fetchall():
+                entry = {
+                    "name": r[0], "kind": r[1], "relationship": r[2],
+                    "context": r[3], "file": r[4], "repo": r[5], "line": r[6],
+                }
+                if include_snippets:
+                    snippet = self._read_snippet(r[5], r[4], r[6], r[7])
+                    if snippet:
+                        entry["snippet"] = snippet
+                result["inbound"].append(entry)
+
+        if direction in ("both", "outbound"):
+            outbound_sql = (
+                f"SELECT n2.name, n2.kind, e.relationship, e.context, "
+                f"f2.path, r2.name as repo_name, n2.line_start, n2.line_end "
+                f"FROM edges e "
+                f"JOIN nodes n2 ON e.target_id = n2.node_id "
+                f"LEFT JOIN files f2 ON n2.file_id = f2.file_id "
+                f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
+                f"WHERE e.source_id IN ({placeholders}) "
+                f"LIMIT ? OFFSET ?"
+            )
+            for r in self._execute_read(outbound_sql, node_ids + [limit, offset]).fetchall():
+                entry = {
+                    "name": r[0], "kind": r[1], "relationship": r[2],
+                    "context": r[3], "file": r[4], "repo": r[5], "line": r[6],
+                }
+                if include_snippets:
+                    snippet = self._read_snippet(r[5], r[4], r[6], r[7])
+                    if snippet:
+                        entry["snippet"] = snippet
+                result["outbound"].append(entry)
+
+        return result
+
+    def query_column_usage(
+        self,
+        table: str,
+        column: str | None = None,
+        usage_type: str | None = None,
+        repo: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        """Find column usage records for a table.
+
+        Args:
+            table: Table name to search for.
+            column: Optional column name filter.
+            usage_type: Optional usage type filter (e.g. ``"select"``, ``"where"``).
+            repo: Optional repo name filter.
+            limit: Maximum records to return.
+            offset: Pagination offset.
+
+        Returns:
+            Dict with keys ``"usage"`` (list of usage dicts with ``table``,
+            ``column``, ``usage_type``, ``alias``, ``node_name``,
+            ``node_kind``, ``file``, ``repo``, ``line``, and optionally
+            ``transform``), ``"summary"`` (dict mapping usage_type to count),
+            and ``"total_count"`` (int).
+        """
+        where = ["cu.table_name = ?"]
+        params: list = [table]
+        if column:
+            where.append("cu.column_name = ?")
+            params.append(column)
+        if usage_type:
+            where.append("cu.usage_type = ?")
+            params.append(usage_type)
+
+        joins = (
+            "JOIN nodes n ON cu.node_id = n.node_id "
+            "JOIN files f ON cu.file_id = f.file_id "
+            "JOIN repos r ON f.repo_id = r.repo_id"
+        )
+        if repo:
+            where.append("r.name = ?")
+            params.append(repo)
+
+        sql = (
+            f"SELECT cu.table_name, cu.column_name, cu.usage_type, cu.alias, "
+            f"n.name as node_name, n.kind as node_kind, f.path, r.name as repo_name, n.line_start, "
+            f"cu.transform "
+            f"FROM column_usage cu {joins} "
+            f"WHERE {' AND '.join(where)} "
+            f"ORDER BY cu.table_name, cu.column_name, cu.usage_type "
+            f"LIMIT ? OFFSET ?"
+        )
+
+        rows = self._execute_read(sql, params + [limit, offset]).fetchall()
+
+        usage = []
+        for r in rows:
+            entry = {
+                "table": r[0], "column": r[1], "usage_type": r[2], "alias": r[3],
+                "node_name": r[4], "node_kind": r[5], "file": r[6], "repo": r[7], "line": r[8],
+            }
+            if r[9]:
+                entry["transform"] = r[9]
+            usage.append(entry)
+
+        # True total count (before pagination)
+        count_sql = (
+            f"SELECT COUNT(*) FROM column_usage cu {joins} "
+            f"WHERE {' AND '.join(where)}"
+        )
+        total_count = self._execute_read(count_sql, params).fetchone()[0]
+
+        # Summary by usage_type
+        summary: dict[str, int] = {}
+        for u in usage:
+            summary[u["usage_type"]] = summary.get(u["usage_type"], 0) + 1
+
+        return {"usage": usage, "summary": summary, "total_count": total_count}
+
+    def query_search(
+        self,
+        pattern: str,
+        kind: str | None = None,
+        language: str | None = None,
+        schema: str | None = None,
+        repo: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_snippets: bool = True,
+    ) -> dict:
+        """Search nodes by name pattern (case-insensitive ``ILIKE``).
+
+        Args:
+            pattern: Substring to match against node names.
+            kind: Filter by node kind (e.g. ``"table"``, ``"view"``).
+            language: Filter by language (e.g. ``"sql"``).
+            schema: Filter by database schema.
+            repo: Filter by repo name.
+            limit: Maximum number of matches to return.
+            offset: Number of matches to skip (for pagination).
+            include_snippets: If ``True``, attach source code snippets to results.
+
+        Returns:
+            Dict with keys ``"matches"`` (list of match dicts with ``name``,
+            ``kind``, ``language``, ``file``, ``repo``, ``line_start``,
+            ``line_end``, and optionally ``snippet``) and ``"total_count"``
+            (int, total matching nodes before pagination).
+        """
+        escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where = ["n.name ILIKE ? ESCAPE '\\'"]
+        params: list = [f"%{escaped}%"]
+        if kind:
+            where.append("n.kind = ?")
+            params.append(kind)
+        if language:
+            where.append("n.language = ?")
+            params.append(language)
+        if schema:
+            where.append("n.schema = ?")
+            params.append(schema)
+
+        joins = (
+            "LEFT JOIN files f ON n.file_id = f.file_id "
+            "LEFT JOIN repos r ON f.repo_id = r.repo_id"
+        )
+        if repo:
+            where.append("r.name = ?")
+            params.append(repo)
+
+        count_sql = f"SELECT COUNT(*) FROM nodes n {joins} WHERE {' AND '.join(where)}"
+        total = self._execute_read(count_sql, params).fetchone()[0]
+
+        sql = (
+            f"SELECT n.name, n.kind, n.language, f.path, r.name as repo_name, "
+            f"n.line_start, n.line_end "
+            f"FROM nodes n {joins} "
+            f"WHERE {' AND '.join(where)} "
+            f"ORDER BY n.name "
+            f"LIMIT ? OFFSET ?"
+        )
+        rows = self._execute_read(sql, params + [limit, offset]).fetchall()
+
+        matches = []
+        for r in rows:
+            match = {
+                "name": r[0], "kind": r[1], "language": r[2],
+                "file": r[3], "repo": r[4], "line_start": r[5], "line_end": r[6],
+            }
+            if include_snippets:
+                snippet = self._read_snippet(r[4], r[3], r[5], r[6])
+                if snippet:
+                    match["snippet"] = snippet
+            matches.append(match)
+
+        return {"matches": matches, "total_count": total}
+
+    def query_trace(
+        self,
+        name: str,
+        kind: str | None = None,
+        direction: str = "downstream",
+        max_depth: int = 3,
+        repo: str | None = None,
+        include_snippets: bool = False,
+        limit: int = 100,
+        exclude_edges: set[tuple[str, str]] | None = None,
+    ) -> dict:
+        """Trace multi-hop dependency chains using a recursive CTE.
+
+        Args:
+            name: Starting entity name.
+            kind: Optional node kind filter for the starting node.
+            direction: ``"downstream"``, ``"upstream"``, or ``"both"``.
+            max_depth: Maximum hops to follow (capped at 10).
+            repo: Optional repo name filter.
+            include_snippets: Attach source code snippets when ``True``.
+            limit: Maximum result rows.
+            exclude_edges: Optional set of ``(source_name, target_name)``
+                tuples.  Any edge whose source and target names match a
+                tuple in this set will be excluded from traversal.  Used
+                by PR-impact v2 to approximate a base-commit graph by
+                removing newly-added edges from the HEAD graph.
+
+        Returns:
+            Dict with keys ``"root"`` (starting node dict or ``None``),
+            ``"paths"`` (list of path-step dicts with ``name``, ``kind``,
+            ``language``, ``relationship``, ``context``, ``depth``,
+            ``file``, ``repo``, and optionally ``snippet``),
+            ``"depth_summary"`` (``{depth: count}``), and
+            ``"repos_affected"`` (sorted list of repo names). When
+            ``direction="both"``, paths are split into ``"downstream"``
+            and ``"upstream"`` keys instead of a single ``"paths"``.
+        """
+        max_depth = min(max_depth, 10)
+        # Find starting node(s)
+        where = ["name = ?"]
+        params: list = [name]
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
+
+        start_nodes = self._execute_read(
+            f"SELECT node_id, name, kind FROM nodes WHERE {' AND '.join(where)}",
+            params,
+        ).fetchall()
+
+        if not start_nodes:
+            return {"root": None, "paths": [], "depth_summary": {}, "repos_affected": []}
+
+        start_id = start_nodes[0][0]
+
+        # Direction determines which side of the edge we follow
+        if direction == "downstream":
+            source_col, target_col = "source_id", "target_id"
+        elif direction == "upstream":
+            source_col, target_col = "target_id", "source_id"
+        else:
+            # Both — run downstream and upstream separately and merge
+            down = self.query_trace(name, kind, "downstream", max_depth, repo, include_snippets, limit, exclude_edges)
+            up = self.query_trace(name, kind, "upstream", max_depth, repo, include_snippets, limit, exclude_edges)
+            return {
+                "root": down["root"],
+                "downstream": down["paths"],
+                "upstream": up["paths"],
+                "depth_summary": {
+                    depth: down["depth_summary"].get(depth, 0) + up["depth_summary"].get(depth, 0)
+                    for depth in set(down["depth_summary"]) | set(up["depth_summary"])
+                },
+                "repos_affected": list(set(down["repos_affected"] + up["repos_affected"])),
+            }
+
+        # Pre-resolve exclude_edges name pairs to ID pairs
+        exclude_clause = ""
+        if exclude_edges:
+            excluded_id_pairs: set[tuple[int, int]] = set()
+            for src_name, tgt_name in exclude_edges:
+                rows_ex = self._execute_read(
+                    "SELECT s.node_id, t.node_id FROM nodes s, nodes t "
+                    "WHERE s.name = ? AND t.name = ?",
+                    [src_name, tgt_name],
+                ).fetchall()
+                for row_ex in rows_ex:
+                    excluded_id_pairs.add((row_ex[0], row_ex[1]))
+            if excluded_id_pairs:
+                pairs_sql = ", ".join(f"({s}, {t})" for s, t in excluded_id_pairs)
+                exclude_clause = (
+                    f"AND (e.source_id, e.target_id) NOT IN (VALUES {pairs_sql})"
+                )
+
+        recursive_sql = f"""
+        WITH RECURSIVE trace AS (
+            SELECT
+                e.{target_col} as node_id,
+                e.relationship,
+                e.context,
+                1 as depth,
+                ARRAY[e.{source_col}] as path
+            FROM edges e
+            WHERE e.{source_col} = ?
+            {exclude_clause}
+
+            UNION ALL
+
+            SELECT
+                e.{target_col},
+                e.relationship,
+                e.context,
+                t.depth + 1,
+                array_append(t.path, e.{source_col})
+            FROM edges e
+            JOIN trace t ON e.{source_col} = t.node_id
+            WHERE t.depth < ?
+            AND NOT array_contains(t.path, e.{target_col})
+            {exclude_clause}
+        )
+        SELECT DISTINCT
+            t.node_id, t.relationship, t.context, t.depth,
+            n.name, n.kind, n.language,
+            f.path as file_path, r.name as repo_name,
+            n.line_start, n.line_end
+        FROM trace t
+        JOIN nodes n ON t.node_id = n.node_id
+        LEFT JOIN files f ON n.file_id = f.file_id
+        LEFT JOIN repos r ON f.repo_id = r.repo_id
+        ORDER BY t.depth, n.name
+        LIMIT ?
+        """
+
+        rows = self._execute_read(recursive_sql, [start_id, max_depth, limit]).fetchall()
+
+        paths = []
+        for r in rows:
+            entry = {
+                "name": r[4], "kind": r[5], "language": r[6],
+                "relationship": r[1], "context": r[2], "depth": r[3],
+                "file": r[7], "repo": r[8],
+            }
+            if include_snippets:
+                snippet = self._read_snippet(r[8], r[7], r[9], r[10])
+                if snippet:
+                    entry["snippet"] = snippet
+            paths.append(entry)
+
+        depth_summary: dict[int, int] = {}
+        repos_affected: set[str] = set()
+        for p in paths:
+            depth_summary[p["depth"]] = depth_summary.get(p["depth"], 0) + 1
+            if p["repo"]:
+                repos_affected.add(p["repo"])
+
+        return {
+            "root": {"name": start_nodes[0][1], "kind": start_nodes[0][2]},
+            "paths": paths,
+            "depth_summary": depth_summary,
+            "repos_affected": sorted(repos_affected),
+        }
+
+    def get_index_status(self) -> dict:
+        """Return a summary of the current index state.
+
+        Returns:
+            Dict with keys ``"repos"`` (list of repo summaries with
+            ``name``, ``path``, ``last_commit``, ``last_branch``,
+            ``indexed_at``, ``file_count``, ``node_count``),
+            ``"totals"`` (aggregate counts for ``files``, ``nodes``,
+            ``edges``, ``column_usage_records``,
+            ``column_lineage_chains``), ``"phantom_nodes"`` (int), and
+            ``"schema_version"`` (str).
+        """
+        repos = self._execute_read(
+            "SELECT r.name, r.path, r.last_commit, r.last_branch, r.indexed_at, "
+            "COUNT(DISTINCT f.file_id) as file_count, "
+            "COUNT(DISTINCT n.node_id) as node_count "
+            "FROM repos r "
+            "LEFT JOIN files f ON r.repo_id = f.repo_id "
+            "LEFT JOIN nodes n ON f.file_id = n.file_id "
+            "GROUP BY r.repo_id, r.name, r.path, r.last_commit, r.last_branch, r.indexed_at"
+        ).fetchall()
+
+        totals = self._execute_read(
+            "SELECT "
+            "(SELECT COUNT(*) FROM files), "
+            "(SELECT COUNT(*) FROM nodes), "
+            "(SELECT COUNT(*) FROM edges), "
+            "(SELECT COUNT(*) FROM column_usage), "
+            "(SELECT COUNT(*) FROM nodes WHERE file_id IS NULL), "
+            "(SELECT COUNT(DISTINCT output_node || '.' || output_column) FROM column_lineage)"
+        ).fetchone()
+
+        return {
+            "repos": [
+                {
+                    "name": r[0], "path": r[1], "last_commit": r[2],
+                    "last_branch": r[3], "indexed_at": str(r[4]) if r[4] else None,
+                    "file_count": r[5], "node_count": r[6],
+                }
+                for r in repos
+            ],
+            "totals": {
+                "files": totals[0], "nodes": totals[1],
+                "edges": totals[2], "column_usage_records": totals[3],
+                "column_lineage_chains": totals[5],
+            },
+            "phantom_nodes": totals[4],
+            "schema_version": "1.0",
+        }

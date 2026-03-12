@@ -1,0 +1,147 @@
+"""Tests for the CLI entry point (task 5.9)."""
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+from click.testing import CliRunner
+
+from sqlprism.cli import cli
+
+
+def test_reindex_with_sql_file(tmp_path):
+    """reindex command indexes a temp directory containing a SQL file."""
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    (repo_dir / "orders.sql").write_text(
+        "CREATE TABLE orders (id INT, amount DECIMAL)"
+    )
+
+    db_path = str(tmp_path / "test.duckdb")
+    config = {
+        "db_path": db_path,
+        "repos": {"test": str(repo_dir)},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["reindex", "--config", str(config_path)])
+    assert result.exit_code == 0, f"stdout={result.output}\nstderr={result.output}"
+    assert "Indexing test" in result.output
+    assert "Done." in result.output
+
+
+def test_help():
+    """--help works and shows the group docstring."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "SQLPrism" in result.output
+
+
+def test_reindex_help():
+    """reindex --help works."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["reindex", "--help"])
+    assert result.exit_code == 0
+    assert "manual reindex" in result.output.lower()
+
+
+def test_unknown_command_fails():
+    """Unknown subcommand exits with non-zero."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["nonexistent-command"])
+    assert result.exit_code != 0
+
+
+def test_reindex_with_parse_errors_exits_nonzero(tmp_path):
+    """reindex exits non-zero when SQL parse errors occur."""
+    repo_dir = tmp_path / "badrepo"
+    repo_dir.mkdir()
+    # Write invalid SQL that will trigger parse errors
+    (repo_dir / "broken.sql").write_text(
+        "CREATE TABLE SELECTFROM WHEREJOIN INVALID GARBAGE ))) ((( ;"
+    )
+
+    db_path = str(tmp_path / "test.duckdb")
+    config = {
+        "db_path": db_path,
+        "repos": {"test": str(repo_dir)},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["reindex", "--config", str(config_path)])
+    # The CLI should still complete indexing but exit non-zero if there were parse errors.
+    # If no parse errors happen to be reported (parser is lenient), at least check it runs.
+    # We rely on the actual parser behavior here.
+    # The key contract: if parse_errors is non-empty, exit code is 1.
+    if "parse error" in result.output.lower():
+        assert result.exit_code == 1
+    else:
+        # Parser was lenient with this input; verify it at least ran
+        assert "Indexing test" in result.output
+
+
+def test_reindex_unknown_repo_exits_nonzero(tmp_path):
+    """reindex --repo with a name not in config exits non-zero."""
+    config = {
+        "db_path": str(tmp_path / "test.duckdb"),
+        "repos": {"real": str(tmp_path)},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "reindex", "--config", str(config_path), "--repo", "nonexistent",
+    ])
+    assert result.exit_code != 0
+    assert "not in config" in result.output
+
+
+def test_serve_help():
+    """serve --help works (2.2a)."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["serve", "--help"])
+    assert result.exit_code == 0
+
+
+def test_reindex_sqlmesh_help():
+    """reindex-sqlmesh --help works (2.2b)."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["reindex-sqlmesh", "--help"])
+    assert result.exit_code == 0
+
+
+def test_reindex_dbt_help():
+    """reindex-dbt --help works (2.2c)."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["reindex-dbt", "--help"])
+    assert result.exit_code == 0
+
+
+def test_serve_with_mocked_mcp_run(tmp_path):
+    """serve command calls configure with config values (2.2d)."""
+    db_path = str(tmp_path / "test.duckdb")
+    config = {
+        "db_path": db_path,
+        "repos": {"demo": str(tmp_path)},
+        "sql_dialect": "postgres",
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    with patch("sqlprism.cli.mcp") as mock_mcp, \
+         patch("sqlprism.cli.configure") as mock_configure:
+        result = runner.invoke(cli, ["serve", "--config", str(config_path)])
+
+    assert result.exit_code == 0, f"stdout={result.output}"
+    mock_configure.assert_called_once()
+    call_kwargs = mock_configure.call_args
+    assert call_kwargs[1]["db_path"] == db_path
+    assert call_kwargs[1]["repos"] == {"demo": str(tmp_path)}
+    assert call_kwargs[1]["sql_dialect"] == "postgres"

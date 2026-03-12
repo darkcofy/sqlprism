@@ -1,0 +1,73 @@
+site_name: SQLPrism
+site_description: MCP server that indexes SQL codebases into a queryable knowledge graph
+# repo_url: https://github.com/your-org/sqlprism
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - search.suggest
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            members_order: source
+            docstring_style: google
+            merge_init_into_class: true
+            show_if_no_docstring: false
+            separate_signature: true
+            signature_crossrefs: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Configuration: getting-started/configuration.md
+  - User Guide:
+    - CLI Reference: guide/cli.md
+    - MCP Tools: guide/mcp-tools.md
+    - SQLMesh Integration: guide/sqlmesh.md
+    - dbt Integration: guide/dbt.md
+  - Architecture:
+    - Overview: architecture/overview.md
+    - DuckDB Schema: architecture/schema.md
+  - API Reference:
+    - Types: api/types.md
+    - GraphDB (Storage): api/graph.md
+    - Indexer (Orchestrator): api/indexer.md
+    - SQL Parser: api/sql-parser.md
+    - SQLMesh Renderer: api/sqlmesh.md
+    - dbt Renderer: api/dbt.md
+    - MCP Server: api/mcp-tools.md
