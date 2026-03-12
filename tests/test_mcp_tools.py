@@ -253,17 +253,16 @@ def test_trace_dependencies_downstream(tmp_path):
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    # Trace downstream from orders: order_summary references orders,
-    # so downstream should find order_summary (and possibly report via order_summary).
+    # summary.sql defines order_summary and references orders.
+    # Downstream from "summary" should find both.
     result = asyncio.run(
-        trace_dependencies(TraceDependenciesInput(name="order_summary", direction="upstream", max_depth=3))
+        trace_dependencies(TraceDependenciesInput(name="summary", direction="downstream", max_depth=3))
     )
     assert result["root"] is not None
-    assert result["root"]["name"] == "order_summary"
+    assert result["root"]["name"] == "summary"
     assert len(result["paths"]) >= 1
-    upstream_names = {p["name"] for p in result["paths"]}
-    # summary.sql's query node defines order_summary and references orders
-    assert "summary" in upstream_names or "orders" in upstream_names
+    downstream_names = {p["name"] for p in result["paths"]}
+    assert "orders" in downstream_names or "order_summary" in downstream_names
 
 
 def test_trace_dependencies_upstream(tmp_path):
