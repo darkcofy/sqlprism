@@ -979,3 +979,218 @@ def test_checksum_parse_result_stability():
     # Sanity: it's a hex string
     assert len(checksum1) == 64
     int(checksum1, 16)  # valid hex
+
+
+# ── Issue #11: reindex_files() and _resolve_file_repo() ──
+
+
+def test_reindex_files_plain_sql(tmp_path):
+    """reindex_files() parses a plain SQL file and inserts into the graph."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "report.sql"
+    sql_file.write_text("SELECT o.id, o.amount FROM orders o")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    # Register the repo first
+    db.upsert_repo("test", str(repo_dir), repo_type="sql")
+
+    stats = indexer.reindex_files(paths=[str(sql_file)])
+    assert stats["reindexed"] == 1
+    assert stats["skipped"] == 0
+    assert stats["errors"] == []
+
+    # Verify data is in the DB
+    results = db.query_search("orders")
+    assert results["total_count"] >= 1
+    db.close()
+
+
+def test_reindex_files_unknown_repo_skipped(tmp_path):
+    """reindex_files() silently skips files not under any configured repo."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    # File outside any repo
+    orphan = tmp_path / "orphan.sql"
+    orphan.write_text("SELECT 1")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    stats = indexer.reindex_files(paths=[str(orphan)])
+    assert stats["skipped"] == 1
+    assert stats["reindexed"] == 0
+
+    detail = stats["details"][0]
+    assert detail["reason"] == "no matching repo"
+    db.close()
+
+
+def test_reindex_files_deleted_file_cleans_graph(tmp_path):
+    """reindex_files() removes graph data when file has been deleted."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "report.sql"
+    sql_file.write_text("CREATE TABLE report (id INT)")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    # First, do a full reindex so data exists
+    indexer.reindex_repo("test", str(repo_dir))
+    status = db.get_index_status()
+    assert status["totals"]["files"] == 1
+
+    # Now delete the file and call reindex_files with the deleted path
+    sql_file.unlink()
+    stats = indexer.reindex_files(paths=[str(sql_file)])
+    assert stats["deleted"] == 1
+
+    # Verify data was cleaned
+    status = db.get_index_status()
+    assert status["totals"]["files"] == 0
+    db.close()
+
+
+def test_reindex_files_unchanged_checksum_skipped(tmp_path):
+    """reindex_files() skips files whose content hasn't changed."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "report.sql"
+    sql_file.write_text("SELECT 1 FROM orders")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    # First reindex via full reindex
+    indexer.reindex_repo("test", str(repo_dir))
+
+    # Now reindex_files — file unchanged
+    stats = indexer.reindex_files(paths=[str(sql_file)])
+    assert stats["skipped"] == 1
+    assert stats["reindexed"] == 0
+
+    detail = stats["details"][0]
+    assert detail["reason"] == "unchanged"
+    db.close()
+
+
+def test_reindex_files_groups_by_repo(tmp_path):
+    """reindex_files() groups files by repo and processes each correctly."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    (repo_a / "a.sql").write_text("CREATE TABLE alpha (id INT)")
+    (repo_b / "b.sql").write_text("CREATE TABLE beta (id INT)")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    db.upsert_repo("repo_a", str(repo_a), repo_type="sql")
+    db.upsert_repo("repo_b", str(repo_b), repo_type="sql")
+
+    stats = indexer.reindex_files(paths=[
+        str(repo_a / "a.sql"),
+        str(repo_b / "b.sql"),
+    ])
+    assert stats["reindexed"] == 2
+    assert stats["skipped"] == 0
+
+    # Both tables are searchable
+    assert db.query_search("alpha")["total_count"] >= 1
+    assert db.query_search("beta")["total_count"] >= 1
+    db.close()
+
+
+def test_resolve_file_repo_deepest_match(tmp_path):
+    """_resolve_file_repo picks the deepest matching repo for nested repos."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    parent = tmp_path / "project"
+    child = parent / "subdir"
+    child.mkdir(parents=True)
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    db.upsert_repo("parent", str(parent), repo_type="sql")
+    db.upsert_repo("child", str(child), repo_type="dbt")
+
+    file_path = child / "model.sql"
+    resolved = indexer._resolve_file_repo(file_path)
+    assert resolved is not None
+    repo_id, repo_name, repo_path, repo_type = resolved
+    assert repo_name == "child"
+    assert repo_type == "dbt"
+
+    # A file in parent but not in child resolves to parent
+    parent_file = parent / "query.sql"
+    resolved2 = indexer._resolve_file_repo(parent_file)
+    assert resolved2 is not None
+    assert resolved2[1] == "parent"
+    assert resolved2[3] == "sql"
+    db.close()
+
+
+def test_reindex_files_non_sql_skipped(tmp_path):
+    """reindex_files() skips non-SQL files."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    py_file = repo_dir / "script.py"
+    py_file.write_text("print('hello')")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    db.upsert_repo("test", str(repo_dir), repo_type="sql")
+
+    stats = indexer.reindex_files(paths=[str(py_file)])
+    assert stats["skipped"] == 1
+    assert stats["details"][0]["reason"] == "not a SQL file"
+    db.close()
+
+
+def test_reindex_files_changed_content(tmp_path):
+    """reindex_files() re-parses a file whose content changed since last index."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "report.sql"
+    sql_file.write_text("CREATE TABLE report (id INT)")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    # Initial full reindex
+    indexer.reindex_repo("test", str(repo_dir))
+    assert db.query_search("report")["total_count"] >= 1
+
+    # Modify the file
+    sql_file.write_text("CREATE TABLE report (id INT, name TEXT, amount DECIMAL)")
+
+    # reindex_files should detect the change and re-parse
+    stats = indexer.reindex_files(paths=[str(sql_file)])
+    assert stats["reindexed"] == 1
+    assert stats["skipped"] == 0
+    db.close()
