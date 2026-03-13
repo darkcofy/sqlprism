@@ -2,6 +2,7 @@
 
 import asyncio
 import subprocess
+from unittest.mock import patch
 
 import pytest
 
@@ -10,16 +11,20 @@ from sqlprism.core.mcp_tools import (
     FindColumnUsageInput,
     FindReferencesInput,
     PrImpactInput,
+    ReindexFilesInput,
     ReindexInput,
     SearchInput,
     TraceColumnLineageInput,
     TraceDependenciesInput,
+    _enqueue_reindex,
+    _flush_reindex,
     configure,
     find_column_usage,
     find_references,
     index_status,
     pr_impact,
     reindex,
+    reindex_files,
     search,
     trace_column_lineage,
     trace_dependencies,
@@ -885,3 +890,273 @@ def test_trace_dependencies_direction_rejects_invalid():
     """TraceDependenciesInput rejects invalid direction values (1.6c)."""
     with pytest.raises(Exception):
         TraceDependenciesInput(name="x", direction="inbound")
+
+
+# ── reindex_files tool and debounce tests ──
+
+
+def _reset_debounce_state():
+    """Reset module-level debounce globals between tests."""
+    _mcp_mod._reindex_pending.clear()
+    for handle in _mcp_mod._reindex_timers.values():
+        handle.cancel()
+    _mcp_mod._reindex_timers.clear()
+
+
+def test_mcp_reindex_files_single(tmp_path):
+    """reindex_files reindexes a modified SQL file via debounce."""
+    _reset_debounce_state()
+    repo_dir = tmp_path / "rf_repo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "orders.sql"
+    sql_file.write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    from sqlprism.core.mcp_tools import _get_indexer
+
+    indexer = _get_indexer()
+    indexer.reindex_repo("test", str(repo_dir))
+
+    # Modify the file
+    sql_file.write_text("CREATE TABLE orders (id INT, amount DECIMAL, status TEXT)")
+
+    async def _run():
+        result = await reindex_files(ReindexFilesInput(paths=[str(sql_file)]))
+        assert result["accepted"] == 1
+        # Wait for debounce to fire (0.5s for sql + margin)
+        await asyncio.sleep(1.0)
+
+    asyncio.run(_run())
+
+    # Verify the file was reindexed by querying the graph
+    graph = _mcp_mod._state.graph
+    search_result = graph.query_search(pattern="orders")
+    assert search_result["total_count"] >= 1
+    _reset_debounce_state()
+
+
+def test_mcp_reindex_files_filters_non_sql(tmp_path):
+    """reindex_files skips non-SQL files and only accepts SQL ones."""
+    _reset_debounce_state()
+    repo_dir = tmp_path / "filter_repo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "model.sql"
+    sql_file.write_text("CREATE TABLE model (id INT)")
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    from sqlprism.core.mcp_tools import _get_indexer
+
+    indexer = _get_indexer()
+    indexer.reindex_repo("test", str(repo_dir))
+
+    async def _run():
+        result = await reindex_files(
+            ReindexFilesInput(
+                paths=[str(sql_file), str(repo_dir / "readme.md"), str(repo_dir / "config.yml")]
+            )
+        )
+        assert result["accepted"] == 1
+        assert result["skipped"] >= 2
+        return result
+
+    result = asyncio.run(_run())
+    assert result["accepted"] == 1
+    assert result["skipped"] >= 2
+    _reset_debounce_state()
+
+
+def test_debounce_batches_plain_sql(tmp_path):
+    """Enqueuing multiple SQL files batches them and flushes after debounce."""
+    _reset_debounce_state()
+    repo_dir = tmp_path / "batch_repo"
+    repo_dir.mkdir()
+    for name in ("a.sql", "b.sql", "c.sql"):
+        (repo_dir / name).write_text(f"CREATE TABLE {name[0]} (id INT)")
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    async def _run():
+        await _enqueue_reindex("test", "sql", [str(repo_dir / "a.sql")])
+        await _enqueue_reindex("test", "sql", [str(repo_dir / "b.sql")])
+        await _enqueue_reindex("test", "sql", [str(repo_dir / "c.sql")])
+
+        # All 3 should be pending
+        assert len(_mcp_mod._reindex_pending["test"]) == 3
+
+        # Wait for debounce to fire (0.5s + margin)
+        await asyncio.sleep(1.0)
+
+        # Pending should be empty after flush
+        assert len(_mcp_mod._reindex_pending.get("test", [])) == 0
+
+    asyncio.run(_run())
+    _reset_debounce_state()
+
+
+def test_debounce_batches_dbt_sqlmesh(tmp_path):
+    """dbt debounce uses 2s delay; verify timer behavior with mocked flush."""
+    _reset_debounce_state()
+    repo_dir = tmp_path / "dbt_batch_repo"
+    repo_dir.mkdir()
+
+    configure(db_path=":memory:", repos={"dbt_test": {"path": str(repo_dir), "repo_type": "dbt"}})
+
+    flush_calls = []
+
+    async def mock_flush(repo_name):
+        flush_calls.append(repo_name)
+        # Still drain the pending list like real flush does
+        _mcp_mod._reindex_pending.pop(repo_name, None)
+        _mcp_mod._reindex_timers.pop(repo_name, None)
+
+    async def _run():
+        with patch.object(_mcp_mod, "_flush_reindex", side_effect=mock_flush):
+            await _enqueue_reindex("dbt_test", "dbt", ["/some/model.sql"])
+
+            # Pending should have the path
+            assert len(_mcp_mod._reindex_pending["dbt_test"]) == 1
+
+            # Sleep 1s — less than 2s dbt debounce, timer not fired yet
+            await asyncio.sleep(1.0)
+            assert len(flush_calls) == 0
+            assert len(_mcp_mod._reindex_pending["dbt_test"]) == 1
+
+            # Sleep another 1.5s — now past the 2s debounce
+            await asyncio.sleep(1.5)
+            assert len(flush_calls) == 1
+
+    asyncio.run(_run())
+    _reset_debounce_state()
+
+
+def test_debounce_timer_resets(tmp_path):
+    """Enqueuing a second file resets the debounce timer."""
+    _reset_debounce_state()
+    repo_dir = tmp_path / "reset_repo"
+    repo_dir.mkdir()
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    flush_calls = []
+
+    async def mock_flush(repo_name):
+        flush_calls.append(list(_mcp_mod._reindex_pending.get(repo_name, [])))
+        _mcp_mod._reindex_pending.pop(repo_name, None)
+        _mcp_mod._reindex_timers.pop(repo_name, None)
+
+    async def _run():
+        with patch.object(_mcp_mod, "_flush_reindex", side_effect=mock_flush):
+            await _enqueue_reindex("test", "sql", ["/a.sql"])
+            await asyncio.sleep(0.3)
+
+            # Enqueue second file — resets the 0.5s timer
+            await _enqueue_reindex("test", "sql", ["/b.sql"])
+            await asyncio.sleep(0.3)
+
+            # Timer hasn't fired yet (only 0.3s since reset)
+            assert len(flush_calls) == 0
+
+            # Wait another 0.3s — now 0.6s since last enqueue, timer should fire
+            await asyncio.sleep(0.3)
+            assert len(flush_calls) == 1
+            # Both files should be in the batch
+            assert "/a.sql" in flush_calls[0]
+            assert "/b.sql" in flush_calls[0]
+
+    asyncio.run(_run())
+    _reset_debounce_state()
+
+
+def test_debounce_deduplicates_paths(tmp_path):
+    """Duplicate paths are deduplicated when flush fires."""
+    _reset_debounce_state()
+    repo_dir = tmp_path / "dedup_repo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "model.sql"
+    sql_file.write_text("CREATE TABLE model (id INT)")
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    captured_paths = []
+    original_reindex_files = _mcp_mod._state.indexer.reindex_files
+
+    def capture_reindex_files(paths, **kwargs):
+        captured_paths.extend(paths)
+        return original_reindex_files(paths=paths, **kwargs)
+
+    async def _run():
+        with patch.object(_mcp_mod._state.indexer, "reindex_files", side_effect=capture_reindex_files):
+            # Enqueue same path twice
+            await _enqueue_reindex("test", "sql", [str(sql_file)])
+            await _enqueue_reindex("test", "sql", [str(sql_file)])
+
+            # Pending has 2 entries (pre-dedup)
+            assert len(_mcp_mod._reindex_pending["test"]) == 2
+
+            # Wait for flush
+            await asyncio.sleep(1.0)
+
+            # Flush should have deduplicated
+            assert captured_paths.count(str(sql_file)) == 1
+
+    asyncio.run(_run())
+    _reset_debounce_state()
+
+
+def test_mcp_reindex_files_not_configured():
+    """reindex_files returns error when server is not configured."""
+    # _reset_mcp_state fixture already sets _state = None
+
+    async def _run():
+        result = await reindex_files(ReindexFilesInput(paths=["some.sql"]))
+        assert "error" in result
+        assert "not configured" in result["error"].lower()
+
+    asyncio.run(_run())
+
+
+def test_reindex_files_waits_for_lock(tmp_path):
+    """_flush_reindex blocks on _reindex_lock and completes after release."""
+    _reset_debounce_state()
+    repo_dir = tmp_path / "lock_repo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "orders.sql"
+    sql_file.write_text("CREATE TABLE orders (id INT)")
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    from sqlprism.core.mcp_tools import _get_indexer
+
+    indexer = _get_indexer()
+    indexer.reindex_repo("test", str(repo_dir))
+
+    # Enqueue a file so flush has something to do
+    _mcp_mod._reindex_pending["test"] = [str(sql_file)]
+
+    flush_done = False
+
+    async def _run():
+        nonlocal flush_done
+
+        # Acquire the lock first
+        await _mcp_mod._reindex_lock.acquire()
+
+        # Start flush in background — should block on the lock
+        flush_task = asyncio.create_task(_flush_reindex("test"))
+
+        # Give it a moment to attempt acquiring the lock
+        await asyncio.sleep(0.1)
+        assert not flush_task.done(), "flush should be blocked on the lock"
+
+        # Release the lock
+        _mcp_mod._reindex_lock.release()
+
+        # Now flush should complete
+        await asyncio.wait_for(flush_task, timeout=5.0)
+        flush_done = True
+
+    asyncio.run(_run())
+    assert flush_done
+    _reset_debounce_state()
