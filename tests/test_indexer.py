@@ -1394,6 +1394,7 @@ def test_resolve_file_repo_various_layouts(tmp_path):
 def test_reindex_checksum_skip_unchanged(tmp_path):
     """reindex_files() skips unchanged files — parser.parse is NOT called."""
     from unittest.mock import patch
+
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
