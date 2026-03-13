@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS repos (
     repo_id     INTEGER PRIMARY KEY DEFAULT nextval('seq_repo_id'),
     name        TEXT NOT NULL UNIQUE,
     path        TEXT NOT NULL,
+    repo_type   TEXT NOT NULL DEFAULT 'sql',
     last_commit TEXT,
     last_branch TEXT,
     indexed_at  TIMESTAMP
@@ -282,30 +283,33 @@ class GraphDB:
 
     # ── Repo management ──
 
-    def upsert_repo(self, name: str, path: str) -> int:
+    def upsert_repo(self, name: str, path: str, repo_type: str = "sql") -> int:
         """Create or update a repo entry.
 
-        Updates the stored path if the repo has been moved.
+        Updates the stored path and repo_type if changed.
 
         Args:
             name: Unique repo name used as the identifier across the index.
             path: Absolute filesystem path to the repo root.
+            repo_type: One of ``'sql'``, ``'dbt'``, ``'sqlmesh'``.
 
         Returns:
             The ``repo_id`` (existing or newly created).
         """
         with self._write_lock:
-            existing = self._execute_write("SELECT repo_id, path FROM repos WHERE name = ?", [name]).fetchone()
+            existing = self._execute_write(
+                "SELECT repo_id, path, repo_type FROM repos WHERE name = ?", [name],
+            ).fetchone()
             if existing:
-                if existing[1] != str(path):
+                if existing[1] != str(path) or existing[2] != repo_type:
                     self._execute_write(
-                        "UPDATE repos SET path = ? WHERE repo_id = ?",
-                        [str(path), existing[0]],
+                        "UPDATE repos SET path = ?, repo_type = ? WHERE repo_id = ?",
+                        [str(path), repo_type, existing[0]],
                     )
                 return existing[0]
             result = self._execute_write(
-                "INSERT INTO repos (name, path) VALUES (?, ?) RETURNING repo_id",
-                [name, str(path)],
+                "INSERT INTO repos (name, path, repo_type) VALUES (?, ?, ?) RETURNING repo_id",
+                [name, str(path), repo_type],
             ).fetchone()
             return result[0]
 
