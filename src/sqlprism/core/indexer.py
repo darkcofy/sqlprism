@@ -350,6 +350,9 @@ class Indexer:
             "details": [],
         }
 
+        # Fetch repo list once for all path resolutions (avoid N queries)
+        all_repos = self.graph.get_all_repos()
+
         # Group files by repo
         files_by_repo: dict[int, list[Path]] = {}
         repo_info: dict[int, tuple[str, str, str]] = {}  # repo_id → (name, path, type)
@@ -363,7 +366,7 @@ class Indexer:
                 stats["details"].append({"path": str(file_path), "status": "skipped", "reason": "not a SQL file"})
                 continue
 
-            resolved = self._resolve_file_repo(file_path)
+            resolved = self._resolve_file_repo(file_path, all_repos)
             if resolved is None:
                 stats["skipped"] += 1
                 stats["details"].append({"path": str(file_path), "status": "skipped", "reason": "no matching repo"})
@@ -376,13 +379,14 @@ class Indexer:
         # Process each repo group
         for repo_id, files in files_by_repo.items():
             repo_name, repo_path, repo_type = repo_info[repo_id]
+            cfg = repo_configs.get(repo_name, {})
 
             if repo_type == "sql":
-                self._reindex_sql_files(repo_id, Path(repo_path), files, stats, repo_configs.get(repo_name))
+                self._reindex_sql_files(repo_id, Path(repo_path), files, stats, cfg)
             elif repo_type == "dbt":
-                self._reindex_dbt_files(repo_id, Path(repo_path), files, stats, repo_configs.get(repo_name, {}))
+                self._reindex_dbt_files(repo_id, Path(repo_path), files, stats, cfg)
             elif repo_type == "sqlmesh":
-                self._reindex_sqlmesh_files(repo_id, Path(repo_path), files, stats, repo_configs.get(repo_name, {}))
+                self._reindex_sqlmesh_files(repo_id, Path(repo_path), files, stats, cfg)
             else:
                 for f in files:
                     stats["skipped"] += 1
@@ -392,20 +396,25 @@ class Indexer:
 
         return stats
 
-    def _resolve_file_repo(self, file_path: Path) -> tuple[int, str, str, str] | None:
+    @staticmethod
+    def _resolve_file_repo(
+        file_path: Path,
+        repos: list[tuple[int, str, str, str]],
+    ) -> tuple[int, str, str, str] | None:
         """Find which configured repo a file belongs to.
 
-        Walks through all registered repos and checks if the file is under
+        Iterates the pre-fetched repo list and checks if the file is under
         the repo path. If multiple match (nested repos), picks the deepest
         (longest path prefix).
 
         Args:
             file_path: Absolute, resolved file path.
+            repos: List of ``(repo_id, name, path, repo_type)`` tuples
+                from ``GraphDB.get_all_repos()``.
 
         Returns:
             ``(repo_id, repo_name, repo_path, repo_type)`` or ``None``.
         """
-        repos = self.graph.get_all_repos()
         best: tuple[int, str, str, str] | None = None
         best_depth = -1
 
@@ -418,7 +427,7 @@ class Indexer:
             else:
                 repo_path_prefix = repo_path
 
-            if file_str.startswith(repo_path_prefix) or file_str == repo_path:
+            if file_str.startswith(repo_path_prefix):
                 depth = repo_path_prefix.count("/")
                 if depth > best_depth:
                     best = (repo_id, name, repo_path, repo_type)
@@ -435,15 +444,15 @@ class Indexer:
         repo_config: dict | str | None = None,
     ) -> None:
         """Reindex plain SQL files: read, parse, insert."""
-        # Extract dialect config
         from sqlprism.types import parse_repo_config
 
         dialect = None
         dialect_overrides = None
-        if repo_config is not None:
+        if repo_config:
             _, dialect, dialect_overrides = parse_repo_config(repo_config)
 
         schema_catalog = self.graph.get_table_columns(repo_id) or None
+        did_reindex = False
 
         for file_path in files:
             rel_path = str(file_path.relative_to(repo_path))
@@ -492,9 +501,28 @@ class Indexer:
 
             stats["reindexed"] += 1
             stats["details"].append({"path": str(file_path), "status": "reindexed"})
+            did_reindex = True
 
-        self.graph.cleanup_phantoms()
-        self.graph.clear_snippet_cache()
+        if did_reindex:
+            self.graph.cleanup_phantoms()
+            self.graph.clear_snippet_cache()
+
+    def _delete_stored_files_by_stem(self, repo_id: int, stem: str, stats: dict, display_path: str) -> None:
+        """Delete stored file data for dbt/sqlmesh models by stem.
+
+        Stored file paths for dbt (e.g. ``staging/orders.sql``) and sqlmesh
+        (e.g. ``catalog/schema/orders.sql``) differ from filesystem relative
+        paths. This method looks up the stored path by stem and deletes it.
+        """
+        stored_paths = self.graph.find_file_paths_by_stem(repo_id, stem)
+        if stored_paths:
+            with self.graph.write_transaction():
+                for sp in stored_paths:
+                    self.graph.delete_file_data(repo_id, sp)
+            stats["deleted"] += len(stored_paths)
+        else:
+            stats["deleted"] += 1
+        stats["details"].append({"path": display_path, "status": "deleted"})
 
     def _reindex_dbt_files(
         self,
@@ -505,15 +533,11 @@ class Indexer:
         repo_config: dict,
     ) -> None:
         """Reindex dbt model files via render_models()."""
-        # Handle deleted files first
+        # Handle deleted files first — look up stored paths by stem
         remaining = []
         for file_path in files:
             if not file_path.exists():
-                rel_path = str(file_path.relative_to(repo_path))
-                with self.graph.write_transaction():
-                    self.graph.delete_file_data(repo_id, rel_path)
-                stats["deleted"] += 1
-                stats["details"].append({"path": str(file_path), "status": "deleted"})
+                self._delete_stored_files_by_stem(repo_id, file_path.stem, stats, str(file_path))
             else:
                 remaining.append(file_path)
 
@@ -568,35 +592,24 @@ class Indexer:
         repo_config: dict,
     ) -> None:
         """Reindex sqlmesh model files via render_models()."""
-        # Handle deleted files first
+        # Handle deleted files first — look up stored paths by stem
         remaining = []
         for file_path in files:
             if not file_path.exists():
-                rel_path = str(file_path.relative_to(repo_path))
-                with self.graph.write_transaction():
-                    self.graph.delete_file_data(repo_id, rel_path)
-                stats["deleted"] += 1
-                stats["details"].append({"path": str(file_path), "status": "deleted"})
+                self._delete_stored_files_by_stem(repo_id, file_path.stem, stats, str(file_path))
             else:
                 remaining.append(file_path)
 
         if not remaining:
             return
 
-        # Resolve model names: try nodes table lookup, fallback to file stem
-        model_names = self._resolve_sqlmesh_model_names(repo_id, repo_path, remaining)
+        # Resolve model names: look up stored node names by file stem,
+        # since stored file paths differ from filesystem paths
+        model_names = self._resolve_model_names_by_stem(repo_id, remaining)
 
         dialect = repo_config.get("dialect", "athena")
         schema_catalog = self.graph.get_table_columns(repo_id) or None
-
-        # Parse variables with int conversion
-        variables: dict[str, str | int] = {}
-        if repo_config.get("variables"):
-            for k, v in repo_config["variables"].items():
-                try:
-                    variables[k] = int(v)
-                except (ValueError, TypeError):
-                    variables[k] = v
+        variables = _coerce_variables(repo_config.get("variables"))
 
         try:
             rendered = self.get_sqlmesh_renderer(dialect).render_models(
@@ -635,26 +648,30 @@ class Indexer:
 
         self.graph.clear_snippet_cache()
 
-    def _resolve_sqlmesh_model_names(
+    def _resolve_model_names_by_stem(
         self,
         repo_id: int,
-        repo_path: Path,
         files: list[Path],
     ) -> list[str]:
-        """Resolve sqlmesh file paths to model names.
+        """Resolve file paths to model names via stored node names.
 
-        Tries to look up the model name from the nodes table (existing
-        indexed models). Falls back to file stem for new/unindexed files.
+        For dbt/sqlmesh repos, the stored file paths differ from filesystem
+        paths. This looks up the stored node name by matching file stems
+        against the files table, then extracting the node name. Falls back
+        to file stem for new/unindexed files.
         """
         model_names = []
         for file_path in files:
-            rel_path = str(file_path.relative_to(repo_path))
-            # Try nodes table: look for a node whose file matches this path
-            node_name = self.graph.find_node_name_by_file(repo_id, rel_path)
-            if node_name:
-                model_names.append(node_name)
-            else:
-                model_names.append(file_path.stem)
+            stem = file_path.stem
+            # Find stored file paths that match this stem
+            stored_paths = self.graph.find_file_paths_by_stem(repo_id, stem)
+            if stored_paths:
+                # Look up the node name from the first matching stored path
+                node_name = self.graph.find_node_name_by_file(repo_id, stored_paths[0])
+                if node_name:
+                    model_names.append(node_name)
+                    continue
+            model_names.append(stem)
         return model_names
 
     def _insert_parse_result(
@@ -992,6 +1009,26 @@ def _resolve_dialect(
             if file_path.startswith(pattern) or fnmatch.fnmatch(file_path, pattern):
                 return dialect
     return default_dialect
+
+
+def _coerce_variables(raw: dict | None) -> dict[str, str | int]:
+    """Coerce variable values to int where possible.
+
+    JSON config preserves int types, but values may arrive as strings
+    from CLI args or env vars.
+    """
+    if not raw:
+        return {}
+    result: dict[str, str | int] = {}
+    for k, v in raw.items():
+        if isinstance(v, int):
+            result[k] = v
+        else:
+            try:
+                result[k] = int(v)
+            except (ValueError, TypeError):
+                result[k] = v
+    return result
 
 
 def _checksum_parse_result(result: ParseResult) -> str:
