@@ -241,11 +241,12 @@ def test_sqlmesh_render_project_command_construction(tmp_path):
         # The script text should be the 5th element
         assert "sqlmesh" in cmd[4], "Inline script should reference sqlmesh"
         assert "Context" in cmd[4], "Inline script should use sqlmesh Context"
-        # Positional args: project_path, dialect, gateway, variables json
+        # Positional args: project_path, dialect, gateway, variables json, model_filter
         assert cmd[5] == str(tmp_path.resolve())
         assert cmd[6] == "athena"
         assert cmd[7] == "local"
         assert json.loads(cmd[8]) == {"GRACE_PERIOD": 7}
+        assert json.loads(cmd[9]) == [], "render_project passes empty model filter"
 
         assert mock_run.call_args[1]["timeout"] == 600
 
@@ -511,9 +512,8 @@ def test_sqlmesh_render_models_single(tmp_path):
     assert len(results) == 1
     assert '"db"."schema"."model_a"' in results
 
-    # Verify V2 script used with model_filter arg
+    # Verify model filter was passed as last subprocess arg
     cmd = mock_run.call_args[0][0]
-    assert "model_filter" in cmd[4], "Should use V2 script with model_filter"
     assert json.loads(cmd[-1]) == ["model_a"]
 
 
@@ -569,7 +569,7 @@ def test_sqlmesh_render_models_partial_failure(tmp_path):
 
 
 def test_sqlmesh_render_project_unchanged(tmp_path):
-    """render_project still uses V1 script without model_filter (no regression)."""
+    """render_project passes empty model filter (no regression)."""
     (tmp_path / ".venv").mkdir()
 
     renderer = SqlMeshRenderer()
@@ -580,8 +580,6 @@ def test_sqlmesh_render_project_unchanged(tmp_path):
         mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
         renderer.render_project(project_path=tmp_path)
 
+    # render_project passes empty model_filter (render all)
     cmd = mock_run.call_args[0][0]
-    # V1 script doesn't reference model_filter
-    assert "model_filter" not in cmd[4], "render_project should use V1 script"
-    # Should have exactly 9 args: uv run python -c <script> <path> <dialect> <gateway> <vars>
-    assert len(cmd) == 9
+    assert json.loads(cmd[-1]) == [], "render_project should pass empty filter"

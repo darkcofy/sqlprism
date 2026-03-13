@@ -73,69 +73,16 @@ class DbtRenderer:
         Returns:
             Dict mapping model relative path -> ParseResult
         """
-        project_path = Path(project_path).resolve()
-        profiles_dir = Path(profiles_dir).resolve() if profiles_dir else project_path
-
-        # Determine where to run uv from (where .venv lives)
-        if venv_dir:
-            cwd = Path(venv_dir).resolve()
-        else:
-            cwd = find_venv_dir(project_path)
-
-        # Use dialect-specific parser if needed (e.g. starrocks uses backticks)
-        parser = self.sql_parser
-        if dialect and dialect != getattr(parser, "dialect", None):
-            parser = SqlParser(dialect=dialect)
-
-        env = build_env(env_file)
-
-        # Run dbt compile
-        self._run_dbt_compile(
+        return self._compile_and_parse(
             project_path=project_path,
             profiles_dir=profiles_dir,
-            cwd=cwd,
-            env=env,
+            env_file=env_file,
             target=target,
             dbt_command=dbt_command,
+            venv_dir=venv_dir,
+            dialect=dialect,
+            schema_catalog=schema_catalog,
         )
-
-        # Read dbt_project.yml to get the project name (for compiled path)
-        project_name = self._get_project_name(project_path)
-
-        # Read compiled SQL files from target/compiled/<project_name>/models/
-        compiled_dir = project_path / "target" / "compiled" / project_name / "models"
-        if not compiled_dir.exists():
-            return {}
-
-        results: dict[str, ParseResult] = {}
-        for sql_file in compiled_dir.rglob("*.sql"):
-            rel_path = str(sql_file.relative_to(compiled_dir))
-            content = sql_file.read_text(errors="replace")
-            if not content.strip():
-                continue
-
-            # dbt compiled SQL is bare SELECT — wrap as CREATE TABLE
-            # so the SQL parser extracts nodes, edges, and column usage.
-            # Derive model name from file stem, schema from parent directory.
-            path_parts = rel_path.removesuffix(".sql").split("/")
-            model_name = path_parts[-1]  # e.g. "orders"
-            # e.g. "staging"
-            model_schema = "/".join(path_parts[:-1]) if len(path_parts) > 1 else None
-
-            # Quote names to handle dashes and special chars
-            safe_name = model_name.replace('"', '""')
-            if model_schema:
-                safe_schema = model_schema.replace('"', '""')
-                wrapped_sql = f'CREATE TABLE "{safe_schema}"."{safe_name}" AS\n{content}'
-            else:
-                wrapped_sql = f'CREATE TABLE "{safe_name}" AS\n{content}'
-
-            result = parser.parse(rel_path, wrapped_sql, schema=schema_catalog)
-            enrich_nodes(result, "dbt_model", rel_path)
-
-            results[rel_path] = result
-
-        return results
 
     def render_models(
         self,
@@ -165,20 +112,48 @@ class DbtRenderer:
         Returns:
             Dict mapping model relative path -> ParseResult
         """
+        return self._compile_and_parse(
+            project_path=project_path,
+            profiles_dir=profiles_dir,
+            env_file=env_file,
+            target=target,
+            dbt_command=dbt_command,
+            venv_dir=venv_dir,
+            dialect=dialect,
+            schema_catalog=schema_catalog,
+            select=model_names,
+        )
+
+    def _compile_and_parse(
+        self,
+        project_path: str | Path,
+        profiles_dir: str | Path | None,
+        env_file: str | Path | None,
+        target: str | None,
+        dbt_command: str,
+        venv_dir: str | Path | None,
+        dialect: str | None,
+        schema_catalog: dict | None,
+        select: list[str] | None = None,
+    ) -> dict[str, ParseResult]:
+        """Shared implementation for render_project and render_models."""
         project_path = Path(project_path).resolve()
         profiles_dir = Path(profiles_dir).resolve() if profiles_dir else project_path
 
+        # Determine where to run uv from (where .venv lives)
         if venv_dir:
             cwd = Path(venv_dir).resolve()
         else:
             cwd = find_venv_dir(project_path)
 
+        # Use dialect-specific parser if needed (e.g. starrocks uses backticks)
         parser = self.sql_parser
         if dialect and dialect != getattr(parser, "dialect", None):
             parser = SqlParser(dialect=dialect)
 
         env = build_env(env_file)
 
+        # Run dbt compile
         self._run_dbt_compile(
             project_path=project_path,
             profiles_dir=profiles_dir,
@@ -186,19 +161,22 @@ class DbtRenderer:
             env=env,
             target=target,
             dbt_command=dbt_command,
-            select=model_names,
+            select=select,
         )
 
+        # Read dbt_project.yml to get the project name (for compiled path)
         project_name = self._get_project_name(project_path)
+
+        # Read compiled SQL files from target/compiled/<project_name>/models/
         compiled_dir = project_path / "target" / "compiled" / project_name / "models"
         if not compiled_dir.exists():
             return {}
 
-        # Only read compiled files for selected models
-        selected = set(model_names)
+        # Only read files for selected models when filtering
+        selected = set(select) if select else None
         results: dict[str, ParseResult] = {}
         for sql_file in compiled_dir.rglob("*.sql"):
-            if sql_file.stem not in selected:
+            if selected and sql_file.stem not in selected:
                 continue
 
             rel_path = str(sql_file.relative_to(compiled_dir))
@@ -206,10 +184,15 @@ class DbtRenderer:
             if not content.strip():
                 continue
 
+            # dbt compiled SQL is bare SELECT — wrap as CREATE TABLE
+            # so the SQL parser extracts nodes, edges, and column usage.
+            # Derive model name from file stem, schema from parent directory.
             path_parts = rel_path.removesuffix(".sql").split("/")
-            model_name = path_parts[-1]
+            model_name = path_parts[-1]  # e.g. "orders"
+            # e.g. "staging"
             model_schema = "/".join(path_parts[:-1]) if len(path_parts) > 1 else None
 
+            # Quote names to handle dashes and special chars
             safe_name = model_name.replace('"', '""')
             if model_schema:
                 safe_schema = model_schema.replace('"', '""')
@@ -219,6 +202,7 @@ class DbtRenderer:
 
             result = parser.parse(rel_path, wrapped_sql, schema=schema_catalog)
             enrich_nodes(result, "dbt_model", rel_path)
+
             results[rel_path] = result
 
         return results
