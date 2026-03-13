@@ -320,6 +320,360 @@ class Indexer:
         self.graph.clear_snippet_cache()
         return stats
 
+    def reindex_files(self, paths: list[str | Path], repo_configs: dict | None = None) -> dict:
+        """Reindex specific files. Fast path for on-save.
+
+        Resolves each path to its repo, determines repo type (plain SQL,
+        dbt, sqlmesh), and reindexes accordingly.
+
+        For plain SQL: read, parse, insert immediately.
+        For dbt/sqlmesh: call ``render_models()`` for the affected models,
+        then parse and insert the rendered SQL.
+
+        Args:
+            paths: Absolute file paths that changed. Non-SQL files and
+                files outside configured repos are silently skipped.
+            repo_configs: Optional repo config dict (repo_name → config).
+                Required for dbt/sqlmesh repos to pass renderer params.
+                If not provided, only plain SQL repos are supported.
+
+        Returns:
+            Stats dict with ``reindexed``, ``skipped``, ``deleted``,
+            ``errors``, and per-file ``details``.
+        """
+        repo_configs = repo_configs or {}
+        stats = {
+            "reindexed": 0,
+            "skipped": 0,
+            "deleted": 0,
+            "errors": [],
+            "details": [],
+        }
+
+        # Fetch repo list once for all path resolutions (avoid N queries)
+        all_repos = self.graph.get_all_repos()
+
+        # Group files by repo
+        files_by_repo: dict[int, list[Path]] = {}
+        repo_info: dict[int, tuple[str, str, str]] = {}  # repo_id → (name, path, type)
+
+        for raw_path in paths:
+            file_path = Path(raw_path).resolve()
+
+            # Skip non-SQL files
+            if not is_sql_file(str(file_path)):
+                stats["skipped"] += 1
+                stats["details"].append({"path": str(file_path), "status": "skipped", "reason": "not a SQL file"})
+                continue
+
+            resolved = self._resolve_file_repo(file_path, all_repos)
+            if resolved is None:
+                stats["skipped"] += 1
+                stats["details"].append({"path": str(file_path), "status": "skipped", "reason": "no matching repo"})
+                continue
+
+            repo_id, repo_name, repo_path, repo_type = resolved
+            files_by_repo.setdefault(repo_id, []).append(file_path)
+            repo_info[repo_id] = (repo_name, repo_path, repo_type)
+
+        # Process each repo group
+        for repo_id, files in files_by_repo.items():
+            repo_name, repo_path, repo_type = repo_info[repo_id]
+            cfg = repo_configs.get(repo_name, {})
+
+            if repo_type == "sql":
+                self._reindex_sql_files(repo_id, Path(repo_path), files, stats, cfg)
+            elif repo_type == "dbt":
+                self._reindex_dbt_files(repo_id, Path(repo_path), files, stats, cfg)
+            elif repo_type == "sqlmesh":
+                self._reindex_sqlmesh_files(repo_id, Path(repo_path), files, stats, cfg)
+            else:
+                for f in files:
+                    stats["skipped"] += 1
+                    stats["details"].append({
+                        "path": str(f), "status": "skipped", "reason": f"unknown repo_type '{repo_type}'",
+                    })
+
+        return stats
+
+    @staticmethod
+    def _resolve_file_repo(
+        file_path: Path,
+        repos: list[tuple[int, str, str, str]],
+    ) -> tuple[int, str, str, str] | None:
+        """Find which configured repo a file belongs to.
+
+        Iterates the pre-fetched repo list and checks if the file is under
+        the repo path. If multiple match (nested repos), picks the deepest
+        (longest path prefix).
+
+        Args:
+            file_path: Absolute, resolved file path.
+            repos: List of ``(repo_id, name, path, repo_type)`` tuples
+                from ``GraphDB.get_all_repos()``.
+
+        Returns:
+            ``(repo_id, repo_name, repo_path, repo_type)`` or ``None``.
+        """
+        best: tuple[int, str, str, str] | None = None
+        best_depth = -1
+
+        file_str = str(file_path)
+        for repo_id, name, path, repo_type in repos:
+            # Normalise repo path for comparison
+            repo_path = str(Path(path).resolve())
+            if not repo_path.endswith("/"):
+                repo_path_prefix = repo_path + "/"
+            else:
+                repo_path_prefix = repo_path
+
+            if file_str.startswith(repo_path_prefix):
+                depth = repo_path_prefix.count("/")
+                if depth > best_depth:
+                    best = (repo_id, name, repo_path, repo_type)
+                    best_depth = depth
+
+        return best
+
+    def _reindex_sql_files(
+        self,
+        repo_id: int,
+        repo_path: Path,
+        files: list[Path],
+        stats: dict,
+        repo_config: dict | str | None = None,
+    ) -> None:
+        """Reindex plain SQL files: read, parse, insert."""
+        from sqlprism.types import parse_repo_config
+
+        dialect = None
+        dialect_overrides = None
+        if repo_config:
+            _, dialect, dialect_overrides = parse_repo_config(repo_config)
+
+        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        did_reindex = False
+
+        for file_path in files:
+            rel_path = str(file_path.relative_to(repo_path))
+
+            # Handle deleted files
+            if not file_path.exists():
+                with self.graph.write_transaction():
+                    self.graph.delete_file_data(repo_id, rel_path)
+                stats["deleted"] += 1
+                stats["details"].append({"path": str(file_path), "status": "deleted"})
+                continue
+
+            # Read and checksum
+            try:
+                content = file_path.read_text(errors="replace")
+            except (OSError, PermissionError):
+                stats["errors"].append(f"{rel_path}: unreadable")
+                stats["details"].append({"path": str(file_path), "status": "error", "reason": "unreadable"})
+                continue
+
+            checksum = hashlib.sha256(content.encode()).hexdigest()
+
+            # Skip if unchanged
+            stored_checksum = self.graph.get_file_checksum(repo_id, rel_path)
+            if stored_checksum == checksum:
+                stats["skipped"] += 1
+                stats["details"].append({"path": str(file_path), "status": "skipped", "reason": "unchanged"})
+                continue
+
+            # Parse
+            file_dialect = _resolve_dialect(rel_path, dialect, dialect_overrides)
+            result = self.get_parser(file_dialect).parse(rel_path, content, schema=schema_catalog)
+            if result.errors:
+                for err in result.errors:
+                    stats["errors"].append(f"{rel_path}: {err}")
+
+            # Atomic delete + insert
+            with self.graph.write_transaction():
+                self.graph.delete_file_data(repo_id, rel_path)
+                file_id = self.graph.insert_file(repo_id, rel_path, "sql", checksum)
+                insert_stats = {
+                    "nodes_added": 0, "edges_added": 0,
+                    "column_usage_added": 0, "lineage_chains": 0,
+                }
+                self._insert_parse_result(result, file_id, repo_id, insert_stats)
+
+            stats["reindexed"] += 1
+            stats["details"].append({"path": str(file_path), "status": "reindexed"})
+            did_reindex = True
+
+        if did_reindex:
+            self.graph.cleanup_phantoms()
+            self.graph.clear_snippet_cache()
+
+    def _delete_stored_files_by_stem(self, repo_id: int, stem: str, stats: dict, display_path: str) -> None:
+        """Delete stored file data for dbt/sqlmesh models by stem.
+
+        Stored file paths for dbt (e.g. ``staging/orders.sql``) and sqlmesh
+        (e.g. ``catalog/schema/orders.sql``) differ from filesystem relative
+        paths. This method looks up the stored path by stem and deletes it.
+        """
+        stored_paths = self.graph.find_file_paths_by_stem(repo_id, stem)
+        if stored_paths:
+            with self.graph.write_transaction():
+                for sp in stored_paths:
+                    self.graph.delete_file_data(repo_id, sp)
+            stats["deleted"] += len(stored_paths)
+        else:
+            stats["deleted"] += 1
+        stats["details"].append({"path": display_path, "status": "deleted"})
+
+    def _reindex_dbt_files(
+        self,
+        repo_id: int,
+        repo_path: Path,
+        files: list[Path],
+        stats: dict,
+        repo_config: dict,
+    ) -> None:
+        """Reindex dbt model files via render_models()."""
+        # Handle deleted files first — look up stored paths by stem
+        remaining = []
+        for file_path in files:
+            if not file_path.exists():
+                self._delete_stored_files_by_stem(repo_id, file_path.stem, stats, str(file_path))
+            else:
+                remaining.append(file_path)
+
+        if not remaining:
+            return
+
+        # Derive model names from file stems
+        model_names = [f.stem for f in remaining]
+
+        # Call render_models with config params
+        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        try:
+            rendered = self.dbt_renderer.render_models(
+                project_path=repo_config.get("project_path", str(repo_path)),
+                model_names=model_names,
+                profiles_dir=repo_config.get("profiles_dir"),
+                env_file=repo_config.get("env_file"),
+                target=repo_config.get("target"),
+                dbt_command=repo_config.get("dbt_command", "uv run dbt"),
+                venv_dir=repo_config.get("venv_dir"),
+                dialect=repo_config.get("dialect"),
+                schema_catalog=schema_catalog,
+            )
+        except Exception as e:
+            for f in remaining:
+                stats["errors"].append(f"{f.stem}: dbt compile failed: {e}")
+                stats["details"].append({"path": str(f), "status": "error", "reason": str(e)})
+            return
+
+        # Insert rendered results
+        for model_path, result in rendered.items():
+            with self.graph.write_transaction():
+                self.graph.delete_file_data(repo_id, model_path)
+                checksum = _checksum_parse_result(result)
+                file_id = self.graph.insert_file(repo_id, model_path, "sql", checksum)
+                insert_stats = {
+                    "nodes_added": 0, "edges_added": 0,
+                    "column_usage_added": 0, "lineage_chains": 0,
+                }
+                self._insert_parse_result(result, file_id, repo_id, insert_stats)
+            stats["reindexed"] += 1
+            stats["details"].append({"path": model_path, "status": "reindexed"})
+
+        self.graph.clear_snippet_cache()
+
+    def _reindex_sqlmesh_files(
+        self,
+        repo_id: int,
+        repo_path: Path,
+        files: list[Path],
+        stats: dict,
+        repo_config: dict,
+    ) -> None:
+        """Reindex sqlmesh model files via render_models()."""
+        # Handle deleted files first — look up stored paths by stem
+        remaining = []
+        for file_path in files:
+            if not file_path.exists():
+                self._delete_stored_files_by_stem(repo_id, file_path.stem, stats, str(file_path))
+            else:
+                remaining.append(file_path)
+
+        if not remaining:
+            return
+
+        # Resolve model names: look up stored node names by file stem,
+        # since stored file paths differ from filesystem paths
+        model_names = self._resolve_model_names_by_stem(repo_id, remaining)
+
+        dialect = repo_config.get("dialect", "athena")
+        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        variables = _coerce_variables(repo_config.get("variables"))
+
+        try:
+            rendered = self.get_sqlmesh_renderer(dialect).render_models(
+                project_path=repo_config.get("project_path", str(repo_path)),
+                model_names=model_names,
+                env_file=repo_config.get("env_file"),
+                variables=variables or None,
+                gateway=repo_config.get("gateway", "local"),
+                dialect=dialect,
+                sqlmesh_command=repo_config.get("sqlmesh_command", "uv run python"),
+                venv_dir=repo_config.get("venv_dir"),
+                schema_catalog=schema_catalog,
+            )
+        except Exception as e:
+            for f in remaining:
+                stats["errors"].append(f"{f.stem}: sqlmesh render failed: {e}")
+                stats["details"].append({"path": str(f), "status": "error", "reason": str(e)})
+            return
+
+        # Insert rendered results
+        for model_name, result in rendered.items():
+            clean_name = model_name.strip('"').replace('"."', "/")
+            file_path_key = clean_name + ".sql"
+
+            with self.graph.write_transaction():
+                self.graph.delete_file_data(repo_id, file_path_key)
+                checksum = _checksum_parse_result(result)
+                file_id = self.graph.insert_file(repo_id, file_path_key, "sql", checksum)
+                insert_stats = {
+                    "nodes_added": 0, "edges_added": 0,
+                    "column_usage_added": 0, "lineage_chains": 0,
+                }
+                self._insert_parse_result(result, file_id, repo_id, insert_stats)
+            stats["reindexed"] += 1
+            stats["details"].append({"path": file_path_key, "status": "reindexed"})
+
+        self.graph.clear_snippet_cache()
+
+    def _resolve_model_names_by_stem(
+        self,
+        repo_id: int,
+        files: list[Path],
+    ) -> list[str]:
+        """Resolve file paths to model names via stored node names.
+
+        For dbt/sqlmesh repos, the stored file paths differ from filesystem
+        paths. This looks up the stored node name by matching file stems
+        against the files table, then extracting the node name. Falls back
+        to file stem for new/unindexed files.
+        """
+        model_names = []
+        for file_path in files:
+            stem = file_path.stem
+            # Find stored file paths that match this stem
+            stored_paths = self.graph.find_file_paths_by_stem(repo_id, stem)
+            if stored_paths:
+                # Look up the node name from the first matching stored path
+                node_name = self.graph.find_node_name_by_file(repo_id, stored_paths[0])
+                if node_name:
+                    model_names.append(node_name)
+                    continue
+            model_names.append(stem)
+        return model_names
+
     def _insert_parse_result(
         self,
         result: ParseResult,
@@ -655,6 +1009,26 @@ def _resolve_dialect(
             if file_path.startswith(pattern) or fnmatch.fnmatch(file_path, pattern):
                 return dialect
     return default_dialect
+
+
+def _coerce_variables(raw: dict | None) -> dict[str, str | int]:
+    """Coerce variable values to int where possible.
+
+    JSON config preserves int types, but values may arrive as strings
+    from CLI args or env vars.
+    """
+    if not raw:
+        return {}
+    result: dict[str, str | int] = {}
+    for k, v in raw.items():
+        if isinstance(v, int):
+            result[k] = v
+        else:
+            try:
+                result[k] = int(v)
+            except (ValueError, TypeError):
+                result[k] = v
+    return result
 
 
 def _checksum_parse_result(result: ParseResult) -> str:

@@ -76,7 +76,9 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
     # Ensure parent directory exists
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Merge all repo types with repo_type tag for the graph layer
+    # Merge all repo types with repo_type tag for the graph layer.
+    # Preserves full config for dbt/sqlmesh so reindex_files() can access
+    # renderer params (profiles_dir, env_file, target, variables, etc.).
     all_repos = {}
     for name, cfg in config.get("repos", {}).items():
         if isinstance(cfg, dict):
@@ -84,11 +86,17 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
         else:
             all_repos[name] = {"path": cfg, "repo_type": "sql"}
     for name, cfg in config.get("dbt_repos", {}).items():
-        path = cfg["project_path"] if isinstance(cfg, dict) else cfg
-        all_repos[name] = {"path": path, "repo_type": "dbt"}
+        if isinstance(cfg, dict):
+            path = cfg["project_path"]
+            all_repos[name] = {**cfg, "path": path, "repo_type": "dbt"}
+        else:
+            all_repos[name] = {"path": cfg, "repo_type": "dbt"}
     for name, cfg in config.get("sqlmesh_repos", {}).items():
-        path = cfg["project_path"] if isinstance(cfg, dict) else cfg
-        all_repos[name] = {"path": path, "repo_type": "sqlmesh"}
+        if isinstance(cfg, dict):
+            path = cfg["project_path"]
+            all_repos[name] = {**cfg, "path": path, "repo_type": "sqlmesh"}
+        else:
+            all_repos[name] = {"path": cfg, "repo_type": "sqlmesh"}
 
     configure(
         db_path=effective_db_path,
