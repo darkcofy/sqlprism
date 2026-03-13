@@ -25,6 +25,41 @@ def test_repo_crud():
     db.close()
 
 
+def test_migration_adds_repo_type_column():
+    """repos table has a repo_type column with default 'sql'."""
+    db = GraphDB()
+    cols = db.conn.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = 'repos' AND column_name = 'repo_type'"
+    ).fetchone()
+    assert cols is not None
+    assert cols[0] == "repo_type"
+    assert cols[1] == "VARCHAR"
+
+    # Verify DDL-level default by inserting without repo_type
+    db.conn.execute(
+        "INSERT INTO repos (name, path) VALUES ('raw-repo', '/tmp/raw')"
+    )
+    row = db.conn.execute(
+        "SELECT repo_type FROM repos WHERE name = 'raw-repo'"
+    ).fetchone()
+    assert row[0] == "sql"
+    db.close()
+
+
+def test_migration_existing_repos_default_sql():
+    """Repos created without explicit repo_type default to 'sql' and data is preserved."""
+    db = GraphDB()
+    db.upsert_repo("default-repo", "/tmp/default")
+    row = db.conn.execute(
+        "SELECT name, path, repo_type FROM repos WHERE name = 'default-repo'"
+    ).fetchone()
+    assert row[0] == "default-repo"
+    assert row[1] == "/tmp/default"
+    assert row[2] == "sql"
+    db.close()
+
+
 def test_file_and_node_insertion():
     db = GraphDB()
     repo_id = db.upsert_repo("test", "/tmp/test")

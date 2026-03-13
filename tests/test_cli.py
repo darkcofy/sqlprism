@@ -144,5 +144,28 @@ def test_serve_with_mocked_mcp_run(tmp_path):
     mock_configure.assert_called_once()
     call_kwargs = mock_configure.call_args
     assert call_kwargs[1]["db_path"] == db_path
-    assert call_kwargs[1]["repos"] == {"demo": str(tmp_path)}
+    assert call_kwargs[1]["repos"] == {"demo": {"path": str(tmp_path), "repo_type": "sql"}}
     assert call_kwargs[1]["sql_dialect"] == "postgres"
+
+
+def test_serve_merges_all_repo_types(tmp_path):
+    """serve command tags repos, dbt_repos, sqlmesh_repos with correct repo_type."""
+    db_path = str(tmp_path / "test.duckdb")
+    config = {
+        "db_path": db_path,
+        "repos": {"sql_one": str(tmp_path / "sql")},
+        "dbt_repos": {"dbt_one": {"project_path": str(tmp_path / "dbt")}},
+        "sqlmesh_repos": {"sm_one": {"project_path": str(tmp_path / "sm")}},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    with patch("sqlprism.cli.mcp"), patch("sqlprism.cli.configure") as mock_configure:
+        result = runner.invoke(cli, ["serve", "--config", str(config_path)])
+
+    assert result.exit_code == 0, f"stdout={result.output}"
+    repos = mock_configure.call_args[1]["repos"]
+    assert repos["sql_one"] == {"path": str(tmp_path / "sql"), "repo_type": "sql"}
+    assert repos["dbt_one"] == {"path": str(tmp_path / "dbt"), "repo_type": "dbt"}
+    assert repos["sm_one"] == {"path": str(tmp_path / "sm"), "repo_type": "sqlmesh"}
