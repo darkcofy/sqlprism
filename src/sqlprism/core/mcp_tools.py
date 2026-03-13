@@ -72,7 +72,8 @@ def configure(db_path: str | Path, repos: dict, sql_dialect: str | None = None):
     # Register repos before publishing new state
     for name, cfg in repos.items():
         path = cfg["path"] if isinstance(cfg, dict) else cfg
-        graph.upsert_repo(name, path)
+        repo_type = cfg.get("repo_type", "sql") if isinstance(cfg, dict) else "sql"
+        graph.upsert_repo(name, path, repo_type=repo_type)
 
     # Atomic swap — readers always get a consistent triple
     _state = _ServerState(graph=graph, indexer=indexer, config=config)
