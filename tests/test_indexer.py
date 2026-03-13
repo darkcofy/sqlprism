@@ -1344,3 +1344,191 @@ def test_reindex_files_empty_input():
     assert stats["errors"] == []
     assert stats["details"] == []
     db.close()
+
+
+# ── Issue #14: Additional indexer unit and integration tests ──
+
+
+def test_resolve_file_repo_various_layouts(tmp_path):
+    """_resolve_file_repo maps files to deepest matching repo; unmatched → None."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    parent = tmp_path / "project" / "a"
+    child = parent / "sub"
+    child.mkdir(parents=True)
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    db.upsert_repo("parent", str(parent), repo_type="sql")
+    db.upsert_repo("child", str(child), repo_type="dbt")
+
+    all_repos = db.get_all_repos()
+
+    # File in child → resolves to child (deepest)
+    resolved = indexer._resolve_file_repo(child / "model.sql", all_repos)
+    assert resolved is not None
+    repo_id, repo_name, repo_path, repo_type = resolved
+    assert repo_name == "child"
+    assert repo_type == "dbt"
+
+    # File in parent but not in child → resolves to parent
+    resolved2 = indexer._resolve_file_repo(parent / "query.sql", all_repos)
+    assert resolved2 is not None
+    _, repo_name2, _, repo_type2 = resolved2
+    assert repo_name2 == "parent"
+    assert repo_type2 == "sql"
+
+    # Deeply nested file under child → still resolves to child
+    deep_file = child / "nested" / "deep" / "model.sql"
+    resolved3 = indexer._resolve_file_repo(deep_file, all_repos)
+    assert resolved3 is not None
+    assert resolved3[1] == "child"
+
+    # File completely outside all repos → None
+    outside = tmp_path / "elsewhere" / "orphan.sql"
+    resolved4 = indexer._resolve_file_repo(outside, all_repos)
+    assert resolved4 is None
+
+    db.close()
+
+
+def test_reindex_checksum_skip_unchanged(tmp_path):
+    """reindex_files() skips unchanged files — parser.parse is NOT called."""
+    from unittest.mock import patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "report.sql"
+    sql_file.write_text("SELECT id, amount FROM orders")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    # Full reindex first
+    indexer.reindex_repo("test", str(repo_dir))
+
+    # Patch the parser to track calls.
+    # get_parser(None) returns the same cached instance that _reindex_sql_files uses
+    # because this repo has no dialect config, so file_dialect resolves to None.
+    parser = indexer.get_parser(None)
+    with patch.object(parser, "parse", wraps=parser.parse) as mock_parse:
+        stats = indexer.reindex_files(paths=[str(sql_file)])
+
+    assert stats["skipped"] == 1
+    assert stats["reindexed"] == 0
+    mock_parse.assert_not_called()
+    db.close()
+
+
+def test_reindex_plain_sql_updates_graph(tmp_path):
+    """reindex_files() updates nodes and edges when plain SQL content changes."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "report.sql"
+    sql_file.write_text("SELECT id FROM orders")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    # Initial full reindex
+    indexer.reindex_repo("test", str(repo_dir))
+
+    # Verify initial state — orders is referenced
+    results = db.query_search("orders")
+    assert results["total_count"] >= 1
+
+    # Now change the SQL to reference a different table
+    sql_file.write_text("SELECT id, name FROM customers JOIN payments ON customers.id = payments.customer_id")
+
+    stats = indexer.reindex_files(paths=[str(sql_file)])
+    assert stats["reindexed"] == 1
+
+    # Verify graph updated: customers should be searchable now
+    results = db.query_search("customers")
+    assert results["total_count"] >= 1
+
+    # payments should also appear
+    results = db.query_search("payments")
+    assert results["total_count"] >= 1
+
+    # Verify stale node (orders) is no longer file-backed — delete + re-insert worked
+    stale = db.query_search("orders")
+    file_backed = [m for m in stale["matches"] if m.get("file")]
+    assert len(file_backed) == 0
+
+    db.close()
+
+
+def test_reindex_deleted_file_cleans_graph(tmp_path):
+    """reindex_files() removes all graph data when a file is deleted."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "report.sql"
+    sql_file.write_text("CREATE TABLE report (id INT, name TEXT)")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    # Index the file
+    indexer.reindex_repo("test", str(repo_dir))
+    status = db.get_index_status()
+    assert status["totals"]["files"] == 1
+    assert status["totals"]["nodes"] >= 1
+
+    # Delete the file
+    sql_file.unlink()
+
+    # Reindex the deleted path
+    stats = indexer.reindex_files(paths=[str(sql_file)])
+    assert stats["deleted"] == 1
+
+    # Verify everything is cleaned up
+    status = db.get_index_status()
+    assert status["totals"]["files"] == 0
+    # Real (file-backed) nodes are removed; only phantoms may remain.
+    # Use status["phantom_nodes"] (no default) so a KeyError surfaces schema changes.
+    real_nodes = status["totals"]["nodes"] - status["phantom_nodes"]
+    assert real_nodes == 0
+
+    # Search for the table name should return no file-backed matches
+    results = db.query_search("report")
+    file_backed = [m for m in results["matches"] if m.get("file")]
+    assert len(file_backed) == 0
+
+    db.close()
+
+
+def test_reindex_file_outside_repos_skipped(tmp_path):
+    """reindex_files() skips files outside all configured repos with reason."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    outside_file = tmp_path / "elsewhere" / "orphan.sql"
+    outside_file.parent.mkdir()
+    outside_file.write_text("SELECT 1")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    db.upsert_repo("test", str(repo_dir), repo_type="sql")
+
+    stats = indexer.reindex_files(paths=[str(outside_file)])
+    assert stats["skipped"] == 1
+    assert stats["reindexed"] == 0
+
+    detail = stats["details"][0]
+    assert detail["path"] == str(outside_file)
+    assert "no matching repo" in detail["reason"]
+
+    db.close()
