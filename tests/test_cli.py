@@ -198,7 +198,6 @@ def test_cli_reindex_file_single(tmp_path):
     )
     assert result.exit_code == 0, f"stdout={result.output}"
     assert "reindexed=1" in result.output
-    assert "Done." in result.output
 
 
 def test_cli_reindex_file_multiple(tmp_path):
@@ -222,16 +221,21 @@ def test_cli_reindex_file_multiple(tmp_path):
     )
     assert result.exit_code == 0, f"stdout={result.output}"
     assert "reindexed=2" in result.output
-    assert "Done." in result.output
 
 
 def test_cli_reindex_file_not_found(tmp_path):
-    """reindex-file with a non-existent path fails via Click validation."""
+    """reindex-file with a non-existent path skips it (no matching repo)."""
+    config = {"db_path": str(tmp_path / "test.duckdb"), "repos": {"r": str(tmp_path)}}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
     runner = CliRunner()
     result = runner.invoke(
-        cli, ["reindex-file", "/nonexistent/path/missing.sql"]
+        cli,
+        ["reindex-file", "--config", str(config_path), "/nonexistent/path/missing.sql"],
     )
-    assert result.exit_code != 0
+    assert result.exit_code == 0
+    assert "skipped=1" in result.output
 
 
 def test_cli_reindex_file_custom_paths(tmp_path):
@@ -242,7 +246,8 @@ def test_cli_reindex_file_custom_paths(tmp_path):
     sql_file.write_text("SELECT 1 AS val FROM source_table")
 
     custom_db = str(tmp_path / "custom" / "my.duckdb")
-    config = {"db_path": str(tmp_path / "default.duckdb"), "repos": {"r": str(repo_dir)}}
+    default_db = str(tmp_path / "default.duckdb")
+    config = {"db_path": default_db, "repos": {"r": str(repo_dir)}}
     config_path = tmp_path / "custom_config.json"
     config_path.write_text(json.dumps(config))
 
@@ -258,5 +263,63 @@ def test_cli_reindex_file_custom_paths(tmp_path):
     )
     assert result.exit_code == 0, f"stdout={result.output}"
     assert "reindexed=1" in result.output
-    # Verify the custom DB was actually created
+    # Verify the custom DB was created and the default was NOT
     assert Path(custom_db).exists()
+    assert not Path(default_db).exists()
+
+
+def test_cli_reindex_file_multi_repo(tmp_path):
+    """reindex-file resolves files across different repos."""
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    file_a = repo_a / "orders.sql"
+    file_b = repo_b / "customers.sql"
+    file_a.write_text("CREATE TABLE orders (id INT)")
+    file_b.write_text("CREATE TABLE customers (id INT)")
+
+    db_path = str(tmp_path / "test.duckdb")
+    config = {
+        "db_path": db_path,
+        "repos": {"alpha": str(repo_a), "beta": str(repo_b)},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["reindex-file", "--config", str(config_path), str(file_a), str(file_b)],
+    )
+    assert result.exit_code == 0, f"stdout={result.output}"
+    assert "reindexed=2" in result.output
+
+
+def test_cli_reindex_file_deleted_cleans_graph(tmp_path):
+    """reindex-file on a deleted path removes stale nodes from the graph."""
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "stale.sql"
+    sql_file.write_text("CREATE TABLE stale (id INT)")
+
+    db_path = str(tmp_path / "test.duckdb")
+    config = {"db_path": db_path, "repos": {"test": str(repo_dir)}}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    # First index the file
+    result = runner.invoke(
+        cli, ["reindex-file", "--config", str(config_path), str(sql_file)]
+    )
+    assert result.exit_code == 0
+    assert "reindexed=1" in result.output
+
+    # Delete the file, then reindex the same path
+    sql_file.unlink()
+    result = runner.invoke(
+        cli, ["reindex-file", "--config", str(config_path), str(sql_file)]
+    )
+    assert result.exit_code == 0
+    assert "deleted=1" in result.output
