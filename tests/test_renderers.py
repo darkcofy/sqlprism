@@ -241,11 +241,12 @@ def test_sqlmesh_render_project_command_construction(tmp_path):
         # The script text should be the 5th element
         assert "sqlmesh" in cmd[4], "Inline script should reference sqlmesh"
         assert "Context" in cmd[4], "Inline script should use sqlmesh Context"
-        # Positional args: project_path, dialect, gateway, variables json
+        # Positional args: project_path, dialect, gateway, variables json, model_filter
         assert cmd[5] == str(tmp_path.resolve())
         assert cmd[6] == "athena"
         assert cmd[7] == "local"
         assert json.loads(cmd[8]) == {"GRACE_PERIOD": 7}
+        assert json.loads(cmd[9]) == [], "render_project passes empty model filter"
 
         assert mock_run.call_args[1]["timeout"] == 600
 
@@ -378,3 +379,207 @@ def test_dbt_model_name_no_subdirectory(tmp_path):
     result = results["orders.sql"]
     node_names = {n.name for n in result.nodes}
     assert "orders" in node_names
+
+
+# ── DbtRenderer.render_models tests (#9) ──
+
+
+def test_dbt_render_models_single(tmp_path):
+    """render_models compiles a single model via --select and returns only that model."""
+    (tmp_path / "dbt_project.yml").write_text("name: test_proj\n")
+    (tmp_path / ".venv").mkdir()
+
+    # Create compiled directory with multiple models (simulating dbt output)
+    compiled_dir = tmp_path / "target" / "compiled" / "test_proj" / "models"
+    compiled_dir.mkdir(parents=True)
+    (compiled_dir / "stg_orders.sql").write_text("SELECT id FROM raw.orders")
+    (compiled_dir / "stg_payments.sql").write_text("SELECT id FROM raw.payments")
+
+    renderer = DbtRenderer()
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        results = renderer.render_models(
+            project_path=tmp_path,
+            model_names=["stg_orders"],
+        )
+
+    # Should only contain the selected model
+    assert "stg_orders.sql" in results
+    assert "stg_payments.sql" not in results
+
+    # Verify --select was passed
+    cmd = mock_run.call_args[0][0]
+    assert "--select" in cmd
+    assert "stg_orders" in cmd
+
+
+def test_dbt_render_models_multiple(tmp_path):
+    """render_models compiles multiple models in a single dbt compile --select call."""
+    (tmp_path / "dbt_project.yml").write_text("name: test_proj\n")
+    (tmp_path / ".venv").mkdir()
+
+    compiled_dir = tmp_path / "target" / "compiled" / "test_proj" / "models"
+    compiled_dir.mkdir(parents=True)
+    (compiled_dir / "stg_orders.sql").write_text("SELECT id FROM raw.orders")
+    (compiled_dir / "stg_payments.sql").write_text("SELECT id FROM raw.payments")
+    (compiled_dir / "stg_customers.sql").write_text("SELECT id FROM raw.customers")
+
+    renderer = DbtRenderer()
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        results = renderer.render_models(
+            project_path=tmp_path,
+            model_names=["stg_orders", "stg_payments"],
+        )
+
+    assert "stg_orders.sql" in results
+    assert "stg_payments.sql" in results
+    assert "stg_customers.sql" not in results
+
+    # Both models passed to single --select call
+    cmd = mock_run.call_args[0][0]
+    select_idx = cmd.index("--select")
+    assert "stg_orders" in cmd[select_idx + 1 :]
+    assert "stg_payments" in cmd[select_idx + 1 :]
+
+
+def test_dbt_render_models_partial_failure(tmp_path):
+    """render_models returns error from dbt compile when a model has errors."""
+    (tmp_path / "dbt_project.yml").write_text("name: test_proj\n")
+    (tmp_path / ".venv").mkdir()
+
+    renderer = DbtRenderer()
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="Compilation Error in model stg_orders",
+        )
+
+        with pytest.raises(RuntimeError, match="Compilation Error"):
+            renderer.render_models(
+                project_path=tmp_path,
+                model_names=["stg_orders"],
+            )
+
+
+def test_dbt_render_project_unchanged(tmp_path):
+    """render_project still works without --select (no regression)."""
+    (tmp_path / "dbt_project.yml").write_text("name: test_proj\n")
+    (tmp_path / ".venv").mkdir()
+
+    compiled_dir = tmp_path / "target" / "compiled" / "test_proj" / "models"
+    compiled_dir.mkdir(parents=True)
+    (compiled_dir / "orders.sql").write_text("SELECT id FROM raw.orders")
+
+    renderer = DbtRenderer()
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    # No --select in command
+    cmd = mock_run.call_args[0][0]
+    assert "--select" not in cmd
+    assert "orders.sql" in results
+
+
+# ── SqlMeshRenderer.render_models tests (#10) ──
+
+
+def test_sqlmesh_render_models_single(tmp_path):
+    """render_models renders a single model via model filter."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    rendered = {'"db"."schema"."model_a"': "SELECT id FROM raw.a"}
+    stdout_json = json.dumps({"rendered": rendered, "errors": []})
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+
+        results = renderer.render_models(
+            project_path=tmp_path,
+            model_names=["model_a"],
+        )
+
+    assert len(results) == 1
+    assert '"db"."schema"."model_a"' in results
+
+    # Verify model filter was passed as last subprocess arg
+    cmd = mock_run.call_args[0][0]
+    assert json.loads(cmd[-1]) == ["model_a"]
+
+
+def test_sqlmesh_render_models_multiple(tmp_path):
+    """render_models renders multiple models in a single subprocess call."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    rendered = {
+        '"db"."schema"."model_a"': "SELECT id FROM raw.a",
+        '"db"."schema"."model_b"': "SELECT id FROM raw.b",
+    }
+    stdout_json = json.dumps({"rendered": rendered, "errors": []})
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+
+        results = renderer.render_models(
+            project_path=tmp_path,
+            model_names=["model_a", "model_b"],
+        )
+
+    assert len(results) == 2
+
+    # Both models in filter arg
+    cmd = mock_run.call_args[0][0]
+    filter_arg = json.loads(cmd[-1])
+    assert set(filter_arg) == {"model_a", "model_b"}
+
+
+def test_sqlmesh_render_models_partial_failure(tmp_path):
+    """render_models returns successful models even when some fail."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    rendered = {'"db"."schema"."model_a"': "SELECT id FROM raw.a"}
+    errors = [{"model": "model_b", "error": "syntax error"}]
+    stdout_json = json.dumps({"rendered": rendered, "errors": errors})
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+
+        results = renderer.render_models(
+            project_path=tmp_path,
+            model_names=["model_a", "model_b"],
+        )
+
+    # model_a succeeded, model_b had error but process didn't crash
+    assert len(results) == 1
+    assert '"db"."schema"."model_a"' in results
+
+
+def test_sqlmesh_render_project_unchanged(tmp_path):
+    """render_project passes empty model filter (no regression)."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    stdout_json = json.dumps({"rendered": {}, "errors": []})
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+        renderer.render_project(project_path=tmp_path)
+
+    # render_project passes empty model_filter (render all)
+    cmd = mock_run.call_args[0][0]
+    assert json.loads(cmd[-1]) == [], "render_project should pass empty filter"
