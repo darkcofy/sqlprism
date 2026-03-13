@@ -76,27 +76,7 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
     # Ensure parent directory exists
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Merge all repo types with repo_type tag for the graph layer.
-    # Preserves full config for dbt/sqlmesh so reindex_files() can access
-    # renderer params (profiles_dir, env_file, target, variables, etc.).
-    all_repos = {}
-    for name, cfg in config.get("repos", {}).items():
-        if isinstance(cfg, dict):
-            all_repos[name] = {**cfg, "repo_type": "sql"}
-        else:
-            all_repos[name] = {"path": cfg, "repo_type": "sql"}
-    for name, cfg in config.get("dbt_repos", {}).items():
-        if isinstance(cfg, dict):
-            path = cfg["project_path"]
-            all_repos[name] = {**cfg, "path": path, "repo_type": "dbt"}
-        else:
-            all_repos[name] = {"path": cfg, "repo_type": "dbt"}
-    for name, cfg in config.get("sqlmesh_repos", {}).items():
-        if isinstance(cfg, dict):
-            path = cfg["project_path"]
-            all_repos[name] = {**cfg, "path": path, "repo_type": "sqlmesh"}
-        else:
-            all_repos[name] = {"path": cfg, "repo_type": "sqlmesh"}
+    all_repos = _build_repo_configs(config)
 
     configure(
         db_path=effective_db_path,
@@ -223,6 +203,53 @@ def reindex(config_path: str, db_path: str | None, repo_name: str | None):
         sys.exit(1)
 
     click.echo("Done.")
+
+
+@cli.command("reindex-file")
+@click.argument("paths", nargs=-1, required=True, type=click.Path())
+@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--db", "db_path", type=click.Path(), default=None)
+def reindex_file(paths, config_path, db_path):
+    """Reindex specific files (fast on-save path).
+
+    Accepts one or more file paths. Resolves each to its repo,
+    determines repo type, and reindexes only the affected models.
+    Deleted file paths trigger removal of stale nodes from the graph.
+
+    For editors without MCP integration:
+      vim: autocmd BufWritePost *.sql silent !sqlprism reindex-file %:p
+    """
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    config = _load_config(config_path)
+    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
+
+    Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    repo_configs = _build_repo_configs(config)
+
+    with GraphDB(effective_db_path) as graph:
+        indexer = Indexer(graph)
+
+        # Register repos so reindex_files can resolve paths
+        for name, cfg in repo_configs.items():
+            graph.upsert_repo(name, cfg["path"], repo_type=cfg["repo_type"])
+
+        resolved_paths = [str(Path(p).resolve()) for p in paths]
+        stats = indexer.reindex_files(paths=resolved_paths, repo_configs=repo_configs)
+
+    # Print summary
+    click.echo(
+        f"reindexed={stats['reindexed']}, "
+        f"skipped={stats['skipped']}, "
+        f"deleted={stats['deleted']}"
+    )
+    if stats["errors"]:
+        click.echo(f"{len(stats['errors'])} error(s):", err=True)
+        for err in stats["errors"]:
+            click.echo(f"  {err}", err=True)
+        sys.exit(1)
 
 
 @cli.command("reindex-sqlmesh")
@@ -628,6 +655,33 @@ def init_config(config_path: str):
     config_file.write_text(json.dumps(default_config, indent=2))
     click.echo(f"Created config at {config_file}")
     click.echo("Edit it to add your repos, then run: sqlprism reindex")
+
+
+def _build_repo_configs(config: dict) -> dict:
+    """Merge repos, dbt_repos, sqlmesh_repos into a single dict with repo_type tags.
+
+    Preserves full config for dbt/sqlmesh so reindex_files() can access
+    renderer params (profiles_dir, env_file, target, variables, etc.).
+    """
+    result = {}
+    for name, cfg in config.get("repos", {}).items():
+        if isinstance(cfg, dict):
+            result[name] = {**cfg, "repo_type": "sql"}
+        else:
+            result[name] = {"path": cfg, "repo_type": "sql"}
+    for name, cfg in config.get("dbt_repos", {}).items():
+        if isinstance(cfg, dict):
+            path = cfg["project_path"]
+            result[name] = {**cfg, "path": path, "repo_type": "dbt"}
+        else:
+            result[name] = {"path": cfg, "repo_type": "dbt"}
+    for name, cfg in config.get("sqlmesh_repos", {}).items():
+        if isinstance(cfg, dict):
+            path = cfg["project_path"]
+            result[name] = {**cfg, "path": path, "repo_type": "sqlmesh"}
+        else:
+            result[name] = {"path": cfg, "repo_type": "sqlmesh"}
+    return result
 
 
 def _load_config(config_path: str) -> dict:
