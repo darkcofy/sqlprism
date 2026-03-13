@@ -80,14 +80,15 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
     all_repos = {}
     for name, cfg in config.get("repos", {}).items():
         if isinstance(cfg, dict):
-            cfg["repo_type"] = "sql"
+            all_repos[name] = {**cfg, "repo_type": "sql"}
         else:
-            cfg = {"path": cfg, "repo_type": "sql"}
-        all_repos[name] = cfg
+            all_repos[name] = {"path": cfg, "repo_type": "sql"}
     for name, cfg in config.get("dbt_repos", {}).items():
-        all_repos[name] = {"path": cfg.get("project_path", cfg.get("path", "")), "repo_type": "dbt"}
+        path = cfg["project_path"] if isinstance(cfg, dict) else cfg
+        all_repos[name] = {"path": path, "repo_type": "dbt"}
     for name, cfg in config.get("sqlmesh_repos", {}).items():
-        all_repos[name] = {"path": cfg.get("project_path", cfg.get("path", "")), "repo_type": "sqlmesh"}
+        path = cfg["project_path"] if isinstance(cfg, dict) else cfg
+        all_repos[name] = {"path": path, "repo_type": "sqlmesh"}
 
     configure(
         db_path=effective_db_path,
