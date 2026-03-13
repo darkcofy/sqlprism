@@ -583,3 +583,102 @@ def test_sqlmesh_render_project_unchanged(tmp_path):
     # render_project passes empty model_filter (render all)
     cmd = mock_run.call_args[0][0]
     assert json.loads(cmd[-1]) == [], "render_project should pass empty filter"
+
+
+# ── Integration tests: Indexer → Renderer → Graph (#14) ──
+
+
+def test_reindex_dbt_triggers_select_compile(tmp_path):
+    """reindex_files for a dbt model invokes dbt compile --select and updates graph."""
+    from unittest.mock import patch, MagicMock
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "dbt_project"
+    repo_dir.mkdir()
+    (repo_dir / "dbt_project.yml").write_text("name: test_proj\n")
+    (repo_dir / ".venv").mkdir()
+
+    models_dir = repo_dir / "models"
+    models_dir.mkdir()
+    model_file = models_dir / "stg_orders.sql"
+    model_file.write_text("SELECT id, amount FROM {{ ref('raw_orders') }}")
+
+    compiled_dir = repo_dir / "target" / "compiled" / "test_proj" / "models"
+    compiled_dir.mkdir(parents=True)
+    (compiled_dir / "stg_orders.sql").write_text("SELECT id, amount FROM raw_schema.raw_orders")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    db.upsert_repo("my_dbt", str(repo_dir), repo_type="dbt")
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        stats = indexer.reindex_files(
+            paths=[str(model_file)],
+            repo_configs={"my_dbt": {
+                "project_path": str(repo_dir),
+                "repo_type": "dbt",
+            }},
+        )
+
+    assert stats["reindexed"] == 1
+    assert stats["errors"] == []
+
+    cmd = mock_run.call_args[0][0]
+    assert "--select" in cmd
+    assert "stg_orders" in cmd
+
+    results = db.query_search("stg_orders")
+    assert results["total_count"] >= 1
+
+    db.close()
+
+
+def test_reindex_sqlmesh_triggers_filtered_render(tmp_path):
+    """reindex_files for a sqlmesh model passes model filter and updates graph."""
+    import json
+    from unittest.mock import patch, MagicMock
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "sqlmesh_project"
+    repo_dir.mkdir()
+    (repo_dir / ".venv").mkdir()
+
+    models_dir = repo_dir / "models"
+    models_dir.mkdir()
+    model_file = models_dir / "model_a.sql"
+    model_file.write_text("SELECT id FROM source_table")
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    db.upsert_repo("my_sm", str(repo_dir), repo_type="sqlmesh")
+
+    rendered = {'"db"."schema"."model_a"': "SELECT id FROM raw.source_table"}
+    stdout_json = json.dumps({"rendered": rendered, "errors": []})
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+
+        stats = indexer.reindex_files(
+            paths=[str(model_file)],
+            repo_configs={"my_sm": {
+                "project_path": str(repo_dir),
+                "repo_type": "sqlmesh",
+                "dialect": "athena",
+            }},
+        )
+
+    assert stats["reindexed"] == 1
+    assert stats["errors"] == []
+
+    cmd = mock_run.call_args[0][0]
+    model_filter = json.loads(cmd[-1])
+    assert "model_a" in model_filter
+
+    results = db.query_search("model_a")
+    assert results["total_count"] >= 1
+
+    db.close()
