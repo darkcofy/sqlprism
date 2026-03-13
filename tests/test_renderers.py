@@ -590,7 +590,8 @@ def test_sqlmesh_render_project_unchanged(tmp_path):
 
 def test_reindex_dbt_triggers_select_compile(tmp_path):
     """reindex_files for a dbt model invokes dbt compile --select and updates graph."""
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import MagicMock, patch
+
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
@@ -639,7 +640,8 @@ def test_reindex_dbt_triggers_select_compile(tmp_path):
 def test_reindex_sqlmesh_triggers_filtered_render(tmp_path):
     """reindex_files for a sqlmesh model passes model filter and updates graph."""
     import json
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import MagicMock, patch
+
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
