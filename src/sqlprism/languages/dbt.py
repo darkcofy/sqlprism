@@ -137,6 +137,92 @@ class DbtRenderer:
 
         return results
 
+    def render_models(
+        self,
+        project_path: str | Path,
+        model_names: list[str],
+        profiles_dir: str | Path | None = None,
+        env_file: str | Path | None = None,
+        target: str | None = None,
+        dbt_command: str = "uv run dbt",
+        venv_dir: str | Path | None = None,
+        dialect: str | None = None,
+        schema_catalog: dict | None = None,
+    ) -> dict[str, ParseResult]:
+        """Compile specific dbt models using ``--select`` and parse the resulting SQL.
+
+        Args:
+            project_path: Path to dbt project dir (containing dbt_project.yml)
+            model_names: List of model names to compile (passed to ``--select``)
+            profiles_dir: Path to directory containing profiles.yml (defaults to project_path)
+            env_file: Optional .env file to source before running dbt compile
+            target: dbt target name (default: whatever profiles.yml specifies)
+            dbt_command: Command to invoke dbt (default: "uv run dbt")
+            venv_dir: Directory to run `uv run` from (where .venv lives).
+            dialect: SQL dialect for parsing.
+            schema_catalog: Optional schema catalog for column resolution.
+
+        Returns:
+            Dict mapping model relative path -> ParseResult
+        """
+        project_path = Path(project_path).resolve()
+        profiles_dir = Path(profiles_dir).resolve() if profiles_dir else project_path
+
+        if venv_dir:
+            cwd = Path(venv_dir).resolve()
+        else:
+            cwd = find_venv_dir(project_path)
+
+        parser = self.sql_parser
+        if dialect and dialect != getattr(parser, "dialect", None):
+            parser = SqlParser(dialect=dialect)
+
+        env = build_env(env_file)
+
+        self._run_dbt_compile(
+            project_path=project_path,
+            profiles_dir=profiles_dir,
+            cwd=cwd,
+            env=env,
+            target=target,
+            dbt_command=dbt_command,
+            select=model_names,
+        )
+
+        project_name = self._get_project_name(project_path)
+        compiled_dir = project_path / "target" / "compiled" / project_name / "models"
+        if not compiled_dir.exists():
+            return {}
+
+        # Only read compiled files for selected models
+        selected = set(model_names)
+        results: dict[str, ParseResult] = {}
+        for sql_file in compiled_dir.rglob("*.sql"):
+            if sql_file.stem not in selected:
+                continue
+
+            rel_path = str(sql_file.relative_to(compiled_dir))
+            content = sql_file.read_text(errors="replace")
+            if not content.strip():
+                continue
+
+            path_parts = rel_path.removesuffix(".sql").split("/")
+            model_name = path_parts[-1]
+            model_schema = "/".join(path_parts[:-1]) if len(path_parts) > 1 else None
+
+            safe_name = model_name.replace('"', '""')
+            if model_schema:
+                safe_schema = model_schema.replace('"', '""')
+                wrapped_sql = f'CREATE TABLE "{safe_schema}"."{safe_name}" AS\n{content}'
+            else:
+                wrapped_sql = f'CREATE TABLE "{safe_name}" AS\n{content}'
+
+            result = parser.parse(rel_path, wrapped_sql, schema=schema_catalog)
+            enrich_nodes(result, "dbt_model", rel_path)
+            results[rel_path] = result
+
+        return results
+
     def _run_dbt_compile(
         self,
         project_path: Path,
@@ -145,6 +231,7 @@ class DbtRenderer:
         env: dict[str, str],
         target: str | None,
         dbt_command: str,
+        select: list[str] | None = None,
     ) -> None:
         """Run dbt compile, pointing at the project directory."""
         _validate_command(dbt_command, allowed_keywords={"dbt", "uv", "uvx"})
@@ -157,6 +244,8 @@ class DbtRenderer:
         ]
         if target:
             cmd.extend(["--target", target])
+        if select:
+            cmd.extend(["--select", *select])
 
         result = subprocess.run(
             cmd,
