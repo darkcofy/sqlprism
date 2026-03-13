@@ -627,12 +627,21 @@ def test_reindex_dbt_triggers_select_compile(tmp_path):
     assert stats["reindexed"] == 1
     assert stats["errors"] == []
 
+    # Verify dbt compile was invoked exactly once with --select
+    assert mock_run.call_count == 1
     cmd = mock_run.call_args[0][0]
     assert "--select" in cmd
     assert "stg_orders" in cmd
 
+    # Verify graph was updated with file-backed node
     results = db.query_search("stg_orders")
     assert results["total_count"] >= 1
+    file_backed = [m for m in results["matches"] if m.get("file")]
+    assert len(file_backed) >= 1
+
+    # Verify edge to referenced table was also inserted
+    ref_results = db.query_search("raw_orders")
+    assert ref_results["total_count"] >= 1
 
     db.close()
 
@@ -658,13 +667,39 @@ def test_reindex_sqlmesh_triggers_filtered_render(tmp_path):
     indexer = Indexer(db)
     db.upsert_repo("my_sm", str(repo_dir), repo_type="sqlmesh")
 
-    rendered = {'"db"."schema"."model_a"': "SELECT id FROM raw.source_table"}
-    stdout_json = json.dumps({"rendered": rendered, "errors": []})
+    rendered_v1 = {'"db"."schema"."model_a"': "SELECT id FROM raw.source_table"}
+    stdout_v1 = json.dumps({"rendered": rendered_v1, "errors": []})
+
+    # First: index the model so it has a stored node name (exercises primary path)
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_v1, stderr="")
+        stats1 = indexer.reindex_files(
+            paths=[str(model_file)],
+            repo_configs={"my_sm": {
+                "project_path": str(repo_dir),
+                "repo_type": "sqlmesh",
+                "dialect": "athena",
+            }},
+        )
+    assert stats1["reindexed"] == 1
+
+    # Verify model filter was passed on the first call (fallback path: file stem)
+    cmd1 = mock_run.call_args[0][0]
+    filter1 = json.loads(cmd1[-1])
+    assert "model_a" in filter1
+
+    # Now modify the file and reindex again — this exercises the primary
+    # _resolve_model_names_by_stem path (lookup stored node name, not fallback).
+    # The primary path resolves stored table/view node names for this file,
+    # which may differ from the file stem.
+    model_file.write_text("SELECT id, name FROM source_table")
+    rendered_v2 = {'"db"."schema"."model_a"': "SELECT id, name FROM raw.source_table"}
+    stdout_v2 = json.dumps({"rendered": rendered_v2, "errors": []})
 
     with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_v2, stderr="")
 
-        stats = indexer.reindex_files(
+        stats2 = indexer.reindex_files(
             paths=[str(model_file)],
             repo_configs={"my_sm": {
                 "project_path": str(repo_dir),
@@ -673,14 +708,18 @@ def test_reindex_sqlmesh_triggers_filtered_render(tmp_path):
             }},
         )
 
-    assert stats["reindexed"] == 1
-    assert stats["errors"] == []
+    assert stats2["reindexed"] == 1
+    assert stats2["errors"] == []
 
-    cmd = mock_run.call_args[0][0]
-    model_filter = json.loads(cmd[-1])
-    assert "model_a" in model_filter
+    # Verify subprocess was called with a non-empty model filter
+    cmd2 = mock_run.call_args[0][0]
+    filter2 = json.loads(cmd2[-1])
+    assert len(filter2) >= 1, "Primary path should resolve at least one model name"
 
+    # Verify graph was updated with file-backed node
     results = db.query_search("model_a")
     assert results["total_count"] >= 1
+    file_backed = [m for m in results["matches"] if m.get("file")]
+    assert len(file_backed) >= 1
 
     db.close()

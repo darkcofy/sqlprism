@@ -1368,14 +1368,16 @@ def test_resolve_file_repo_various_layouts(tmp_path):
     # File in child → resolves to child (deepest)
     resolved = indexer._resolve_file_repo(child / "model.sql", all_repos)
     assert resolved is not None
-    assert resolved[1] == "child"
-    assert resolved[3] == "dbt"
+    repo_id, repo_name, repo_path, repo_type = resolved
+    assert repo_name == "child"
+    assert repo_type == "dbt"
 
     # File in parent but not in child → resolves to parent
     resolved2 = indexer._resolve_file_repo(parent / "query.sql", all_repos)
     assert resolved2 is not None
-    assert resolved2[1] == "parent"
-    assert resolved2[3] == "sql"
+    _, repo_name2, _, repo_type2 = resolved2
+    assert repo_name2 == "parent"
+    assert repo_type2 == "sql"
 
     # Deeply nested file under child → still resolves to child
     deep_file = child / "nested" / "deep" / "model.sql"
@@ -1409,7 +1411,9 @@ def test_reindex_checksum_skip_unchanged(tmp_path):
     # Full reindex first
     indexer.reindex_repo("test", str(repo_dir))
 
-    # Patch the parser to track calls
+    # Patch the parser to track calls.
+    # get_parser(None) returns the same cached instance that _reindex_sql_files uses
+    # because this repo has no dialect config, so file_dialect resolves to None.
     parser = indexer.get_parser(None)
     with patch.object(parser, "parse", wraps=parser.parse) as mock_parse:
         stats = indexer.reindex_files(paths=[str(sql_file)])
@@ -1454,6 +1458,11 @@ def test_reindex_plain_sql_updates_graph(tmp_path):
     results = db.query_search("payments")
     assert results["total_count"] >= 1
 
+    # Verify stale node (orders) is no longer file-backed — delete + re-insert worked
+    stale = db.query_search("orders")
+    file_backed = [m for m in stale["matches"] if m.get("file")]
+    assert len(file_backed) == 0
+
     db.close()
 
 
@@ -1486,8 +1495,9 @@ def test_reindex_deleted_file_cleans_graph(tmp_path):
     # Verify everything is cleaned up
     status = db.get_index_status()
     assert status["totals"]["files"] == 0
-    # Real (file-backed) nodes are removed; only phantoms may remain
-    real_nodes = status["totals"]["nodes"] - status.get("phantom_nodes", 0)
+    # Real (file-backed) nodes are removed; only phantoms may remain.
+    # Use status["phantom_nodes"] (no default) so a KeyError surfaces schema changes.
+    real_nodes = status["totals"]["nodes"] - status["phantom_nodes"]
     assert real_nodes == 0
 
     # Search for the table name should return no file-backed matches

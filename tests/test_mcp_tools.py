@@ -1177,20 +1177,29 @@ def test_debounce_batches_rapid_enqueues(tmp_path):
     configure(db_path=":memory:", repos={"test": str(repo_dir)})
 
     flushed_paths = []
+    flush_call_count = 0
 
     async def mock_flush(repo_name):
+        nonlocal flush_call_count
+        flush_call_count += 1
         flushed_paths.extend(_mcp_mod._reindex_pending.pop(repo_name, []))
         _mcp_mod._reindex_timers.pop(repo_name, None)
 
     async def _run():
-        with patch.object(_mcp_mod, "_flush_reindex", side_effect=mock_flush):
+        with (
+            patch.object(_mcp_mod, "_flush_reindex", side_effect=mock_flush),
+            patch.object(_mcp_mod, "_DEBOUNCE_SQL", 0.05),
+        ):
             for p in paths:
                 await _enqueue_reindex("test", "sql", [p])
 
             assert len(_mcp_mod._reindex_pending["test"]) == 5
 
-            await asyncio.sleep(1.0)
+            # Wait for debounce to fire (0.05s + margin)
+            await asyncio.sleep(0.3)
 
+        # Exactly one flush should have run, containing all 5 paths
+        assert flush_call_count == 1
         assert len(flushed_paths) == 5
         for p in paths:
             assert p in flushed_paths
@@ -1199,7 +1208,11 @@ def test_debounce_batches_rapid_enqueues(tmp_path):
 
 
 def test_reindex_concurrent_waits_for_lock(tmp_path):
-    """_flush_reindex waits for _reindex_lock held by a concurrent full reindex."""
+    """_flush_reindex waits for _reindex_lock, then updates the graph after release.
+
+    Differs from test_reindex_files_waits_for_lock by verifying the graph is
+    actually updated after the lock is released (not just that the task completes).
+    """
     repo_dir = tmp_path / "concurrent_repo"
     repo_dir.mkdir()
     sql_file = repo_dir / "orders.sql"
@@ -1212,6 +1225,12 @@ def test_reindex_concurrent_waits_for_lock(tmp_path):
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
+    # Verify initial state — no 'status' column
+    graph = _mcp_mod._state.graph
+    col_before = graph.query_column_usage(table="orders", column="status")
+    assert col_before["total_count"] == 0
+
+    # Modify the file and stage it for flush
     sql_file.write_text("CREATE TABLE orders (id INT, status TEXT)")
     _mcp_mod._reindex_pending["test"] = [str(sql_file)]
 
@@ -1220,6 +1239,11 @@ def test_reindex_concurrent_waits_for_lock(tmp_path):
     async def _run():
         nonlocal flush_completed
 
+        # Recreate the lock on the current event loop — prior tests may have
+        # bound it to a different loop via asyncio.run().
+        _mcp_mod._reindex_lock = asyncio.Lock()
+
+        # Simulate a full reindex holding the lock
         await _mcp_mod._reindex_lock.acquire()
 
         flush_task = asyncio.create_task(_flush_reindex("test"))
@@ -1234,3 +1258,7 @@ def test_reindex_concurrent_waits_for_lock(tmp_path):
 
     asyncio.run(_run())
     assert flush_completed
+
+    # Verify the graph was actually updated after lock release
+    status = graph.get_index_status()
+    assert status["totals"]["files"] == 1
