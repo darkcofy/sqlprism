@@ -378,6 +378,35 @@ class GraphDB:
         # Delete repo
         self._execute_write("DELETE FROM repos WHERE repo_id = ?", [repo_id])
 
+    def get_all_repos(self) -> list[tuple[int, str, str, str]]:
+        """Return all repos as (repo_id, name, path, repo_type) tuples."""
+        return self._execute_read(
+            "SELECT repo_id, name, path, repo_type FROM repos"
+        ).fetchall()
+
+    def get_file_checksum(self, repo_id: int, path: str) -> str | None:
+        """Get the stored checksum for a single file in a repo."""
+        row = self._execute_read(
+            "SELECT checksum FROM files WHERE repo_id = ? AND path = ?",
+            [repo_id, path],
+        ).fetchone()
+        return row[0] if row else None
+
+    def find_node_name_by_file(self, repo_id: int, rel_path: str) -> str | None:
+        """Find the primary node name for a file path in a repo.
+
+        Used by sqlmesh reindex to resolve file paths to model names.
+        Returns the first table/view node name found, or ``None``.
+        """
+        row = self._execute_read(
+            "SELECT n.name FROM nodes n "
+            "JOIN files f ON n.file_id = f.file_id "
+            "WHERE f.repo_id = ? AND f.path = ? AND n.kind IN ('table', 'view') "
+            "LIMIT 1",
+            [repo_id, rel_path],
+        ).fetchone()
+        return row[0] if row else None
+
     # ── File management ──
 
     def get_file_checksums(self, repo_id: int) -> dict[str, str]:
