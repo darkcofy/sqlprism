@@ -1,6 +1,7 @@
 """Tests for the CLI entry point (task 5.9)."""
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -174,3 +175,88 @@ def test_serve_merges_all_repo_types(tmp_path):
     assert repos["sm_one"]["path"] == str(tmp_path / "sm")
     assert repos["sm_one"]["repo_type"] == "sqlmesh"
     assert repos["sm_one"]["project_path"] == str(tmp_path / "sm")
+
+
+# ── reindex-file tests (#13) ──
+
+
+def test_cli_reindex_file_single(tmp_path):
+    """reindex-file reindexes a single SQL file standalone."""
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "orders.sql"
+    sql_file.write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
+
+    db_path = str(tmp_path / "test.duckdb")
+    config = {"db_path": db_path, "repos": {"test": str(repo_dir)}}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["reindex-file", "--config", str(config_path), str(sql_file)]
+    )
+    assert result.exit_code == 0, f"stdout={result.output}"
+    assert "reindexed=1" in result.output
+    assert "Done." in result.output
+
+
+def test_cli_reindex_file_multiple(tmp_path):
+    """reindex-file reindexes multiple SQL files in one call."""
+    repo_dir = tmp_path / "myrepo"
+    repo_dir.mkdir()
+    file_a = repo_dir / "orders.sql"
+    file_b = repo_dir / "customers.sql"
+    file_a.write_text("CREATE TABLE orders (id INT)")
+    file_b.write_text("CREATE TABLE customers (id INT, name TEXT)")
+
+    db_path = str(tmp_path / "test.duckdb")
+    config = {"db_path": db_path, "repos": {"test": str(repo_dir)}}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["reindex-file", "--config", str(config_path), str(file_a), str(file_b)],
+    )
+    assert result.exit_code == 0, f"stdout={result.output}"
+    assert "reindexed=2" in result.output
+    assert "Done." in result.output
+
+
+def test_cli_reindex_file_not_found(tmp_path):
+    """reindex-file with a non-existent path fails via Click validation."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["reindex-file", "/nonexistent/path/missing.sql"]
+    )
+    assert result.exit_code != 0
+
+
+def test_cli_reindex_file_custom_paths(tmp_path):
+    """reindex-file works with --config and --db overrides."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "model.sql"
+    sql_file.write_text("SELECT 1 AS val FROM source_table")
+
+    custom_db = str(tmp_path / "custom" / "my.duckdb")
+    config = {"db_path": str(tmp_path / "default.duckdb"), "repos": {"r": str(repo_dir)}}
+    config_path = tmp_path / "custom_config.json"
+    config_path.write_text(json.dumps(config))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "reindex-file",
+            "--config", str(config_path),
+            "--db", custom_db,
+            str(sql_file),
+        ],
+    )
+    assert result.exit_code == 0, f"stdout={result.output}"
+    assert "reindexed=1" in result.output
+    # Verify the custom DB was actually created
+    assert Path(custom_db).exists()
