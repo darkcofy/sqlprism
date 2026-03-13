@@ -25,6 +25,25 @@ def test_repo_crud():
     db.close()
 
 
+def test_migration_adds_repo_type_column():
+    """repos table has a repo_type column with default 'sql'."""
+    db = GraphDB()
+    row = db.conn.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'repos' AND column_name = 'repo_type'").fetchone()
+    assert row is not None
+    assert row[0] == "repo_type"
+    assert row[1] == "VARCHAR"
+    db.close()
+
+
+def test_migration_existing_repos_default_sql():
+    """Repos created without explicit repo_type default to 'sql'."""
+    db = GraphDB()
+    db.upsert_repo("default-repo", "/tmp/default")
+    row = db.conn.execute("SELECT repo_type FROM repos WHERE name = 'default-repo'").fetchone()
+    assert row[0] == "sql"
+    db.close()
+
+
 def test_file_and_node_insertion():
     db = GraphDB()
     repo_id = db.upsert_repo("test", "/tmp/test")
