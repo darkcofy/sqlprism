@@ -892,8 +892,9 @@ async def _flush_reindex(repo_name: str):
 
 class ReindexFilesInput(BaseModel):
     paths: list[str] = Field(
+        min_length=1,
         description="Absolute paths to files that changed. "
-        "Non-SQL files are silently ignored."
+        "Non-SQL files are silently ignored.",
     )
 
 
@@ -902,7 +903,7 @@ class ReindexFilesInput(BaseModel):
     annotations={
         "readOnlyHint": False,
         "destructiveHint": False,
-        "idempotentHint": True,
+        "idempotentHint": False,
         "openWorldHint": False,
     },
 )
