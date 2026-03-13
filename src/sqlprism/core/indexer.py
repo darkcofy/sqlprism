@@ -97,7 +97,7 @@ class Indexer:
             ``phantoms_cleaned``.
         """
         path = Path(path).resolve()
-        repo_id = self.graph.upsert_repo(name, str(path))
+        repo_id = self.graph.upsert_repo(name, str(path), repo_type="sql")
 
         # Get current checksums from DB
         stored_checksums = self.graph.get_file_checksums(repo_id)
@@ -210,7 +210,7 @@ class Indexer:
             ``edges_added``, ``column_usage_added``, and ``lineage_chains``.
         """
         project_path = Path(project_path).resolve()
-        repo_id = self.graph.upsert_repo(repo_name, str(project_path))
+        repo_id = self.graph.upsert_repo(repo_name, str(project_path), repo_type="sqlmesh")
 
         # Build schema catalog from existing index for SELECT * expansion
         schema_catalog = self.graph.get_table_columns(repo_id) or None
@@ -282,7 +282,7 @@ class Indexer:
             ``edges_added``, ``column_usage_added``, and ``lineage_chains``.
         """
         project_path = Path(project_path).resolve()
-        repo_id = self.graph.upsert_repo(repo_name, str(project_path))
+        repo_id = self.graph.upsert_repo(repo_name, str(project_path), repo_type="dbt")
 
         # Build schema catalog from existing index for SELECT * expansion
         schema_catalog = self.graph.get_table_columns(repo_id) or None

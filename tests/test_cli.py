@@ -144,5 +144,5 @@ def test_serve_with_mocked_mcp_run(tmp_path):
     mock_configure.assert_called_once()
     call_kwargs = mock_configure.call_args
     assert call_kwargs[1]["db_path"] == db_path
-    assert call_kwargs[1]["repos"] == {"demo": str(tmp_path)}
+    assert call_kwargs[1]["repos"] == {"demo": {"path": str(tmp_path), "repo_type": "sql"}}
     assert call_kwargs[1]["sql_dialect"] == "postgres"

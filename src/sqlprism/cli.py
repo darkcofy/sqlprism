@@ -76,9 +76,22 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
     # Ensure parent directory exists
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
 
+    # Merge all repo types with repo_type tag for the graph layer
+    all_repos = {}
+    for name, cfg in config.get("repos", {}).items():
+        if isinstance(cfg, dict):
+            cfg["repo_type"] = "sql"
+        else:
+            cfg = {"path": cfg, "repo_type": "sql"}
+        all_repos[name] = cfg
+    for name, cfg in config.get("dbt_repos", {}).items():
+        all_repos[name] = {"path": cfg.get("project_path", cfg.get("path", "")), "repo_type": "dbt"}
+    for name, cfg in config.get("sqlmesh_repos", {}).items():
+        all_repos[name] = {"path": cfg.get("project_path", cfg.get("path", "")), "repo_type": "sqlmesh"}
+
     configure(
         db_path=effective_db_path,
-        repos=config.get("repos", {}),
+        repos=all_repos,
         sql_dialect=config.get("sql_dialect"),
     )
 
