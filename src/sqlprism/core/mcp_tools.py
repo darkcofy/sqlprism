@@ -10,6 +10,8 @@ WHERE filters, and dependency tracing across dialects.
 
 import asyncio
 import json
+import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +24,8 @@ from sqlprism.core.graph import GraphDB
 from sqlprism.core.indexer import Indexer
 from sqlprism.languages import is_sql_file
 from sqlprism.types import NodeResult, ParseResult, parse_repo_config
+
+logger = logging.getLogger(__name__)
 
 # ── Server initialisation ──
 
@@ -46,6 +50,13 @@ _reindex_lock = asyncio.Lock()
 _reindex_task: asyncio.Task | None = None
 _reindex_status: dict = {"state": "idle"}
 _last_parse_errors: list[str] = []
+
+# Per-repo debounce state for reindex_files
+_reindex_pending: dict[str, list[str]] = defaultdict(list)  # repo_name → [paths]
+_reindex_timers: dict[str, asyncio.TimerHandle] = {}         # repo_name → timer
+
+_DEBOUNCE_SQL = 0.5       # 500ms for plain SQL (fast parse)
+_DEBOUNCE_RENDERED = 2.0  # 2s for dbt/sqlmesh (subprocess)
 
 
 def configure(db_path: str | Path, repos: dict, sql_dialect: str | None = None):
@@ -818,6 +829,132 @@ async def reindex_dbt(params: ReindexDbtInput) -> dict:
         ),
         "repos": [params.name],
     }
+
+
+# ── Per-file reindex with debounce ──
+
+
+def _log_flush_exception(task: asyncio.Task):
+    """Done-callback: log exceptions from debounced flush tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error("reindex_files flush failed: %s", exc, exc_info=exc)
+
+
+async def _enqueue_reindex(repo_name: str, repo_type: str, paths: list[str]):
+    """Add paths to pending reindex, reset debounce timer."""
+    _reindex_pending[repo_name].extend(paths)
+
+    # Cancel existing timer
+    if repo_name in _reindex_timers:
+        _reindex_timers[repo_name].cancel()
+
+    delay = _DEBOUNCE_SQL if repo_type == "sql" else _DEBOUNCE_RENDERED
+    loop = asyncio.get_running_loop()
+
+    def _schedule_flush(rn=repo_name):
+        task = asyncio.ensure_future(_flush_reindex(rn))
+        task.add_done_callback(_log_flush_exception)
+
+    _reindex_timers[repo_name] = loop.call_later(delay, _schedule_flush)
+
+
+async def _flush_reindex(repo_name: str):
+    """Execute pending reindex for a repo."""
+    paths = _reindex_pending.pop(repo_name, [])
+    _reindex_timers.pop(repo_name, None)
+
+    if not paths:
+        return
+
+    # Deduplicate (same file saved twice rapidly)
+    unique_paths = list(dict.fromkeys(paths))
+
+    state = _state
+    if not state:
+        return
+
+    # Respects existing _reindex_lock — won't conflict with full reindex
+    async with _reindex_lock:
+        try:
+            await asyncio.to_thread(
+                state.indexer.reindex_files,
+                paths=unique_paths,
+                repo_configs=state.config.get("repos", {}),
+            )
+        except Exception:
+            logger.error(
+                "reindex_files failed for %d paths", len(unique_paths), exc_info=True,
+            )
+
+
+class ReindexFilesInput(BaseModel):
+    paths: list[str] = Field(
+        min_length=1,
+        description="Absolute paths to files that changed. "
+        "Non-SQL files are silently ignored.",
+    )
+
+
+@mcp.tool(
+    name="reindex_files",
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def reindex_files(params: ReindexFilesInput) -> dict:
+    """Reindex specific files after save. Non-blocking.
+
+    Fast path for on-save reindex. Accepts absolute file paths,
+    resolves to repos, and reindexes only the affected models.
+
+    - Plain SQL files: reindexed in ~50ms
+    - dbt/sqlmesh models: compiled + reindexed in ~2-5s
+
+    Multiple rapid calls are debounced per repo. Returns immediately;
+    reindex runs in background.
+    """
+    state = _state
+    if not state:
+        return {"error": "Server not configured. Call configure() first."}
+
+    sql_files = [p for p in params.paths if is_sql_file(p)]
+    if not sql_files:
+        return {"accepted": 0, "skipped": len(params.paths), "reason": "No SQL files in paths"}
+
+    # Resolve files to repos and group by (repo_name, repo_type)
+    all_repos = state.indexer.graph.get_all_repos()
+    enqueued = 0
+    skipped = 0
+    grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for path in sql_files:
+        resolved = state.indexer._resolve_file_repo(Path(path).resolve(), all_repos)
+        if resolved:
+            repo_id, repo_name, repo_path, repo_type = resolved
+            grouped[(repo_name, repo_type)].append(path)
+            enqueued += 1
+        else:
+            skipped += 1
+
+    for (repo_name, repo_type), paths in grouped.items():
+        await _enqueue_reindex(repo_name, repo_type, paths)
+
+    non_sql_skipped = len(params.paths) - len(sql_files)
+    result: dict = {
+        "accepted": enqueued,
+        "skipped": skipped + non_sql_skipped,
+        "queued_at": datetime.now().isoformat(),
+    }
+    if enqueued > 0:
+        result["note"] = "Reindex queued. Check index_status for progress."
+    else:
+        result["reason"] = "No SQL files matched a configured repo"
+    return result
 
 
 @mcp.tool(
