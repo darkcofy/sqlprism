@@ -167,5 +167,10 @@ def test_serve_merges_all_repo_types(tmp_path):
     assert result.exit_code == 0, f"stdout={result.output}"
     repos = mock_configure.call_args[1]["repos"]
     assert repos["sql_one"] == {"path": str(tmp_path / "sql"), "repo_type": "sql"}
-    assert repos["dbt_one"] == {"path": str(tmp_path / "dbt"), "repo_type": "dbt"}
-    assert repos["sm_one"] == {"path": str(tmp_path / "sm"), "repo_type": "sqlmesh"}
+    # dbt/sqlmesh repos now pass through full config (for reindex_files renderer params)
+    assert repos["dbt_one"]["path"] == str(tmp_path / "dbt")
+    assert repos["dbt_one"]["repo_type"] == "dbt"
+    assert repos["dbt_one"]["project_path"] == str(tmp_path / "dbt")
+    assert repos["sm_one"]["path"] == str(tmp_path / "sm")
+    assert repos["sm_one"]["repo_type"] == "sqlmesh"
+    assert repos["sm_one"]["project_path"] == str(tmp_path / "sm")
