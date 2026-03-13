@@ -184,6 +184,15 @@ class GraphDB:
         with self._write_lock:
             self._execute_write(SCHEMA_SQL)
             self._execute_write(INDEX_SQL)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Run idempotent schema migrations for existing databases."""
+        # v1.0.1: add repo_type column (DuckDB ALTER doesn't support NOT NULL)
+        self._execute_write(
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS "
+            "repo_type TEXT DEFAULT 'sql'"
+        )
 
     def _execute_read(self, sql: str, params=None):
         """Execute a read-only SQL statement.
