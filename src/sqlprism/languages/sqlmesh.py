@@ -22,47 +22,9 @@ from sqlprism.types import ParseResult
 
 logger = logging.getLogger(__name__)
 
-# Inline script that runs inside the sqlmesh project's venv
+# Inline script that runs inside the sqlmesh project's venv.
+# Accepts a model_filter arg (JSON list). Empty list = render all models.
 _RENDER_SCRIPT = textwrap.dedent("""\
-    import json
-    import sys
-    import os
-
-    project_path = sys.argv[1]
-    dialect = sys.argv[2]
-    gateway = sys.argv[3]
-    variables = json.loads(sys.argv[4])
-
-    from sqlmesh import Context
-    from sqlmesh.core.config import (
-        Config, DuckDBConnectionConfig, GatewayConfig, ModelDefaultsConfig,
-    )
-
-    config = Config(
-        model_defaults=ModelDefaultsConfig(dialect=dialect),
-        gateways={gateway: GatewayConfig(connection=DuckDBConnectionConfig())},
-        default_gateway=gateway,
-        variables=variables,
-    )
-
-    context = Context(paths=[project_path], config=config)
-
-    rendered = {}
-    errors = []
-    for model_name in context.models:
-        try:
-            query = context.render(model_name)
-            sql = query.sql(dialect=dialect)
-            if sql:
-                rendered[model_name] = sql
-        except Exception as e:
-            errors.append({"model": model_name, "error": str(e)})
-
-    json.dump({"rendered": rendered, "errors": errors}, sys.stdout)
-""")
-
-# V2 accepts a 5th arg: model_filter (JSON list). Empty list = all models.
-_RENDER_SCRIPT_V2 = textwrap.dedent("""\
     import json
     import sys
     import os
@@ -147,43 +109,16 @@ class SqlMeshRenderer:
         Returns:
             Dict mapping model name -> ParseResult
         """
-        project_path = Path(project_path).resolve()
-
-        # Determine where to run uv from (where .venv lives)
-        if venv_dir:
-            cwd = Path(venv_dir).resolve()
-        else:
-            cwd = find_venv_dir(project_path)
-
-        env = build_env(env_file)
-
-        # Run the render script in the project's venv
-        models, errors = self._run_render_script(
+        return self._render_and_parse(
             project_path=project_path,
-            cwd=cwd,
-            env=env,
-            variables=variables or {},
+            env_file=env_file,
+            variables=variables,
             gateway=gateway,
             dialect=dialect,
             sqlmesh_command=sqlmesh_command,
+            venv_dir=venv_dir,
+            schema_catalog=schema_catalog,
         )
-
-        for err in errors:
-            logger.warning(
-                "sqlmesh render error for model %s: %s",
-                err.get("model", "<unknown>"),
-                err.get("error", "<no message>"),
-            )
-
-        results: dict[str, ParseResult] = {}
-        for model_name, rendered_sql in models.items():
-            clean_name = model_name.strip('"').replace('"."', "/")
-            result = self.sql_parser.parse(clean_name + ".sql", rendered_sql, schema=schema_catalog)
-            enrich_nodes(result, "sqlmesh_model", model_name)
-
-            results[model_name] = result
-
-        return results
 
     def render_models(
         self,
@@ -213,6 +148,31 @@ class SqlMeshRenderer:
         Returns:
             Dict mapping model name -> ParseResult
         """
+        return self._render_and_parse(
+            project_path=project_path,
+            env_file=env_file,
+            variables=variables,
+            gateway=gateway,
+            dialect=dialect,
+            sqlmesh_command=sqlmesh_command,
+            venv_dir=venv_dir,
+            schema_catalog=schema_catalog,
+            model_filter=model_names,
+        )
+
+    def _render_and_parse(
+        self,
+        project_path: str | Path,
+        env_file: str | Path | None,
+        variables: dict[str, str | int] | None,
+        gateway: str,
+        dialect: str,
+        sqlmesh_command: str,
+        venv_dir: str | Path | None,
+        schema_catalog: dict | None,
+        model_filter: list[str] | None = None,
+    ) -> dict[str, ParseResult]:
+        """Shared implementation for render_project and render_models."""
         project_path = Path(project_path).resolve()
 
         if venv_dir:
@@ -230,7 +190,7 @@ class SqlMeshRenderer:
             gateway=gateway,
             dialect=dialect,
             sqlmesh_command=sqlmesh_command,
-            model_filter=model_names,
+            model_filter=model_filter or [],
         )
 
         for err in errors:
@@ -258,26 +218,18 @@ class SqlMeshRenderer:
         gateway: str,
         dialect: str,
         sqlmesh_command: str,
-        model_filter: list[str] | None = None,
+        model_filter: list[str],
     ) -> tuple[dict[str, str], list[dict]]:
         """Run the inline render script via subprocess. Returns ({model_name: sql}, errors)."""
         _validate_command(sqlmesh_command, allowed_keywords={"python", "sqlmesh", "uv"})
-
-        if model_filter is not None:
-            script = _RENDER_SCRIPT_V2
-            extra_args = [json.dumps(model_filter)]
-        else:
-            script = _RENDER_SCRIPT
-            extra_args = []
-
         cmd = shlex.split(sqlmesh_command) + [
             "-c",
-            script,
+            _RENDER_SCRIPT,
             str(project_path),
             dialect,
             gateway,
             json.dumps(variables),
-            *extra_args,
+            json.dumps(model_filter),
         ]
 
         result = subprocess.run(
