@@ -402,10 +402,32 @@ class GraphDB:
             "SELECT n.name FROM nodes n "
             "JOIN files f ON n.file_id = f.file_id "
             "WHERE f.repo_id = ? AND f.path = ? AND n.kind IN ('table', 'view') "
-            "LIMIT 1",
+            "ORDER BY n.kind, n.name LIMIT 1",
             [repo_id, rel_path],
         ).fetchone()
         return row[0] if row else None
+
+    def find_file_paths_by_stem(self, repo_id: int, stem: str) -> list[str]:
+        """Find stored file paths whose filename stem matches.
+
+        Used by dbt/sqlmesh on-save reindex to map filesystem paths
+        (e.g. ``models/orders.sql``) to stored paths that may differ
+        (e.g. ``staging/orders.sql`` for dbt, ``catalog/schema/orders.sql``
+        for sqlmesh).
+
+        Args:
+            repo_id: Repo to search within.
+            stem: Filename stem without extension (e.g. ``"orders"``).
+
+        Returns:
+            List of matching stored file paths.
+        """
+        rows = self._execute_read(
+            "SELECT path FROM files WHERE repo_id = ? "
+            "AND (path = ? OR path LIKE ?)",
+            [repo_id, stem + ".sql", "%/" + stem + ".sql"],
+        ).fetchall()
+        return [r[0] for r in rows]
 
     # ── File management ──
 
