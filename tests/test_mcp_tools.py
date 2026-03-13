@@ -1162,3 +1162,75 @@ def test_reindex_files_waits_for_lock(tmp_path):
 
     asyncio.run(_run())
     assert flush_done
+
+
+def test_debounce_batches_rapid_enqueues(tmp_path):
+    """5 rapid enqueues produce exactly one flush containing all 5 files."""
+    repo_dir = tmp_path / "batch5_repo"
+    repo_dir.mkdir()
+    paths = []
+    for i in range(5):
+        f = repo_dir / f"model_{i}.sql"
+        f.write_text(f"CREATE TABLE t{i} (id INT)")
+        paths.append(str(f))
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    flushed_paths = []
+
+    async def mock_flush(repo_name):
+        flushed_paths.extend(_mcp_mod._reindex_pending.pop(repo_name, []))
+        _mcp_mod._reindex_timers.pop(repo_name, None)
+
+    async def _run():
+        with patch.object(_mcp_mod, "_flush_reindex", side_effect=mock_flush):
+            for p in paths:
+                await _enqueue_reindex("test", "sql", [p])
+
+            assert len(_mcp_mod._reindex_pending["test"]) == 5
+
+            await asyncio.sleep(1.0)
+
+        assert len(flushed_paths) == 5
+        for p in paths:
+            assert p in flushed_paths
+
+    asyncio.run(_run())
+
+
+def test_reindex_concurrent_waits_for_lock(tmp_path):
+    """_flush_reindex waits for _reindex_lock held by a concurrent full reindex."""
+    repo_dir = tmp_path / "concurrent_repo"
+    repo_dir.mkdir()
+    sql_file = repo_dir / "orders.sql"
+    sql_file.write_text("CREATE TABLE orders (id INT)")
+
+    configure(db_path=":memory:", repos={"test": str(repo_dir)})
+
+    from sqlprism.core.mcp_tools import _get_indexer
+
+    indexer = _get_indexer()
+    indexer.reindex_repo("test", str(repo_dir))
+
+    sql_file.write_text("CREATE TABLE orders (id INT, status TEXT)")
+    _mcp_mod._reindex_pending["test"] = [str(sql_file)]
+
+    flush_completed = False
+
+    async def _run():
+        nonlocal flush_completed
+
+        await _mcp_mod._reindex_lock.acquire()
+
+        flush_task = asyncio.create_task(_flush_reindex("test"))
+
+        await asyncio.sleep(0.2)
+        assert not flush_task.done(), "flush should be blocked waiting for the lock"
+
+        _mcp_mod._reindex_lock.release()
+
+        await asyncio.wait_for(flush_task, timeout=5.0)
+        flush_completed = True
+
+    asyncio.run(_run())
+    assert flush_completed
