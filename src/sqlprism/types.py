@@ -135,6 +135,37 @@ class ColumnLineageResult:
     chain: list[LineageHop] = field(default_factory=list)  # ordered hops from output → source
 
 
+@dataclass(frozen=True)
+class ColumnDefResult:
+    """Column definition metadata extracted from SQL or schema files.
+
+    Records column-level metadata for tables and views, including the
+    column's data type, ordinal position, provenance, and optional
+    description. Parsers emit these alongside nodes and edges so the
+    indexer can build a column-level catalogue.
+
+    Attributes:
+        node_name: The table or view this column belongs to.
+        column_name: Column name as declared.
+        data_type: SQL data type (e.g. ``"VARCHAR"``, ``"INT"``), or ``None``
+            if unknown.
+        position: Ordinal position in the column list (0-based), or ``None``
+            if unavailable.
+        source: How this column was discovered. One of ``"definition"``
+            (from CREATE/ALTER DDL), ``"inferred"`` (from SELECT output),
+            ``"schema_yml"`` (from dbt schema.yml), ``"sqlmesh_schema"``
+            (from sqlmesh model schema).
+        description: Human-readable column description, or ``None``.
+    """
+
+    node_name: str
+    column_name: str
+    data_type: str | None = None
+    position: int | None = None
+    source: str = "definition"
+    description: str | None = None
+
+
 def parse_repo_config(
     cfg: str | dict,
     global_dialect: str | None = None,
@@ -179,6 +210,7 @@ class ParseResult:
         edges: Relationships between entities.
         column_usage: Column-level usage records (SQL only).
         column_lineage: End-to-end column lineage chains (SQL only).
+        columns: Column definitions extracted from DDL or schema files.
         errors: Non-fatal parse errors encountered during processing.
     """
 
@@ -187,4 +219,5 @@ class ParseResult:
     edges: list[EdgeResult] = field(default_factory=list)
     column_usage: list[ColumnUsageResult] = field(default_factory=list)
     column_lineage: list[ColumnLineageResult] = field(default_factory=list)
+    columns: list[ColumnDefResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
