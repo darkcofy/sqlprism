@@ -30,8 +30,9 @@
               │                    │  │ (sqlmesh.py) │ │                   │
               │  sqlglot AST →     │  │              │ │ dbt compile →     │
               │  nodes, edges,     │  │ subprocess → │ │ subprocess →      │
-              │  column_usage,     │  │ render all   │ │ read compiled/    │
-              │  column_lineage    │  │ models →     │ │ models →          │
+              │  column_usage,     │  │ render all/  │ │ read compiled/    │
+              │  column_lineage    │  │ selected     │ │ all or --select   │
+              │                    │  │ models →     │ │ models →          │
               │                    │  │ SqlParser    │ │ SqlParser         │
               └────────┬───────────┘  └──────┬───────┘ └┬──────────────────┘
                        │                     │          │
@@ -117,9 +118,11 @@ The orchestrator for all indexing operations:
 1. **`reindex_repo`**: Scan directory → checksum → parse changed files → store results
 2. **`reindex_sqlmesh`**: Render via subprocess → parse rendered SQL → store results
 3. **`reindex_dbt`**: Compile via subprocess → parse compiled SQL → store results
+4. **`reindex_files`**: Resolve files to repos → dispatch by repo type (SQL/dbt/sqlmesh) → selective reindex
 
 The indexer also handles:
 
+- File-to-repo resolution (matching file paths to configured repos, picking deepest match for nested repos)
 - File-level deletion (cleans up old data before inserting new)
 - Edge resolution (matching edge target names to actual node IDs)
 - Git metadata (storing current commit and branch per repo)
@@ -182,4 +185,20 @@ reindex (MCP tool, non-blocking)
   │         └─ update _reindex_status on completion/failure
   ├─ Return immediately: {"status": "started"}
   └─ Queries continue serving via MVCC snapshots
+
+reindex_files (MCP tool, on-save fast path)
+  │
+  ├─ Filter to SQL files only
+  ├─ Resolve each file → (repo_name, repo_type) via _resolve_file_repo
+  ├─ Enqueue per repo with debounce:
+  │    ├─ SQL repos: 500ms debounce window
+  │    └─ dbt/sqlmesh repos: 2s debounce window
+  ├─ Return immediately: {"accepted": N}
+  └─ On debounce timer fire (_flush_reindex):
+       ├─ Deduplicate accumulated paths
+       ├─ Acquire _reindex_lock (waits if full reindex running)
+       └─ indexer.reindex_files(paths)
+            ├─ SQL: read → parse → atomic insert (~50ms)
+            ├─ dbt: dbt compile --select model → parse → insert (~2-5s)
+            └─ sqlmesh: render with model filter → parse → insert (~2-5s)
 ```

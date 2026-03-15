@@ -15,16 +15,16 @@ SQL knowledge graph MCP server — indexes SQL, dbt, and sqlmesh repos into a Du
 ```
 src/sqlprism/
   core/
-    graph.py       — DuckDB storage layer (only module that touches DB)
-    indexer.py      — Orchestrates parsing + indexing across repos
-    mcp_tools.py   — MCP server tools (query, reindex, pr_impact)
+    graph.py       — DuckDB storage layer (MVCC, repo_type tracking)
+    indexer.py      — Orchestrates parsing + indexing; file-level reindex with repo-type dispatch
+    mcp_tools.py   — MCP server tools (11 tools, non-blocking reindex, per-repo debounce)
   languages/
     sql.py         — sqlglot-based SQL parser
-    dbt.py         — dbt renderer (compile → parse)
-    sqlmesh.py     — sqlmesh renderer (render → parse)
+    dbt.py         — dbt renderer (full project + selective render_models)
+    sqlmesh.py     — sqlmesh renderer (full project + selective render_models)
     utils.py       — Shared venv/env utilities
   types.py         — Data classes (ParseResult, NodeResult, etc.)
-  cli.py           — Click CLI entry point
+  cli.py           — Click CLI (serve, reindex, reindex-file, reindex-sqlmesh, reindex-dbt, status, init)
 tests/
   test_indexer.py  — Indexer + integration tests
   test_renderers.py — dbt/sqlmesh renderer tests
