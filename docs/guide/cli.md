@@ -34,7 +34,7 @@ sqlprism status [--config PATH] [--db PATH]
 
 ### `sqlprism serve`
 
-Starts the MCP server, exposing all 10 tools to any MCP client.
+Starts the MCP server, exposing all 11 tools to any MCP client.
 
 ```bash
 sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable_http] [--port 8000]
@@ -48,6 +48,30 @@ sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable_http] [
 | `--db` | From config | Path to DuckDB file. Overrides `db_path` in config. |
 
 ## Indexing Commands
+
+### `sqlprism reindex-file`
+
+Reindex specific files (fast on-save path). Works standalone without a running MCP server. Resolves each file to its repo, determines the repo type (plain SQL, dbt, sqlmesh), and reindexes accordingly.
+
+```bash
+sqlprism reindex-file /path/to/model.sql [/path/to/another.sql ...]
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `PATHS` | Yes | One or more file paths to reindex (positional). |
+| `--config` | No | Path to config file. Default: `~/.sqlprism/config.json`. |
+| `--db` | No | Path to DuckDB file. Overrides config. |
+
+**Editor integration (non-MCP):**
+```bash
+# Vim/Neovim
+autocmd BufWritePost *.sql silent !sqlprism reindex-file %:p
+
+# Emacs — add to after-save-hook
+```
+
+**Output:** `reindexed=N, skipped=M, deleted=K`
 
 ### `sqlprism reindex`
 
