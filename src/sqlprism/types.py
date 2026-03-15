@@ -7,6 +7,7 @@ does language-specific parsing.
 """
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -162,7 +163,7 @@ class ColumnDefResult:
     column_name: str
     data_type: str | None = None
     position: int | None = None
-    source: str = "definition"
+    source: Literal["definition", "inferred", "schema_yml", "sqlmesh_schema"] = "definition"
     description: str | None = None
 
 
