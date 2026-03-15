@@ -17,6 +17,7 @@ from sqlglot.optimizer.qualify_columns import qualify_columns
 from sqlglot.optimizer.scope import build_scope
 
 from sqlprism.types import (
+    ColumnDefResult,
     ColumnLineageResult,
     ColumnUsageResult,
     EdgeResult,
@@ -71,6 +72,7 @@ class SqlParser:
         edges: list[EdgeResult] = []
         column_usage: list[ColumnUsageResult] = []
         column_lineage: list[ColumnLineageResult] = []
+        columns: list[ColumnDefResult] = []
         errors: list[str] = []
 
         file_stem = Path(file_path).stem
@@ -96,6 +98,7 @@ class SqlParser:
                     nodes,
                     edges,
                     column_usage,
+                    columns,
                     seen_nodes=seen_nodes,
                     seen_ctes=seen_ctes,
                 )
@@ -116,6 +119,7 @@ class SqlParser:
             edges=edges,
             column_usage=column_usage,
             column_lineage=column_lineage,
+            columns=columns,
             errors=errors,
         )
 
@@ -127,10 +131,13 @@ class SqlParser:
         nodes: list[NodeResult],
         edges: list[EdgeResult],
         column_usage: list[ColumnUsageResult],
+        columns: list[ColumnDefResult] | None = None,
         seen_nodes: set[tuple[str, str, str | None]] | None = None,
         seen_ctes: set[str] | None = None,
     ) -> None:
         """Process a single SQL statement."""
+        if columns is None:
+            columns = []
         # Use persistent dedup sets across statements, or create fresh ones
         if seen_nodes is None:
             seen_nodes = {(n.name, n.kind, (n.metadata or {}).get("schema")) for n in nodes}
@@ -138,7 +145,7 @@ class SqlParser:
 
         # CREATE TABLE / CREATE VIEW
         if isinstance(stmt, exp.Create):
-            self._process_create(stmt, file_stem, nodes, edges)
+            self._process_create(stmt, file_stem, nodes, edges, columns)
 
         # Extract table references from any statement type
         self._extract_table_references(stmt, file_stem, nodes, edges, seen_nodes, seen_edges)
@@ -159,6 +166,7 @@ class SqlParser:
         file_stem: str,
         nodes: list[NodeResult],
         edges: list[EdgeResult],
+        columns: list[ColumnDefResult] | None = None,
     ) -> None:
         """Handle CREATE TABLE / CREATE VIEW statements."""
         kind_expr = stmt.args.get("kind")
@@ -167,13 +175,14 @@ class SqlParser:
 
         kind_str = kind_expr.upper() if isinstance(kind_expr, str) else str(kind_expr).upper()
 
+        # Unwrap Schema -> Table if needed
         table_expr = stmt.this
+        schema_expr = None
+        if isinstance(table_expr, exp.Schema):
+            schema_expr = table_expr
+            table_expr = table_expr.this
         if not isinstance(table_expr, exp.Table):
-            # Could be a Schema wrapping a Table
-            if isinstance(table_expr, exp.Schema):
-                table_expr = table_expr.this
-            if not isinstance(table_expr, exp.Table):
-                return
+            return
 
         name = self._normalize_identifier(table_expr.name, self._is_quoted_identifier(table_expr))
         if not name:
@@ -202,6 +211,67 @@ class SqlParser:
                 context="CREATE statement",
             )
         )
+
+        if columns is None:
+            return
+
+        # Extract column definitions from CREATE TABLE (ColumnDef nodes)
+        if schema_expr is not None and schema_expr.expressions:
+            for i, col_expr in enumerate(schema_expr.expressions):
+                if isinstance(col_expr, exp.ColumnDef):
+                    col_name = col_expr.this.name if col_expr.this else None
+                    if not col_name:
+                        continue
+                    col_type = col_expr.kind.sql(dialect=self.dialect) if col_expr.kind else None
+                    columns.append(
+                        ColumnDefResult(
+                            node_name=name,
+                            column_name=col_name,
+                            data_type=col_type,
+                            position=i,
+                            source="definition",
+                        )
+                    )
+
+        # Infer output columns from CREATE VIEW AS SELECT
+        if node_kind == "view" and stmt.expression:
+            select_expr = stmt.expression
+            if isinstance(select_expr, exp.Select) or isinstance(select_expr, exp.Query):
+                self._extract_inferred_columns(select_expr, name, columns)
+
+    def _extract_inferred_columns(
+        self,
+        select_expr: exp.Expression,
+        node_name: str,
+        columns: list[ColumnDefResult],
+    ) -> None:
+        """Infer output column names from a SELECT expression."""
+        # Find the outermost SELECT
+        select = select_expr.find(exp.Select) if not isinstance(select_expr, exp.Select) else select_expr
+        if not select or not select.expressions:
+            return
+
+        for i, sel_col in enumerate(select.expressions):
+            # Use alias if present, otherwise try to get column name
+            if isinstance(sel_col, exp.Alias):
+                col_name = sel_col.alias
+            elif isinstance(sel_col, exp.Column):
+                col_name = sel_col.name
+            elif isinstance(sel_col, exp.Star):
+                continue  # can't infer from *
+            else:
+                # Try alias_or_name for other expression types
+                col_name = sel_col.alias_or_name if hasattr(sel_col, "alias_or_name") else None
+
+            if col_name and col_name != "*":
+                columns.append(
+                    ColumnDefResult(
+                        node_name=node_name,
+                        column_name=col_name,
+                        position=i,
+                        source="inferred",
+                    )
+                )
 
     def _extract_table_references(
         self,
