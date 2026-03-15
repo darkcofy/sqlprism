@@ -123,6 +123,19 @@ CREATE TABLE IF NOT EXISTS column_lineage (
     hop_expression  TEXT
 );
 
+CREATE SEQUENCE IF NOT EXISTS seq_column_id START 1;
+
+CREATE TABLE IF NOT EXISTS columns (
+    column_id   INTEGER PRIMARY KEY DEFAULT nextval('seq_column_id'),
+    node_id     INTEGER NOT NULL,
+    column_name TEXT NOT NULL,
+    data_type   TEXT,
+    position    INTEGER,
+    source      TEXT NOT NULL,
+    description TEXT,
+    UNIQUE(node_id, column_name)
+);
+
 """
 
 INDEX_SQL = """
@@ -141,6 +154,8 @@ CREATE INDEX IF NOT EXISTS idx_lineage_output ON column_lineage(output_node, out
 CREATE INDEX IF NOT EXISTS idx_lineage_hop ON column_lineage(hop_table, hop_column);
 CREATE INDEX IF NOT EXISTS idx_lineage_file ON column_lineage(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_schema ON nodes(schema);
+CREATE INDEX IF NOT EXISTS idx_columns_node ON columns(node_id);
+CREATE INDEX IF NOT EXISTS idx_columns_name ON columns(column_name);
 """
 
 
@@ -826,6 +841,30 @@ class GraphDB:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+
+    # ── Columns (schema-level) ──
+
+    def insert_columns_batch(self, rows: list[tuple]) -> int:
+        """Batch insert/upsert column definitions.
+
+        Args:
+            rows: List of tuples, each containing
+                ``(node_id, column_name, data_type, position, source,
+                description)``.
+
+        Returns:
+            Number of rows inserted.
+        """
+        if not rows:
+            return 0
+        with self._write_lock:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO columns "
+                "(node_id, column_name, data_type, position, source, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        return len(rows)
 
     # ── Column usage ──
 
