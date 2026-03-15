@@ -4,7 +4,7 @@ import os
 import tempfile
 import threading
 
-from sqlprism.core.graph import GraphDB, _read_file_lines
+from sqlprism.core.graph import INDEX_SQL, SCHEMA_SQL, GraphDB, _read_file_lines
 
 
 def test_init_creates_schema():
@@ -1048,4 +1048,123 @@ def test_cleanup_phantoms_removes_phantom_only_referenced_by_phantoms():
     # or was already identified as stale/orphaned)
     row_c = db._execute_read("SELECT node_id FROM nodes WHERE node_id = ?", [phantom_c_id]).fetchone()
     assert row_c is None, "phantom_c should be deleted (no real inbound edges)"
+    db.close()
+
+
+# ── v1.1: columns table ──
+
+
+def test_columns_table_created_fresh_db():
+    """columns table exists with correct structure on a fresh database."""
+    db = GraphDB()
+    cols = db.conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'columns' ORDER BY ordinal_position"
+    ).fetchall()
+    col_names = [c[0] for c in cols]
+    assert "column_id" in col_names
+    assert "node_id" in col_names
+    assert "column_name" in col_names
+    assert "data_type" in col_names
+    assert "position" in col_names
+    assert "source" in col_names
+    assert "description" in col_names
+
+    # Verify sequence exists by using it
+    seq_val = db.conn.execute("SELECT nextval('seq_column_id')").fetchone()[0]
+    assert seq_val >= 1
+
+    # Verify indexes exist
+    indexes = db.conn.execute(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'columns'"
+    ).fetchall()
+    idx_names = {r[0] for r in indexes}
+    assert "idx_columns_node" in idx_names
+    assert "idx_columns_name" in idx_names
+    db.close()
+
+
+def test_columns_table_migration_existing_db():
+    """columns table is created on an existing DB without affecting other tables."""
+    db = GraphDB()
+    # Insert data into existing tables
+    repo_id = db.upsert_repo("migration-test", "/tmp/migration")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Re-init (simulates opening an existing DB with new schema)
+    db.conn.execute(SCHEMA_SQL)
+    db.conn.execute(INDEX_SQL)
+
+    # Existing data should be intact
+    found = db.resolve_node("orders", "table", repo_id)
+    assert found == node_id
+
+    # columns table should exist
+    count = db.conn.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'columns'"
+    ).fetchone()[0]
+    assert count == 1
+    db.close()
+
+
+def test_columns_migration_idempotent():
+    """Running schema creation twice does not error or lose data."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Insert column data
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+        (node_id, "status", "TEXT", 1, "definition", "Order status"),
+    ])
+
+    # Re-run schema (idempotent)
+    db.conn.execute(SCHEMA_SQL)
+    db.conn.execute(INDEX_SQL)
+
+    # Column data should be preserved
+    rows = db.conn.execute(
+        "SELECT column_name, data_type FROM columns WHERE node_id = ? ORDER BY position",
+        [node_id],
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0] == ("order_id", "INT")
+    assert rows[1] == ("status", "TEXT")
+    db.close()
+
+
+def test_insert_columns_batch_upsert():
+    """insert_columns_batch upserts on (node_id, column_name) conflict."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Initial insert
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    # Upsert with new description
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "schema_yml", "Primary key"),
+    ])
+
+    rows = db.conn.execute(
+        "SELECT source, description FROM columns WHERE node_id = ? AND column_name = 'order_id'",
+        [node_id],
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0] == ("schema_yml", "Primary key")
+    db.close()
+
+
+def test_insert_columns_batch_empty():
+    """insert_columns_batch with empty list returns 0."""
+    db = GraphDB()
+    count = db.insert_columns_batch([])
+    assert count == 0
     db.close()

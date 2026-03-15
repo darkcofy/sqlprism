@@ -859,9 +859,12 @@ class GraphDB:
             return 0
         with self._write_lock:
             self.conn.executemany(
-                "INSERT OR REPLACE INTO columns "
+                "INSERT INTO columns "
                 "(node_id, column_name, data_type, position, source, description) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (node_id, column_name) DO UPDATE SET "
+                "data_type = EXCLUDED.data_type, position = EXCLUDED.position, "
+                "source = EXCLUDED.source, description = EXCLUDED.description",
                 rows,
             )
         return len(rows)
