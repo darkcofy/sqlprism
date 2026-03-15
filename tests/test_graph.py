@@ -1168,3 +1168,97 @@ def test_insert_columns_batch_empty():
     count = db.insert_columns_batch([])
     assert count == 0
     db.close()
+
+
+def test_delete_repo_cascades_columns():
+    """delete_repo removes column definitions for the repo's nodes."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+        (node_id, "status", "TEXT", 1, "definition", None),
+    ])
+
+    # Verify columns exist
+    count = db.conn.execute("SELECT COUNT(*) FROM columns").fetchone()[0]
+    assert count == 2
+
+    db.delete_repo(repo_id)
+
+    # Columns should be gone
+    count = db.conn.execute("SELECT COUNT(*) FROM columns").fetchone()[0]
+    assert count == 0
+    db.close()
+
+
+def test_delete_file_data_cascades_columns():
+    """delete_file_data removes column definitions for the file's nodes."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    db.delete_file_data(repo_id, "query.sql")
+
+    count = db.conn.execute("SELECT COUNT(*) FROM columns").fetchone()[0]
+    assert count == 0
+    db.close()
+
+
+def test_insert_columns_batch_coalesce_description():
+    """Upsert preserves existing description when new value is NULL."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # First insert with description from schema_yml
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "schema_yml", "Primary key"),
+    ])
+
+    # Re-insert from DDL parse (no description)
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    row = db.conn.execute(
+        "SELECT source, description FROM columns WHERE node_id = ? AND column_name = 'order_id'",
+        [node_id],
+    ).fetchone()
+    # Source updates (definition wins), but description is preserved via COALESCE
+    assert row[0] == "definition"
+    assert row[1] == "Primary key"
+    db.close()
+
+
+def test_insert_columns_batch_coalesce_data_type():
+    """Upsert preserves existing data_type when new value is NULL."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # First insert with type from DDL
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    # Re-insert from inferred source (no type)
+    db.insert_columns_batch([
+        (node_id, "order_id", None, 0, "inferred", None),
+    ])
+
+    row = db.conn.execute(
+        "SELECT data_type, source FROM columns WHERE node_id = ? AND column_name = 'order_id'",
+        [node_id],
+    ).fetchone()
+    # data_type preserved via COALESCE, source updates
+    assert row[0] == "INT"
+    assert row[1] == "inferred"
+    db.close()

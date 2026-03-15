@@ -370,6 +370,13 @@ class GraphDB:
             "DELETE FROM column_usage WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ?)",
             [repo_id],
         )
+        # Delete columns for all nodes in repo's files
+        self._execute_write(
+            "DELETE FROM columns WHERE node_id IN "
+            "(SELECT node_id FROM nodes WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?))",
+            [repo_id],
+        )
         # Delete edges referencing repo's nodes
         self._execute_write(
             "DELETE FROM edges WHERE source_id IN "
@@ -476,6 +483,10 @@ class GraphDB:
 
         self._execute_write("DELETE FROM column_lineage WHERE file_id = ?", [file_id])
         self._execute_write("DELETE FROM column_usage WHERE file_id = ?", [file_id])
+        self._execute_write(
+            "DELETE FROM columns WHERE node_id IN (SELECT node_id FROM nodes WHERE file_id = ?)",
+            [file_id],
+        )
 
         # Delete edges where source is in this file's nodes (outbound from this file)
         self._execute_write(
@@ -853,7 +864,7 @@ class GraphDB:
                 description)``.
 
         Returns:
-            Number of rows inserted.
+            Number of rows processed (inserts + upserts).
         """
         if not rows:
             return 0
@@ -863,8 +874,10 @@ class GraphDB:
                 "(node_id, column_name, data_type, position, source, description) "
                 "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (node_id, column_name) DO UPDATE SET "
-                "data_type = EXCLUDED.data_type, position = EXCLUDED.position, "
-                "source = EXCLUDED.source, description = EXCLUDED.description",
+                "data_type = COALESCE(EXCLUDED.data_type, columns.data_type), "
+                "position = COALESCE(EXCLUDED.position, columns.position), "
+                "source = EXCLUDED.source, "
+                "description = COALESCE(EXCLUDED.description, columns.description)",
                 rows,
             )
         return len(rows)
