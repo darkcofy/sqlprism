@@ -1329,3 +1329,95 @@ def test_union_lineage_different_column_names_all_branches():
                 a_sources.add((hop.table, hop.column))
     assert ("t1", "a") in a_sources, "output 'a' should trace back to t1.a"
     assert ("t2", "b") in a_sources, "output 'a' should also trace back to t2.b (second branch)"
+
+
+# ── v1.1: Column extraction from DDL / SELECT ──
+
+
+def test_extract_columns_create_table():
+    """CREATE TABLE with typed columns produces ColumnDefResult entries."""
+    parser = SqlParser()
+    result = parser.parse(
+        "orders.sql",
+        "CREATE TABLE orders (order_id INT, status TEXT, amount DECIMAL(10,2))",
+    )
+    assert len(result.columns) == 3
+    assert result.columns[0].node_name == "orders"
+    assert result.columns[0].column_name == "order_id"
+    assert result.columns[0].data_type is not None
+    assert "INT" in result.columns[0].data_type.upper()
+    assert result.columns[0].position == 0
+    assert result.columns[0].source == "definition"
+
+    assert result.columns[1].column_name == "status"
+    assert result.columns[2].column_name == "amount"
+    assert result.columns[2].position == 2
+
+
+def test_extract_columns_snowflake_ddl():
+    """Snowflake-style DDL preserves column types."""
+    parser = SqlParser(dialect="snowflake")
+    result = parser.parse(
+        "orders.sql",
+        "CREATE TABLE IF NOT EXISTS db.schema.orders (id NUMBER, name VARCHAR(255))",
+    )
+    cols = result.columns
+    assert len(cols) == 2
+    assert cols[0].column_name == "id"
+    assert cols[1].column_name == "name"
+    # Types should be preserved
+    assert cols[0].data_type is not None
+    assert cols[1].data_type is not None
+
+
+def test_extract_columns_bigquery_ddl():
+    """BigQuery-style DDL preserves column types."""
+    parser = SqlParser(dialect="bigquery")
+    result = parser.parse(
+        "orders.sql",
+        "CREATE TABLE dataset.orders (id INT64, name STRING, ts TIMESTAMP)",
+    )
+    cols = result.columns
+    assert len(cols) == 3
+    assert cols[0].column_name == "id"
+    assert cols[1].column_name == "name"
+    assert cols[2].column_name == "ts"
+
+
+def test_extract_columns_create_view_select():
+    """CREATE VIEW with SELECT output columns produces inferred ColumnDefResult entries."""
+    parser = SqlParser()
+    result = parser.parse(
+        "v_orders.sql",
+        "CREATE VIEW v_orders AS SELECT o.order_id, o.status, SUM(amount) AS total FROM orders o GROUP BY 1, 2",
+    )
+    inferred = [c for c in result.columns if c.source == "inferred"]
+    assert len(inferred) == 3
+    col_names = [c.column_name for c in inferred]
+    assert "order_id" in col_names
+    assert "status" in col_names
+    assert "total" in col_names  # alias used
+
+
+def test_extract_columns_ctas_no_defs():
+    """CTAS with no column definitions produces no 'definition' source columns."""
+    parser = SqlParser()
+    result = parser.parse(
+        "new_orders.sql",
+        "CREATE TABLE new_orders AS SELECT * FROM orders",
+    )
+    definition_cols = [c for c in result.columns if c.source == "definition"]
+    assert len(definition_cols) == 0
+
+
+def test_extract_columns_cte_output():
+    """CTE columns are tracked via column_usage; final SELECT inferred for views."""
+    parser = SqlParser()
+    result = parser.parse(
+        "cte_view.sql",
+        "CREATE VIEW cte_view AS WITH cte AS (SELECT a, b FROM t) SELECT a, b FROM cte",
+    )
+    inferred = [c for c in result.columns if c.source == "inferred"]
+    col_names = [c.column_name for c in inferred]
+    assert "a" in col_names
+    assert "b" in col_names
