@@ -123,6 +123,19 @@ CREATE TABLE IF NOT EXISTS column_lineage (
     hop_expression  TEXT
 );
 
+CREATE SEQUENCE IF NOT EXISTS seq_column_id START 1;
+
+CREATE TABLE IF NOT EXISTS columns (
+    column_id   INTEGER PRIMARY KEY DEFAULT nextval('seq_column_id'),
+    node_id     INTEGER NOT NULL,
+    column_name TEXT NOT NULL,
+    data_type   TEXT,
+    position    INTEGER,
+    source      TEXT NOT NULL,
+    description TEXT,
+    UNIQUE(node_id, column_name)
+);
+
 """
 
 INDEX_SQL = """
@@ -141,6 +154,8 @@ CREATE INDEX IF NOT EXISTS idx_lineage_output ON column_lineage(output_node, out
 CREATE INDEX IF NOT EXISTS idx_lineage_hop ON column_lineage(hop_table, hop_column);
 CREATE INDEX IF NOT EXISTS idx_lineage_file ON column_lineage(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_schema ON nodes(schema);
+CREATE INDEX IF NOT EXISTS idx_columns_node ON columns(node_id);
+CREATE INDEX IF NOT EXISTS idx_columns_name ON columns(column_name);
 """
 
 
@@ -355,6 +370,13 @@ class GraphDB:
             "DELETE FROM column_usage WHERE file_id IN (SELECT file_id FROM files WHERE repo_id = ?)",
             [repo_id],
         )
+        # Delete columns for all nodes in repo's files
+        self._execute_write(
+            "DELETE FROM columns WHERE node_id IN "
+            "(SELECT node_id FROM nodes WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?))",
+            [repo_id],
+        )
         # Delete edges referencing repo's nodes
         self._execute_write(
             "DELETE FROM edges WHERE source_id IN "
@@ -461,6 +483,10 @@ class GraphDB:
 
         self._execute_write("DELETE FROM column_lineage WHERE file_id = ?", [file_id])
         self._execute_write("DELETE FROM column_usage WHERE file_id = ?", [file_id])
+        self._execute_write(
+            "DELETE FROM columns WHERE node_id IN (SELECT node_id FROM nodes WHERE file_id = ?)",
+            [file_id],
+        )
 
         # Delete edges where source is in this file's nodes (outbound from this file)
         self._execute_write(
@@ -826,6 +852,35 @@ class GraphDB:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+
+    # ── Columns (schema-level) ──
+
+    def insert_columns_batch(self, rows: list[tuple]) -> int:
+        """Batch insert/upsert column definitions.
+
+        Args:
+            rows: List of tuples, each containing
+                ``(node_id, column_name, data_type, position, source,
+                description)``.
+
+        Returns:
+            Number of rows processed (inserts + upserts).
+        """
+        if not rows:
+            return 0
+        with self._write_lock:
+            self.conn.executemany(
+                "INSERT INTO columns "
+                "(node_id, column_name, data_type, position, source, description) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (node_id, column_name) DO UPDATE SET "
+                "data_type = COALESCE(EXCLUDED.data_type, columns.data_type), "
+                "position = COALESCE(EXCLUDED.position, columns.position), "
+                "source = EXCLUDED.source, "
+                "description = COALESCE(EXCLUDED.description, columns.description)",
+                rows,
+            )
+        return len(rows)
 
     # ── Column usage ──
 

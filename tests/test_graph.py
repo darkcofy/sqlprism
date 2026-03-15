@@ -4,7 +4,7 @@ import os
 import tempfile
 import threading
 
-from sqlprism.core.graph import GraphDB, _read_file_lines
+from sqlprism.core.graph import INDEX_SQL, SCHEMA_SQL, GraphDB, _read_file_lines
 
 
 def test_init_creates_schema():
@@ -1048,4 +1048,223 @@ def test_cleanup_phantoms_removes_phantom_only_referenced_by_phantoms():
     # or was already identified as stale/orphaned)
     row_c = db._execute_read("SELECT node_id FROM nodes WHERE node_id = ?", [phantom_c_id]).fetchone()
     assert row_c is None, "phantom_c should be deleted (no real inbound edges)"
+    db.close()
+
+
+# ── v1.1: columns table ──
+
+
+def test_columns_table_created_fresh_db():
+    """columns table exists with correct structure on a fresh database."""
+    db = GraphDB()
+    cols = db._execute_read(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'columns' ORDER BY ordinal_position"
+    ).fetchall()
+    col_names = [c[0] for c in cols]
+    assert "column_id" in col_names
+    assert "node_id" in col_names
+    assert "column_name" in col_names
+    assert "data_type" in col_names
+    assert "position" in col_names
+    assert "source" in col_names
+    assert "description" in col_names
+
+    # Verify sequence exists via catalog
+    seq = db._execute_read(
+        "SELECT sequence_name FROM duckdb_sequences() WHERE sequence_name = 'seq_column_id'"
+    ).fetchone()
+    assert seq is not None
+
+    # Verify indexes exist
+    indexes = db._execute_read(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'columns'"
+    ).fetchall()
+    idx_names = {r[0] for r in indexes}
+    assert "idx_columns_node" in idx_names
+    assert "idx_columns_name" in idx_names
+    db.close()
+
+
+def test_columns_table_migration_existing_db():
+    """columns table is created on an existing DB without affecting other tables."""
+    db = GraphDB()
+    # Insert data into all existing tables
+    repo_id = db.upsert_repo("migration-test", "/tmp/migration")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+    node_id2 = db.insert_node(file_id, "query", "my_query", "sql")
+    db.insert_edge(node_id2, node_id, "references", "FROM clause")
+
+    # Re-init (simulates opening an existing DB with new schema)
+    db.conn.execute(SCHEMA_SQL)
+    db.conn.execute(INDEX_SQL)
+
+    # All existing data should be intact across all tables
+    assert db.resolve_node("orders", "table", repo_id) == node_id
+    assert db._execute_read("SELECT COUNT(*) FROM repos").fetchone()[0] >= 1
+    assert db._execute_read("SELECT COUNT(*) FROM files").fetchone()[0] >= 1
+    assert db._execute_read("SELECT COUNT(*) FROM edges").fetchone()[0] >= 1
+
+    # columns table should exist
+    count = db._execute_read(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'columns'"
+    ).fetchone()[0]
+    assert count == 1
+    db.close()
+
+
+def test_columns_migration_idempotent():
+    """Running schema creation twice does not error or lose data."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Insert column data
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+        (node_id, "status", "TEXT", 1, "definition", "Order status"),
+    ])
+
+    # Re-run schema (idempotent)
+    db.conn.execute(SCHEMA_SQL)
+    db.conn.execute(INDEX_SQL)
+
+    # Column data should be preserved
+    rows = db.conn.execute(
+        "SELECT column_name, data_type FROM columns WHERE node_id = ? ORDER BY position",
+        [node_id],
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0] == ("order_id", "INT")
+    assert rows[1] == ("status", "TEXT")
+    db.close()
+
+
+def test_insert_columns_batch_upsert():
+    """insert_columns_batch upserts on (node_id, column_name) conflict."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Initial insert
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    # Upsert with new description
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "schema_yml", "Primary key"),
+    ])
+
+    rows = db.conn.execute(
+        "SELECT source, description FROM columns WHERE node_id = ? AND column_name = 'order_id'",
+        [node_id],
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0] == ("schema_yml", "Primary key")
+    db.close()
+
+
+def test_insert_columns_batch_empty():
+    """insert_columns_batch with empty list returns 0."""
+    db = GraphDB()
+    count = db.insert_columns_batch([])
+    assert count == 0
+    db.close()
+
+
+def test_delete_repo_cascades_columns():
+    """delete_repo removes column definitions for the repo's nodes."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+        (node_id, "status", "TEXT", 1, "definition", None),
+    ])
+
+    # Verify columns exist
+    count = db.conn.execute("SELECT COUNT(*) FROM columns").fetchone()[0]
+    assert count == 2
+
+    db.delete_repo(repo_id)
+
+    # Columns should be gone
+    count = db.conn.execute("SELECT COUNT(*) FROM columns").fetchone()[0]
+    assert count == 0
+    db.close()
+
+
+def test_delete_file_data_cascades_columns():
+    """delete_file_data removes column definitions for the file's nodes."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    db.delete_file_data(repo_id, "query.sql")
+
+    count = db.conn.execute("SELECT COUNT(*) FROM columns").fetchone()[0]
+    assert count == 0
+    db.close()
+
+
+def test_insert_columns_batch_coalesce_description():
+    """Upsert preserves existing description when new value is NULL."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # First insert with description from schema_yml
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "schema_yml", "Primary key"),
+    ])
+
+    # Re-insert from DDL parse (no description)
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    row = db.conn.execute(
+        "SELECT source, description FROM columns WHERE node_id = ? AND column_name = 'order_id'",
+        [node_id],
+    ).fetchone()
+    # Source updates (definition wins), but description is preserved via COALESCE
+    assert row[0] == "definition"
+    assert row[1] == "Primary key"
+    db.close()
+
+
+def test_insert_columns_batch_coalesce_data_type():
+    """Upsert preserves existing data_type when new value is NULL."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # First insert with type from DDL
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+    ])
+
+    # Re-insert from inferred source (no type)
+    db.insert_columns_batch([
+        (node_id, "order_id", None, 0, "inferred", None),
+    ])
+
+    row = db.conn.execute(
+        "SELECT data_type, source FROM columns WHERE node_id = ? AND column_name = 'order_id'",
+        [node_id],
+    ).fetchone()
+    # data_type preserved via COALESCE, source updates
+    assert row[0] == "INT"
+    assert row[1] == "inferred"
     db.close()
