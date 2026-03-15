@@ -1,6 +1,6 @@
 # MCP Tools
 
-When running as an MCP server (`sqlprism serve`), 10 tools are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
+When running as an MCP server (`sqlprism serve`), 11 tools are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
 
 ## Query Tools
 
@@ -104,6 +104,16 @@ This tells reviewers what *net-new risk* the PR introduces, filtering out pre-ex
 Set `compare_mode: "absolute"` for v1 behavior — total downstream blast radius without comparison to base.
 
 ## Index Management Tools
+
+### `reindex_files`
+
+Fast on-save reindex of specific files. Accepts absolute file paths, resolves each to its repo, and reindexes only the affected models. Non-blocking with per-repo debounce.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `paths` | list[string] | Yes | | Absolute file paths that changed. Non-SQL files are silently ignored. |
+
+> **Non-blocking with debounce:** Returns immediately. Reindex is debounced per repo — 500ms for plain SQL (fast parse), 2s for dbt/sqlmesh (subprocess compilation). Multiple rapid calls accumulate paths and execute as a single batch. Plain SQL files reindex in ~50ms; dbt/sqlmesh models compile + reindex in ~2-5s.
 
 ### `reindex`
 

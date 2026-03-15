@@ -13,6 +13,7 @@ Registered repositories.
 | `repo_id` | INTEGER PK | Auto-increment ID. |
 | `name` | TEXT UNIQUE | Repo name (used in queries to filter). |
 | `path` | TEXT | Absolute path to the repo directory. |
+| `repo_type` | TEXT | Repo type: `sql`, `dbt`, or `sqlmesh`. Default: `sql`. Used by `reindex_files` to select the correct renderer. |
 | `last_commit` | TEXT | Git commit hash at last index time. |
 | `last_branch` | TEXT | Git branch at last index time. |
 | `indexed_at` | TIMESTAMP | When the repo was last indexed. |
