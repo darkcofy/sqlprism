@@ -24,7 +24,7 @@ from pathlib import Path
 from sqlprism.languages.sql import SqlParser
 from sqlprism.languages.sqlmesh import _validate_command
 from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
-from sqlprism.types import ParseResult
+from sqlprism.types import ColumnDefResult, ParseResult
 
 
 class DbtRenderer:
@@ -270,3 +270,78 @@ class DbtRenderer:
                 return name
 
         raise ValueError(f"Could not find 'name:' in {dbt_project_file}")
+
+    def extract_schema_yml(
+        self, project_path: str | Path
+    ) -> dict[str, list[ColumnDefResult]]:
+        """Extract column definitions from dbt schema.yml files.
+
+        Scans all ``*.yml`` and ``*.yaml`` files under the project's ``models/``
+        directory for model entries with ``columns:`` lists. Returns a mapping
+        of model name to ``ColumnDefResult`` entries with ``source='schema_yml'``.
+
+        Args:
+            project_path: Path to dbt project dir (containing ``models/``).
+
+        Returns:
+            Dict mapping model name -> list of ``ColumnDefResult``.
+        """
+        import yaml
+
+        project_path = Path(project_path).resolve()
+        models_dir = project_path / "models"
+        if not models_dir.exists():
+            return {}
+
+        result: dict[str, list[ColumnDefResult]] = {}
+
+        for pattern in ("**/*.yml", "**/*.yaml"):
+            for yml_file in models_dir.glob(pattern):
+                try:
+                    data = yaml.safe_load(yml_file.read_text())
+                except Exception:
+                    continue
+
+                if not isinstance(data, dict):
+                    continue
+
+                models = data.get("models")
+                if not isinstance(models, list):
+                    continue
+
+                for model in models:
+                    if not isinstance(model, dict):
+                        continue
+                    model_name = model.get("name")
+                    if not model_name:
+                        continue
+
+                    columns = model.get("columns")
+                    if not isinstance(columns, list):
+                        continue
+
+                    col_defs: list[ColumnDefResult] = []
+                    for position, col in enumerate(columns):
+                        if not isinstance(col, dict):
+                            continue
+                        col_name = col.get("name")
+                        if not col_name:
+                            continue
+                        col_defs.append(
+                            ColumnDefResult(
+                                node_name=model_name,
+                                column_name=col_name,
+                                data_type=col.get("data_type"),
+                                position=position,
+                                source="schema_yml",
+                                description=col.get("description"),
+                            )
+                        )
+
+                    if col_defs:
+                        if model_name in result:
+                            result[model_name].extend(col_defs)
+                        else:
+                            result[model_name] = col_defs
+
+        return result
