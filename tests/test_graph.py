@@ -1057,7 +1057,7 @@ def test_cleanup_phantoms_removes_phantom_only_referenced_by_phantoms():
 def test_columns_table_created_fresh_db():
     """columns table exists with correct structure on a fresh database."""
     db = GraphDB()
-    cols = db.conn.execute(
+    cols = db._execute_read(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name = 'columns' ORDER BY ordinal_position"
     ).fetchall()
@@ -1070,12 +1070,14 @@ def test_columns_table_created_fresh_db():
     assert "source" in col_names
     assert "description" in col_names
 
-    # Verify sequence exists by using it
-    seq_val = db.conn.execute("SELECT nextval('seq_column_id')").fetchone()[0]
-    assert seq_val >= 1
+    # Verify sequence exists via catalog
+    seq = db._execute_read(
+        "SELECT sequence_name FROM duckdb_sequences() WHERE sequence_name = 'seq_column_id'"
+    ).fetchone()
+    assert seq is not None
 
     # Verify indexes exist
-    indexes = db.conn.execute(
+    indexes = db._execute_read(
         "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'columns'"
     ).fetchall()
     idx_names = {r[0] for r in indexes}
@@ -1087,21 +1089,25 @@ def test_columns_table_created_fresh_db():
 def test_columns_table_migration_existing_db():
     """columns table is created on an existing DB without affecting other tables."""
     db = GraphDB()
-    # Insert data into existing tables
+    # Insert data into all existing tables
     repo_id = db.upsert_repo("migration-test", "/tmp/migration")
     file_id = db.insert_file(repo_id, "query.sql", "sql", "abc123")
     node_id = db.insert_node(file_id, "table", "orders", "sql")
+    node_id2 = db.insert_node(file_id, "query", "my_query", "sql")
+    db.insert_edge(node_id2, node_id, "references", "FROM clause")
 
     # Re-init (simulates opening an existing DB with new schema)
     db.conn.execute(SCHEMA_SQL)
     db.conn.execute(INDEX_SQL)
 
-    # Existing data should be intact
-    found = db.resolve_node("orders", "table", repo_id)
-    assert found == node_id
+    # All existing data should be intact across all tables
+    assert db.resolve_node("orders", "table", repo_id) == node_id
+    assert db._execute_read("SELECT COUNT(*) FROM repos").fetchone()[0] >= 1
+    assert db._execute_read("SELECT COUNT(*) FROM files").fetchone()[0] >= 1
+    assert db._execute_read("SELECT COUNT(*) FROM edges").fetchone()[0] >= 1
 
     # columns table should exist
-    count = db.conn.execute(
+    count = db._execute_read(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'columns'"
     ).fetchone()[0]
     assert count == 1
