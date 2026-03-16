@@ -208,7 +208,7 @@ Full reference: [CLI guide](https://darkcofy.github.io/sqlprism/guide/cli/)
 
 Full reference: [MCP tools guide](https://darkcofy.github.io/sqlprism/guide/mcp-tools/)
 
-When running as an MCP server (`sqlprism serve`), 11 tools are exposed:
+When running as an MCP server (`sqlprism serve`), 19 tools are exposed:
 
 | Tool | Description |
 |---|---|
@@ -217,12 +217,20 @@ When running as an MCP server (`sqlprism serve`), 11 tools are exposed:
 | `find_column_usage` | Column usage — type, transforms, aliases. |
 | `trace_dependencies` | Multi-hop upstream/downstream chains. |
 | `trace_column_lineage` | End-to-end column lineage through CTEs. |
+| `get_schema` | Table/view schema with columns, types, and dependencies. |
+| `get_context` | One-call comprehensive context dump for a model. |
+| `find_path` | Shortest path between two models (DuckPGQ). |
+| `find_critical_models` | Rank models by PageRank importance (DuckPGQ). |
+| `detect_cycles` | Find circular dependencies in the graph. |
+| `find_subgraphs` | Identify disconnected clusters and orphaned models (DuckPGQ). |
+| `find_bottlenecks` | High fan-out models with risk classification. |
+| `check_impact` | Column-level impact analysis before making changes. |
 | `pr_impact` | Structural diff + blast radius since a base commit. |
 | `reindex` | Background incremental reindex of SQL repos. |
 | `reindex_files` | Fast on-save reindex with per-repo debounce. |
-| `reindex_dbt` | Background [dbt](https://www.getdbt.com/) compile + index. |
-| `reindex_sqlmesh` | Background [SQLMesh](https://sqlmesh.com/) render + index. |
-| `index_status` | Index stats and reindex progress. |
+| `reindex_dbt` | Background dbt compile + index. |
+| `reindex_sqlmesh` | Background SQLMesh render + index. |
+| `index_status` | Index stats, cross-repo edges, and name collisions. |
 
 ## Architecture
 
@@ -238,7 +246,7 @@ src/sqlprism/
   core/
     graph.py            <- DuckDB storage layer (MVCC), queries, snippets, repo_type tracking
     indexer.py          <- Orchestrator: scan -> checksum -> parse -> store; file-level reindex with repo-type dispatch
-    mcp_tools.py        <- FastMCP tool definitions (11 tools, non-blocking reindex, per-repo debounce)
+    mcp_tools.py        <- FastMCP tool definitions (19 tools, non-blocking reindex, per-repo debounce)
   cli.py                <- Click CLI: serve, reindex, reindex-file, reindex-sqlmesh, reindex-dbt, status, init
 ```
 
@@ -250,11 +258,15 @@ The SQL parser extracts:
 
 Full architecture docs: [Architecture overview](https://darkcofy.github.io/sqlprism/architecture/overview/) | [DuckDB schema](https://darkcofy.github.io/sqlprism/architecture/schema/)
 
+### DuckPGQ Graph Analytics
+
+SQLPrism optionally integrates with [DuckPGQ](https://github.com/cwida/duckpgq) for advanced graph analytics. When installed, these tools become available: `find_path`, `find_critical_models`, `find_subgraphs`, `find_bottlenecks` (clustering enrichment). DuckPGQ is installed automatically on first use — no manual setup needed.
+
 ## Development
 
 ```bash
 uv sync
-uv run pytest                          # run tests (282 tests)
+uv run pytest                          # run tests (416+ tests)
 uv run pytest --cov=sqlprism           # run with coverage report
 uv run pytest --cov=sqlprism --cov-report=html:coverage_html  # HTML report
 ```
