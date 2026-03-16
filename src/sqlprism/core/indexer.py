@@ -125,6 +125,7 @@ class Indexer:
             "nodes_added": 0,
             "edges_added": 0,
             "column_usage_added": 0,
+            "columns_added": 0,
             "lineage_chains": 0,
             "column_usage_dropped": 0,
             "parse_errors": [],
@@ -230,6 +231,7 @@ class Indexer:
             "nodes_added": 0,
             "edges_added": 0,
             "column_usage_added": 0,
+            "columns_added": 0,
             "lineage_chains": 0,
         }
 
@@ -303,6 +305,7 @@ class Indexer:
             "nodes_added": 0,
             "edges_added": 0,
             "column_usage_added": 0,
+            "columns_added": 0,
             "lineage_chains": 0,
         }
 
@@ -495,7 +498,7 @@ class Indexer:
                 file_id = self.graph.insert_file(repo_id, rel_path, "sql", checksum)
                 insert_stats = {
                     "nodes_added": 0, "edges_added": 0,
-                    "column_usage_added": 0, "lineage_chains": 0,
+                    "column_usage_added": 0, "columns_added": 0, "lineage_chains": 0,
                 }
                 self._insert_parse_result(result, file_id, repo_id, insert_stats)
 
@@ -575,7 +578,7 @@ class Indexer:
                 file_id = self.graph.insert_file(repo_id, model_path, "sql", checksum)
                 insert_stats = {
                     "nodes_added": 0, "edges_added": 0,
-                    "column_usage_added": 0, "lineage_chains": 0,
+                    "column_usage_added": 0, "columns_added": 0, "lineage_chains": 0,
                 }
                 self._insert_parse_result(result, file_id, repo_id, insert_stats)
             stats["reindexed"] += 1
@@ -640,7 +643,7 @@ class Indexer:
                 file_id = self.graph.insert_file(repo_id, file_path_key, "sql", checksum)
                 insert_stats = {
                     "nodes_added": 0, "edges_added": 0,
-                    "column_usage_added": 0, "lineage_chains": 0,
+                    "column_usage_added": 0, "columns_added": 0, "lineage_chains": 0,
                 }
                 self._insert_parse_result(result, file_id, repo_id, insert_stats)
             stats["reindexed"] += 1
@@ -805,6 +808,44 @@ class Indexer:
                 stats["lineage_chains"] += 1
             if lineage_rows:
                 self.graph.insert_column_lineage_batch(lineage_rows)
+
+        # ── Batch insert column definitions ──
+        if result.columns:
+            col_rows = []
+            for col_def in result.columns:
+                # Try to resolve node_id from local map (table/view only, matching kind)
+                node_id = None
+                for key, nid in node_id_map.items():
+                    if key[0] == col_def.node_name and key[1] in ("table", "view", "source"):
+                        node_id = nid
+                        break
+                # Fall back to graph resolution
+                if not node_id:
+                    node_id = self.graph.resolve_node(col_def.node_name, "table", repo_id)
+                if not node_id:
+                    node_id = self.graph.resolve_node(col_def.node_name, "view", repo_id)
+                if not node_id:
+                    node_id = self.graph.resolve_node(col_def.node_name, "source", repo_id)
+                if not node_id:
+                    logger.warning(
+                        "Column def skipped: cannot resolve node '%s' for column '%s'",
+                        col_def.node_name,
+                        col_def.column_name,
+                    )
+                    continue
+                col_rows.append(
+                    (
+                        node_id,
+                        col_def.column_name,
+                        col_def.data_type,
+                        col_def.position,
+                        col_def.source,
+                        col_def.description,
+                    )
+                )
+            if col_rows:
+                self.graph.insert_columns_batch(col_rows)
+            stats["columns_added"] += len(col_rows)
 
     def _resolve_edge_endpoint(
         self,
