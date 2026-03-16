@@ -1903,6 +1903,107 @@ class GraphDB:
             "total_nodes_in_scope": total,
         }
 
+    def query_find_bottlenecks(
+        self,
+        min_downstream: int = 5,
+        repo: str | None = None,
+    ) -> dict:
+        """Identify bottleneck models with high fan-in/out and low clustering.
+
+        Uses plain SQL to compute fan-in (upstream) and fan-out (downstream)
+        counts for each node.  When DuckPGQ is available, enriches results
+        with local clustering coefficient to better assess risk.
+
+        Args:
+            min_downstream: Minimum downstream (dependents) count to include
+                a node (default 5, clamped 1–100).
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``bottlenecks`` list, ``total_analyzed``, and
+            ``has_clustering``; each bottleneck includes ``name``, ``kind``,
+            ``downstream``, ``upstream``, ``clustering``, and ``risk``.
+        """
+        min_downstream = max(min(min_downstream, 100), 1)
+
+        # Build repo join/where dynamically
+        repo_join = (
+            "JOIN files f ON n.file_id = f.file_id "
+            "JOIN repos r ON f.repo_id = r.repo_id "
+        ) if repo else ""
+        repo_where = "AND r.name = ? " if repo else ""
+        params: list = [repo] if repo else []
+
+        fan_sql = (
+            "SELECT n.node_id, n.name, n.kind, "
+            "COUNT(DISTINCT e_down.source_id) AS downstream, "
+            "(SELECT COUNT(DISTINCT e_up.target_id) FROM edges e_up "
+            "WHERE e_up.source_id = n.node_id) AS upstream "
+            "FROM nodes n "
+            "LEFT JOIN edges e_down ON e_down.target_id = n.node_id "
+            f"{repo_join}"
+            f"WHERE n.file_id IS NOT NULL {repo_where}"
+            "GROUP BY n.node_id, n.name, n.kind "
+            f"HAVING COUNT(DISTINCT e_down.source_id) >= ? "
+            "ORDER BY downstream DESC"
+        )
+        params.append(min_downstream)
+
+        rows = self._execute_read(fan_sql, params).fetchall()
+
+        # Total nodes in scope (for context)
+        total_params: list = [repo] if repo else []
+        if repo:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id WHERE n.file_id IS NOT NULL AND r.name = ?",
+                total_params,
+            ).fetchone()[0]
+        else:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL"
+            ).fetchone()[0]
+
+        # Enrich with local clustering coefficient when DuckPGQ is available
+        lcc_map: dict[int, float] = {}
+        has_clustering = False
+        if self.has_pgq:
+            try:
+                lcc_rows = self._execute_read(
+                    "SELECT * FROM local_clustering_coefficient("
+                    "sqlprism_graph, nodes, edges)"
+                ).fetchall()
+                lcc_map = {r[0]: r[1] for r in lcc_rows}
+                has_clustering = True
+            except duckdb.Error:
+                lcc_map = {}
+
+        bottlenecks = []
+        for node_id, name, kind, downstream, upstream in rows:
+            clustering = lcc_map.get(node_id, None)
+
+            if downstream > 20 and (clustering is None or clustering < 0.1):
+                risk = "high"
+            elif downstream > 10:
+                risk = "medium"
+            else:
+                risk = "low"
+
+            bottlenecks.append({
+                "name": name,
+                "kind": kind,
+                "downstream": downstream,
+                "upstream": upstream,
+                "clustering": clustering,
+                "risk": risk,
+            })
+
+        return {
+            "bottlenecks": bottlenecks,
+            "total_analyzed": total,
+            "has_clustering": has_clustering,
+        }
+
     def query_context(self, name: str, repo: str | None = None) -> dict:
         """Return comprehensive context for a model.
 
