@@ -1,6 +1,6 @@
 # MCP Tools
 
-When running as an MCP server (`sqlprism serve`), 11 tools are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
+When running as an MCP server (`sqlprism serve`), 19 tools are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
 
 ## Query Tools
 
@@ -159,6 +159,87 @@ Compile and index a dbt project. Runs `dbt compile`, then parses the compiled SQ
 ### `index_status`
 
 Returns the current state of the index — repos, file counts, node counts, last commit, staleness. When a background reindex is in progress, includes `reindex_in_progress: true` and `reindex_status` with the current state. After completion, includes `last_reindex` with the result. No parameters.
+
+## Schema & Context Tools
+
+### `get_schema`
+
+Get table/view schema including columns, types, and upstream/downstream dependencies.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Entity name (table, view, CTE). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `get_context`
+
+One-call comprehensive context dump — schema, dependencies, column usage summary, code snippet, and optional graph metrics.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | | Entity name. |
+| `repo` | string | No | | Filter by repo name. |
+
+## Graph Analytics Tools
+
+### `find_path`
+
+Find the shortest path between two models in the dependency graph. Requires DuckPGQ.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `source` | string | Yes | | Starting model name. |
+| `target` | string | Yes | | Destination model name. |
+| `max_depth` | int | No | 10 | Maximum path length (1-15). |
+
+### `find_critical_models`
+
+Rank models by PageRank importance — models with high scores are referenced by many important models. Requires DuckPGQ.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `top_n` | int | No | 20 | Number of top models to return (1-100). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `detect_cycles`
+
+Find circular dependencies in the SQL dependency graph. Uses recursive CTE — no DuckPGQ required.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | No | | Filter by repo name. |
+| `max_cycle_length` | int | No | 10 | Maximum cycle length (2-15). |
+
+### `find_subgraphs`
+
+Identify weakly connected components (disconnected clusters) and orphaned models. Requires DuckPGQ.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | No | | Filter by repo name. |
+
+### `find_bottlenecks`
+
+Find bottleneck models with high fan-out and low clustering — single points of failure.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `min_downstream` | int | No | 5 | Minimum downstream dependents (1-100). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `check_impact`
+
+Analyze the downstream impact of proposed column changes BEFORE modifying code.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `model` | string | Yes | | Model or table name to check impact for. |
+| `changes` | list | Yes | | List of column changes (remove_column, rename_column, add_column). |
+| `repo` | string | No | | Filter by repo name. |
+
+## DuckPGQ Tools
+
+The following tools require the [DuckPGQ](https://github.com/cwida/duckpgq) extension: `find_path`, `find_critical_models`, `find_subgraphs`. The extension is installed automatically on first use. Tools that don't require DuckPGQ (`detect_cycles`, `find_bottlenecks`, `check_impact`) use plain SQL and work everywhere.
 
 ## Pagination
 
