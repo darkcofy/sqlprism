@@ -1645,9 +1645,16 @@ class GraphDB:
             return {"error": f"Graph query failed: {e}"}
 
         if not rows:
-            total = self._execute_read(
-                "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL"
-            ).fetchone()[0]
+            if repo:
+                total = self._execute_read(
+                    "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.file_id "
+                    "JOIN repos r ON f.repo_id = r.repo_id WHERE r.name = ?",
+                    [repo],
+                ).fetchone()[0]
+            else:
+                total = self._execute_read(
+                    "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL"
+                ).fetchone()[0]
             return {"models": [], "total_indexed_nodes": total}
 
         # Batch downstream count (direct dependents) using node_ids

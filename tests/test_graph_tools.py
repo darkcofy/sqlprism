@@ -151,6 +151,16 @@ def test_find_critical_models_pagerank():
     by_name = {m["name"]: m for m in models}
     # model_isolated has no dependents
     assert by_name["model_isolated"]["direct_dependents"] == 0
+    # Chain: raw.orders -> staging.orders -> int_payments -> marts.revenue
+    # direct_dependents = models whose edges point TO this node (source_id -> target_id)
+    # raw.orders is root source — nothing points to it
+    assert by_name["raw.orders"]["direct_dependents"] == 0
+    # staging.orders is target of raw.orders
+    assert by_name["staging.orders"]["direct_dependents"] == 1
+    # int_payments is target of staging.orders
+    assert by_name["int_payments"]["direct_dependents"] == 1
+    # marts.revenue is target of int_payments
+    assert by_name["marts.revenue"]["direct_dependents"] == 1
     db.close()
 
 
@@ -202,6 +212,10 @@ def test_find_critical_models_repo_filter():
     names = {m["name"] for m in result["models"]}
     assert names == {"model_a1", "model_a2"}
     assert result["total_indexed_nodes"] == 2
+    # model_a2 is referenced by both n_a1 and n_b1 (cross-repo)
+    by_name = {m["name"]: m for m in result["models"]}
+    assert by_name["model_a2"]["direct_dependents"] == 2
+    assert by_name["model_a1"]["direct_dependents"] == 0
     db.close()
 
 
