@@ -19,6 +19,7 @@ from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
+from pydantic import model_validator as pydantic_model_validator
 
 from sqlprism.core.graph import GraphDB
 from sqlprism.core.indexer import Indexer
@@ -401,6 +402,15 @@ class ColumnChange(BaseModel):
     old: str | None = Field(None, description="Old column name (for rename_column)")
     new: str | None = Field(None, description="New column name (for rename_column)")
 
+    @pydantic_model_validator(mode="after")
+    def _validate_fields_per_action(self) -> "ColumnChange":
+        if self.action in ("remove_column", "add_column") and not self.column:
+            raise ValueError(f"'{self.action}' requires 'column' to be set")
+        if self.action == "rename_column":
+            if not self.old or not self.new:
+                raise ValueError("'rename_column' requires both 'old' and 'new' to be set")
+        return self
+
 
 class CheckImpactInput(BaseModel):
     model_config = {"populate_by_name": True}
@@ -431,6 +441,9 @@ async def check_impact(params: CheckImpactInput) -> dict:
     - **safe**: column not referenced downstream
 
     Call this BEFORE removing, renaming, or adding columns to understand the blast radius.
+
+    Note: ``add_column`` does not detect ``SELECT *`` usage — downstream models
+    using wildcard selects may still be affected by new columns.
     """
     return await asyncio.to_thread(
         _get_graph().query_check_impact,

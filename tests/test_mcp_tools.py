@@ -1601,6 +1601,9 @@ def test_check_impact_rename_column():
     breaking_models = {b["model"] for b in impact["breaking"]}
     assert "marts.revenue" in breaking_models
     assert "marts.orders_summary" in breaking_models
+    # Verify usage_types are reported
+    for b in impact["breaking"]:
+        assert "select" in b["usage_types"]
 
     db.close()
 
@@ -1666,18 +1669,21 @@ def test_check_impact_multiple_changes():
 
     # Change 0: remove total_amount — ds1 breaking, ds2 safe
     imp0 = result["impacts"][0]
+    assert imp0["change"]["action"] == "remove_column"
     assert len(imp0["breaking"]) == 1
     assert imp0["breaking"][0]["model"] == "marts.revenue"
     assert len(imp0["safe"]) == 1
 
     # Change 1: rename order_id — both ds1 and ds2 breaking
     imp1 = result["impacts"][1]
+    assert imp1["change"]["action"] == "rename_column"
     breaking_models = {b["model"] for b in imp1["breaking"]}
     assert "marts.revenue" in breaking_models
     assert "marts.orders_summary" in breaking_models
 
     # Change 2: add new_field — all safe
     imp2 = result["impacts"][2]
+    assert imp2["change"]["action"] == "add_column"
     assert imp2["breaking"] == []
     assert imp2["warnings"] == []
     assert len(imp2["safe"]) == 2
@@ -1689,3 +1695,78 @@ def test_check_impact_multiple_changes():
     assert summary["total_safe"] == 3  # 1 (remove) + 0 (rename) + 2 (add)
 
     db.close()
+
+
+def test_check_impact_mixed_breaking_and_warning_usage():
+    """A model with both SELECT and WHERE usage on the same column is classified as breaking."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "abc123")
+        src_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        ds1_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+        db.insert_edge(ds1_id, src_id, "references")
+        # Same column used in both SELECT (breaking) and WHERE (warning)
+        db.insert_column_usage(ds1_id, "staging.orders", "amount", "select", file_id)
+        db.insert_column_usage(ds1_id, "staging.orders", "amount", "where", file_id)
+
+    result = db.query_check_impact(
+        "staging.orders",
+        [{"action": "remove_column", "column": "amount"}],
+    )
+
+    impact = result["impacts"][0]
+    # Should be breaking (SELECT takes precedence), NOT in warnings
+    assert len(impact["breaking"]) == 1
+    assert impact["breaking"][0]["model"] == "marts.revenue"
+    assert "select" in impact["breaking"][0]["usage_types"]
+    assert "where" in impact["breaking"][0]["usage_types"]
+    assert impact["warnings"] == []
+
+    db.close()
+
+
+def test_check_impact_nonexistent_model():
+    """check_impact for a model not in the index returns model_found=False."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    result = db.query_check_impact(
+        "nonexistent_model",
+        [{"action": "remove_column", "column": "col"}],
+    )
+
+    assert result["model_found"] is False
+    assert result["changes_analyzed"] == 1
+    assert result["impacts"] == []
+    assert result["summary"]["total_breaking"] == 0
+
+    db.close()
+
+
+def test_check_impact_column_change_validation():
+    """ColumnChange validator rejects missing required fields."""
+    import pytest
+
+    from sqlprism.core.mcp_tools import ColumnChange
+
+    # remove_column without column
+    with pytest.raises(Exception, match="requires 'column'"):
+        ColumnChange(action="remove_column")
+
+    # rename_column without old
+    with pytest.raises(Exception, match="requires both"):
+        ColumnChange(action="rename_column", new="id")
+
+    # rename_column without new
+    with pytest.raises(Exception, match="requires both"):
+        ColumnChange(action="rename_column", old="order_id")
+
+    # Valid cases should work
+    ColumnChange(action="remove_column", column="col")
+    ColumnChange(action="add_column", column="col")
+    ColumnChange(action="rename_column", old="a", new="b")

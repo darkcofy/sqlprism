@@ -1248,6 +1248,12 @@ class GraphDB:
         queries the ``column_usage`` table to classify downstream models
         as **breaking**, **warning**, or **safe**.
 
+        Note: ``add_column`` does not account for ``SELECT *`` usage —
+        downstream models using wildcard selects may still be affected.
+
+        The ``repo`` filter restricts both model lookup and downstream
+        consumer discovery to the same repo.
+
         Args:
             model: The model/table name whose columns are changing.
             changes: List of change dicts.  Supported actions:
@@ -1257,9 +1263,10 @@ class GraphDB:
             repo: Optional repo name filter.
 
         Returns:
-            Dict with ``model``, ``changes_analyzed``, ``impacts`` (one
-            entry per change with ``breaking``, ``warnings``, and ``safe``
-            lists), and a ``summary`` with totals.
+            Dict with ``model``, ``model_found``, ``changes_analyzed``,
+            ``impacts`` (one entry per change with ``breaking``,
+            ``warnings``, and ``safe`` lists), and a ``summary`` with
+            totals.
         """
         breaking_types = {"select", "join_on", "insert", "update"}
         warning_types = {
@@ -1267,31 +1274,44 @@ class GraphDB:
             "partition_by", "window_order", "qualify",
         }
 
-        # Pre-fetch all downstream models via edges for safe classification
-        node_sql = (
-            "SELECT n.node_id FROM nodes n "
-            "LEFT JOIN files f ON n.file_id = f.file_id "
-            "LEFT JOIN repos r ON f.repo_id = r.repo_id "
-            "WHERE n.name = ?"
-        )
-        node_params: list = [model]
+        # Pre-fetch source node IDs — exclude phantoms (file_id IS NULL)
         if repo:
-            node_sql += " AND r.name = ?"
-            node_params.append(repo)
-
-        node_rows = self._execute_read(node_sql, node_params).fetchall()
-        all_downstream: list[dict] = []
-        if node_rows:
-            placeholders = ", ".join("?" for _ in node_rows)
-            node_ids = [r[0] for r in node_rows]
-            ds_rows = self._execute_read(
-                "SELECT DISTINCT n2.name, n2.kind "
-                "FROM edges e "
-                "JOIN nodes n2 ON e.source_id = n2.node_id "
-                f"WHERE e.target_id IN ({placeholders})",
-                node_ids,
+            node_rows = self._execute_read(
+                "SELECT n.node_id FROM nodes n "
+                "JOIN files f ON n.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id "
+                "WHERE n.name = ? AND r.name = ?",
+                [model, repo],
             ).fetchall()
-            all_downstream = [{"name": r[0], "kind": r[1]} for r in ds_rows]
+        else:
+            node_rows = self._execute_read(
+                "SELECT n.node_id FROM nodes n "
+                "WHERE n.name = ? AND n.file_id IS NOT NULL",
+                [model],
+            ).fetchall()
+
+        if not node_rows:
+            return {
+                "model": model,
+                "model_found": False,
+                "changes_analyzed": len(changes),
+                "impacts": [],
+                "summary": {"total_breaking": 0, "total_warnings": 0, "total_safe": 0},
+            }
+
+        node_ids = [r[0] for r in node_rows]
+        placeholders = ", ".join("?" for _ in node_ids)
+
+        # Fetch downstream models via edges, excluding the model itself
+        ds_rows = self._execute_read(
+            "SELECT DISTINCT n2.name, n2.kind "
+            "FROM edges e "
+            "JOIN nodes n2 ON e.source_id = n2.node_id "
+            f"WHERE e.target_id IN ({placeholders}) "
+            f"AND e.source_id NOT IN ({placeholders})",
+            node_ids + node_ids,
+        ).fetchall()
+        all_downstream = [{"name": r[0], "kind": r[1]} for r in ds_rows]
 
         impacts: list[dict] = []
         total_breaking = 0
@@ -1304,6 +1324,7 @@ class GraphDB:
             # Determine the column name to check
             if action == "add_column":
                 # Always safe — no downstream references exist yet
+                # (does not account for SELECT * usage)
                 impacts.append({
                     "change": change,
                     "breaking": [],
@@ -1317,7 +1338,15 @@ class GraphDB:
             elif action == "remove_column":
                 col_name = change.get("column", "")
             else:
-                # Unknown action — skip
+                # Unknown action — record as skipped so len(impacts) == changes_analyzed
+                impacts.append({
+                    "change": change,
+                    "skipped": True,
+                    "reason": f"unknown action '{action}'",
+                    "breaking": [],
+                    "warnings": [],
+                    "safe": [],
+                })
                 continue
 
             # Query column_usage for downstream references to this column
@@ -1331,8 +1360,8 @@ class GraphDB:
                 "SELECT DISTINCT n.name AS node_name, n.kind AS node_kind, cu.usage_type "
                 "FROM column_usage cu "
                 "JOIN nodes n ON cu.node_id = n.node_id "
-                "JOIN files f ON cu.file_id = f.file_id "
-                "JOIN repos r ON f.repo_id = r.repo_id "
+                "LEFT JOIN files f ON cu.file_id = f.file_id "
+                "LEFT JOIN repos r ON f.repo_id = r.repo_id "
                 f"WHERE {' AND '.join(where)}"
             )
             usage_rows = self._execute_read(usage_sql, params).fetchall()
@@ -1382,6 +1411,7 @@ class GraphDB:
 
         return {
             "model": model,
+            "model_found": True,
             "changes_analyzed": len(changes),
             "impacts": impacts,
             "summary": {
