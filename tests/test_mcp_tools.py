@@ -1487,3 +1487,205 @@ def test_get_schema_mcp_tool_integration(tmp_path):
     assert len(result["columns"]) == 2
 
     graph.close()
+
+
+# ── check_impact (query_check_impact) tests ──
+
+
+def test_check_impact_remove_column_breaking():
+    """Removing a column used in SELECT is a breaking change."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "abc123")
+        src_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        ds1_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+        db.insert_edge(ds1_id, src_id, "references")
+        db.insert_column_usage(ds1_id, "staging.orders", "total_amount", "select", file_id)
+
+    result = db.query_check_impact(
+        "staging.orders",
+        [{"action": "remove_column", "column": "total_amount"}],
+    )
+
+    impact = result["impacts"][0]
+    breaking_models = [b["model"] for b in impact["breaking"]]
+    assert "marts.revenue" in breaking_models
+    breaking_entry = next(b for b in impact["breaking"] if b["model"] == "marts.revenue")
+    assert "select" in breaking_entry["usage_types"]
+
+    db.close()
+
+
+def test_check_impact_remove_column_warning():
+    """Removing a column used only in WHERE is a warning (not breaking)."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "abc123")
+        src_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        ds1_id = db.insert_node(file_id, "query", "int_orders", "sql")
+        db.insert_edge(ds1_id, src_id, "references")
+        db.insert_column_usage(ds1_id, "staging.orders", "status", "where", file_id)
+
+    result = db.query_check_impact(
+        "staging.orders",
+        [{"action": "remove_column", "column": "status"}],
+    )
+
+    impact = result["impacts"][0]
+    warning_models = [w["model"] for w in impact["warnings"]]
+    breaking_models = [b["model"] for b in impact["breaking"]]
+    assert "int_orders" in warning_models
+    assert "int_orders" not in breaking_models
+    warning_entry = next(w for w in impact["warnings"] if w["model"] == "int_orders")
+    assert "where" in warning_entry["usage_types"]
+
+    db.close()
+
+
+def test_check_impact_remove_unused_safe():
+    """Removing a column not referenced by any downstream model is safe."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "abc123")
+        src_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        ds1_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+        db.insert_edge(ds1_id, src_id, "references")
+        # marts.revenue uses a different column, not internal_note
+        db.insert_column_usage(ds1_id, "staging.orders", "total_amount", "select", file_id)
+
+    result = db.query_check_impact(
+        "staging.orders",
+        [{"action": "remove_column", "column": "internal_note"}],
+    )
+
+    impact = result["impacts"][0]
+    assert impact["breaking"] == []
+    assert impact["warnings"] == []
+    safe_models = [s["model"] for s in impact["safe"]]
+    assert "marts.revenue" in safe_models
+
+    db.close()
+
+
+def test_check_impact_rename_column():
+    """Renaming a column used in SELECT by 2 downstream models breaks both."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "abc123")
+        src_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        ds1_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+        ds2_id = db.insert_node(file_id, "query", "marts.orders_summary", "sql")
+        db.insert_edge(ds1_id, src_id, "references")
+        db.insert_edge(ds2_id, src_id, "references")
+        db.insert_column_usage(ds1_id, "staging.orders", "order_id", "select", file_id)
+        db.insert_column_usage(ds2_id, "staging.orders", "order_id", "select", file_id)
+
+    result = db.query_check_impact(
+        "staging.orders",
+        [{"action": "rename_column", "old": "order_id", "new": "id"}],
+    )
+
+    impact = result["impacts"][0]
+    breaking_models = {b["model"] for b in impact["breaking"]}
+    assert "marts.revenue" in breaking_models
+    assert "marts.orders_summary" in breaking_models
+
+    db.close()
+
+
+def test_check_impact_add_column_safe():
+    """Adding a new column is always safe for all downstream models."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "abc123")
+        src_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        ds1_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+        ds2_id = db.insert_node(file_id, "query", "marts.orders_summary", "sql")
+        db.insert_edge(ds1_id, src_id, "references")
+        db.insert_edge(ds2_id, src_id, "references")
+        db.insert_column_usage(ds1_id, "staging.orders", "order_id", "select", file_id)
+
+    result = db.query_check_impact(
+        "staging.orders",
+        [{"action": "add_column", "column": "new_field"}],
+    )
+
+    impact = result["impacts"][0]
+    assert impact["breaking"] == []
+    assert impact["warnings"] == []
+    safe_models = {s["model"] for s in impact["safe"]}
+    assert "marts.revenue" in safe_models
+    assert "marts.orders_summary" in safe_models
+
+    db.close()
+
+
+def test_check_impact_multiple_changes():
+    """Multiple changes are analyzed independently with correct summary totals."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "abc123")
+        src_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        ds1_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+        ds2_id = db.insert_node(file_id, "query", "marts.orders_summary", "sql")
+        db.insert_edge(ds1_id, src_id, "references")
+        db.insert_edge(ds2_id, src_id, "references")
+        # ds1 uses total_amount (SELECT) and order_id (SELECT)
+        db.insert_column_usage(ds1_id, "staging.orders", "total_amount", "select", file_id)
+        db.insert_column_usage(ds1_id, "staging.orders", "order_id", "select", file_id)
+        # ds2 uses order_id (SELECT)
+        db.insert_column_usage(ds2_id, "staging.orders", "order_id", "select", file_id)
+
+    changes = [
+        {"action": "remove_column", "column": "total_amount"},  # breaking for ds1, safe for ds2
+        {"action": "rename_column", "old": "order_id", "new": "id"},  # breaking for ds1 & ds2
+        {"action": "add_column", "column": "new_field"},  # safe for all
+    ]
+    result = db.query_check_impact("staging.orders", changes)
+
+    assert result["changes_analyzed"] == 3
+    assert len(result["impacts"]) == 3
+
+    # Change 0: remove total_amount — ds1 breaking, ds2 safe
+    imp0 = result["impacts"][0]
+    assert len(imp0["breaking"]) == 1
+    assert imp0["breaking"][0]["model"] == "marts.revenue"
+    assert len(imp0["safe"]) == 1
+
+    # Change 1: rename order_id — both ds1 and ds2 breaking
+    imp1 = result["impacts"][1]
+    breaking_models = {b["model"] for b in imp1["breaking"]}
+    assert "marts.revenue" in breaking_models
+    assert "marts.orders_summary" in breaking_models
+
+    # Change 2: add new_field — all safe
+    imp2 = result["impacts"][2]
+    assert imp2["breaking"] == []
+    assert imp2["warnings"] == []
+    assert len(imp2["safe"]) == 2
+
+    # Summary totals
+    summary = result["summary"]
+    assert summary["total_breaking"] == 3  # 1 (remove) + 2 (rename)
+    assert summary["total_warnings"] == 0
+    assert summary["total_safe"] == 3  # 1 (remove) + 0 (rename) + 2 (add)
+
+    db.close()
