@@ -549,6 +549,39 @@ async def find_subgraphs(params: FindSubgraphsInput) -> dict:
     )
 
 
+class FindBottlenecksInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    min_downstream: int = Field(
+        5,
+        description="Minimum downstream dependents to qualify as bottleneck (default 5, max 100)",
+        ge=1,
+        le=100,
+    )
+    repo: str | None = Field(None, description="Filter by repo name. Omit for all repos.")
+
+
+@mcp.tool(
+    name="find_bottlenecks",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def find_bottlenecks(params: FindBottlenecksInput) -> dict:
+    """Find bottleneck models with high fan-in/out that are single points of failure.
+
+    Combines edge counting (plain SQL) with optional DuckPGQ clustering coefficient.
+    Models with high downstream count and low clustering are flagged as high risk.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_find_bottlenecks,
+        min_downstream=params.min_downstream,
+        repo=params.repo,
+    )
+
+
 class ColumnChange(BaseModel):
     action: Literal["remove_column", "rename_column", "add_column"] = Field(
         ...,
