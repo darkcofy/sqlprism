@@ -573,3 +573,186 @@ def test_find_subgraphs_empty():
         assert result["orphaned_models"] == []
     finally:
         db.close()
+
+
+# ── find_bottlenecks ────────────────────────────────────────────────
+
+
+def _build_star_graph(db, file_id, hub_name: str, spoke_count: int):
+    """Create a star: hub_name <- spoke_1, spoke_2, ..., spoke_N.
+
+    Each spoke depends on hub (edge: spoke -> hub), so hub has
+    `spoke_count` downstream dependents.
+    """
+    hub = db.insert_node(file_id, "table", hub_name, "sql")
+    for i in range(spoke_count):
+        spoke = db.insert_node(file_id, "table", f"{hub_name}_dep_{i}", "sql")
+        db.insert_edge(spoke, hub, "references")
+    return hub
+
+
+def test_find_bottlenecks_high_fanout():
+    """Model with high downstream count is identified as bottleneck."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "star.sql", "sql", "abc")
+
+        # Hub has 25 dependents and 1 upstream dependency
+        hub = _build_star_graph(db, file_id, "staging_orders", 25)
+        source = db.insert_node(file_id, "table", "raw_orders", "sql")
+        db.insert_edge(hub, source, "references")
+
+        if db.has_pgq:
+            db._create_property_graph()
+        result = db.query_find_bottlenecks(min_downstream=5)
+
+        assert len(result["bottlenecks"]) == 1
+        b = result["bottlenecks"][0]
+        assert b["name"] == "staging_orders"
+        assert b["downstream"] == 25
+        assert b["upstream"] == 1
+        assert b["risk"] == "high"
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_min_filter():
+    """min_downstream filters out models below the threshold."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "multi.sql", "sql", "abc")
+
+        _build_star_graph(db, file_id, "hub_3", 3)
+        _build_star_graph(db, file_id, "hub_10", 10)
+        _build_star_graph(db, file_id, "hub_25", 25)
+        _build_star_graph(db, file_id, "hub_50", 50)
+
+        if db.has_pgq:
+            db._create_property_graph()
+
+        result = db.query_find_bottlenecks(min_downstream=20)
+        names = {b["name"] for b in result["bottlenecks"]}
+        assert names == {"hub_25", "hub_50"}
+
+        result_all = db.query_find_bottlenecks(min_downstream=1)
+        names_all = {b["name"] for b in result_all["bottlenecks"]}
+        assert {"hub_3", "hub_10", "hub_25", "hub_50"} <= names_all
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_clustering():
+    """Clustering coefficient is included when DuckPGQ is available."""
+    db = GraphDB()
+    if not db.has_pgq:
+        pytest.skip("DuckPGQ not installed")
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "cluster.sql", "sql", "abc")
+
+        _build_star_graph(db, file_id, "hub", 6)
+        db._create_property_graph()
+
+        result = db.query_find_bottlenecks(min_downstream=5)
+        assert result["has_clustering"] is True
+        assert len(result["bottlenecks"]) >= 1
+        b = result["bottlenecks"][0]
+        assert b["name"] == "hub"
+        assert isinstance(b["clustering"], (int, float))
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_no_pgq_fallback():
+    """Without DuckPGQ, has_clustering is False and clustering is None."""
+    db = GraphDB()
+    db._has_pgq = False
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "star.sql", "sql", "abc")
+
+        _build_star_graph(db, file_id, "hub", 10)
+
+        result = db.query_find_bottlenecks(min_downstream=5)
+        assert result["has_clustering"] is False
+        assert len(result["bottlenecks"]) == 1
+        b = result["bottlenecks"][0]
+        assert b["clustering"] is None
+        assert b["downstream"] == 10
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_ordering():
+    """Results ordered by downstream desc; risk boundaries at 10 and 20."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "order.sql", "sql", "abc")
+
+        _build_star_graph(db, file_id, "small", 5)          # low (<= 10)
+        _build_star_graph(db, file_id, "at_ten", 10)        # low (boundary: exactly 10)
+        _build_star_graph(db, file_id, "medium", 15)        # medium (> 10)
+        _build_star_graph(db, file_id, "at_twenty_one", 21) # high (> 20)
+        _build_star_graph(db, file_id, "large", 30)         # high
+
+        if db.has_pgq:
+            db._create_property_graph()
+
+        result = db.query_find_bottlenecks(min_downstream=5)
+        downstream_counts = [b["downstream"] for b in result["bottlenecks"]]
+        assert downstream_counts == sorted(downstream_counts, reverse=True)
+
+        by_name = {b["name"]: b for b in result["bottlenecks"]}
+        assert by_name["large"]["risk"] == "high"
+        assert by_name["at_twenty_one"]["risk"] == "high"
+        assert by_name["medium"]["risk"] == "medium"
+        assert by_name["at_ten"]["risk"] == "low"   # exactly 10 is NOT > 10
+        assert by_name["small"]["risk"] == "low"
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_repo_filter():
+    """Repo filter restricts analysis to models in that repo."""
+    db = GraphDB()
+    try:
+        repo_a = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
+        repo_b = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
+        file_a = db.insert_file(repo_a, "a.sql", "sql", "abc")
+        file_b = db.insert_file(repo_b, "b.sql", "sql", "def")
+
+        _build_star_graph(db, file_id=file_a, hub_name="hub_a", spoke_count=10)
+        _build_star_graph(db, file_id=file_b, hub_name="hub_b", spoke_count=15)
+
+        if db.has_pgq:
+            db._create_property_graph()
+
+        result_a = db.query_find_bottlenecks(min_downstream=5, repo="repo_a")
+        names_a = {b["name"] for b in result_a["bottlenecks"]}
+        assert names_a == {"hub_a"}
+
+        result_b = db.query_find_bottlenecks(min_downstream=5, repo="repo_b")
+        names_b = {b["name"] for b in result_b["bottlenecks"]}
+        assert names_b == {"hub_b"}
+
+        # Non-existent repo returns empty results
+        result_none = db.query_find_bottlenecks(min_downstream=1, repo="nonexistent")
+        assert result_none["bottlenecks"] == []
+        assert result_none["total_analyzed"] == 0
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_empty_graph():
+    """Empty graph returns no bottlenecks."""
+    db = GraphDB()
+    try:
+        db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        result = db.query_find_bottlenecks(min_downstream=1)
+        assert result["bottlenecks"] == []
+        assert result["total_analyzed"] == 0
+    finally:
+        db.close()

@@ -1903,6 +1903,129 @@ class GraphDB:
             "total_nodes_in_scope": total,
         }
 
+    def query_find_bottlenecks(
+        self,
+        min_downstream: int = 5,
+        repo: str | None = None,
+    ) -> dict:
+        """Identify bottleneck models with high fan-out and low clustering.
+
+        Uses plain SQL to count dependents and dependencies for each node.
+        When DuckPGQ is available, enriches results with local clustering
+        coefficient to better assess risk.
+
+        Terminology (edge convention: ``source REFERENCES target`` means
+        source depends on target):
+
+        - ``downstream``: models that depend on this node (edges pointing
+          *to* it — high count = many things break if this node fails).
+        - ``upstream``: models this node depends on (edges pointing *from*
+          it — high count = many inputs).
+
+        Risk tiers (fixed thresholds):
+
+        - **high**: downstream > 20 and (no clustering data or clustering < 0.1)
+        - **medium**: downstream > 10
+        - **low**: everything else
+
+        When ``has_clustering`` is True, a ``clustering: null`` value means
+        the node was absent from the LCC result set (e.g. isolated node).
+
+        Args:
+            min_downstream: Minimum downstream (dependents) count to include
+                a node (default 5, clamped 1–100).
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``bottlenecks`` list, ``total_analyzed``, and
+            ``has_clustering``; each bottleneck includes ``name``, ``kind``,
+            ``downstream``, ``upstream``, ``clustering``, and ``risk``.
+        """
+        min_downstream = max(min(min_downstream, 100), 1)
+
+        # Build repo join/where dynamically
+        repo_join = (
+            "JOIN files f ON n.file_id = f.file_id "
+            "JOIN repos r ON f.repo_id = r.repo_id "
+        ) if repo else ""
+        repo_where = "AND r.name = ? " if repo else ""
+        params: list = [repo] if repo else []
+
+        # e_dep: edges where other nodes depend on n (n is the target)
+        #        → COUNT = downstream dependents
+        # upstream CTE: edges where n depends on other nodes (n is the source)
+        #               → COUNT = upstream dependencies
+        fan_sql = (
+            "WITH upstream_counts AS ("
+            "SELECT source_id, COUNT(DISTINCT target_id) AS upstream "
+            "FROM edges GROUP BY source_id"
+            ") "
+            "SELECT n.node_id, n.name, n.kind, "
+            "COUNT(DISTINCT e_dep.source_id) AS downstream, "
+            "COALESCE(uc.upstream, 0) AS upstream "
+            "FROM nodes n "
+            "LEFT JOIN edges e_dep ON e_dep.target_id = n.node_id "
+            "LEFT JOIN upstream_counts uc ON uc.source_id = n.node_id "
+            f"{repo_join}"
+            f"WHERE n.file_id IS NOT NULL {repo_where}"
+            "GROUP BY n.node_id, n.name, n.kind, uc.upstream "
+            f"HAVING COUNT(DISTINCT e_dep.source_id) >= ? "
+            "ORDER BY downstream DESC"
+        )
+        params.append(min_downstream)
+
+        rows = self._execute_read(fan_sql, params).fetchall()
+
+        # Total nodes in scope — reuse repo filter
+        total_sql = (
+            f"SELECT COUNT(*) FROM nodes n {repo_join}"
+            f"WHERE n.file_id IS NOT NULL {repo_where}"
+        )
+        total_params: list = [repo] if repo else []
+        total = self._execute_read(total_sql, total_params).fetchone()[0]
+
+        # Enrich with local clustering coefficient when DuckPGQ is available.
+        # NOTE: LCC runs on the full property graph; when repo is set the
+        # clustering values still reflect cross-repo neighbors.
+        lcc_map: dict[int, float] = {}
+        has_clustering = False
+        if self.has_pgq and rows:
+            try:
+                lcc_rows = self._execute_read(
+                    "SELECT * FROM local_clustering_coefficient("
+                    "sqlprism_graph, nodes, edges)"
+                ).fetchall()
+                lcc_map = {r[0]: r[1] for r in lcc_rows}
+                has_clustering = True
+            except duckdb.Error:
+                lcc_map = {}
+
+        bottlenecks = []
+        for node_id, name, kind, downstream, upstream in rows:
+            clustering = lcc_map.get(node_id, None)
+
+            if downstream > 20 and (clustering is None or clustering < 0.1):
+                risk = "high"
+            elif downstream > 10:
+                risk = "medium"
+            else:
+                risk = "low"
+
+            bottlenecks.append({
+                "name": name,
+                "kind": kind,
+                "downstream": downstream,
+                "upstream": upstream,
+                "clustering": clustering,
+                "risk": risk,
+            })
+
+        return {
+            "bottlenecks": bottlenecks,
+            "total_analyzed": total,
+            "has_clustering": has_clustering,
+        }
+
     def query_context(self, name: str, repo: str | None = None) -> dict:
         """Return comprehensive context for a model.
 
