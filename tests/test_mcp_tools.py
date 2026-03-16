@@ -1817,7 +1817,7 @@ def test_get_context_full():
     assert "marts.revenue" in downstream_names
     # Column usage summary
     cus = result["column_usage_summary"]
-    assert len(cus["most_used_columns"]) > 0
+    assert set(cus["most_used_columns"]) == {"order_id", "amount"}
     assert "order_id" in cus["downstream_join_keys"]
     assert "amount" in cus["downstream_aggregations"]
     # Snippet is None (no real file on disk)
@@ -1870,16 +1870,11 @@ def test_get_context_with_pgq():
     db.refresh_property_graph()
     result = db.query_context("staging.orders")
 
-    # DuckPGQ is available; if pagerank succeeds graph_metrics is included
-    if "graph_metrics" in result:
-        gm = result["graph_metrics"]
-        assert isinstance(gm["importance"], (float, type(None)))
-        assert gm["downstream_count"] == 1
-    else:
-        # pagerank may fail on some DuckDB/DuckPGQ versions — verify
-        # the rest of the response is still well-formed
-        assert "model" in result
-        assert result["downstream"][0]["name"] == "marts.revenue"
+    # DuckPGQ is available and graph refreshed — graph_metrics must be present
+    assert "graph_metrics" in result
+    gm = result["graph_metrics"]
+    assert isinstance(gm["importance"], (float, type(None)))
+    assert gm["downstream_count"] == 1
 
     db.close()
 
@@ -1924,5 +1919,41 @@ def test_get_context_unknown_model():
     result = db.query_context("nonexistent")
 
     assert "error" in result
+    assert "model" not in result
+
+    db.close()
+
+
+def test_get_context_repo_filter():
+    """query_context with repo filter disambiguates same-named models."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_a_id = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
+    repo_b_id = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
+    with db.write_transaction():
+        file_a = db.insert_file(repo_a_id, "orders.sql", "sql", "aaa")
+        node_a = db.insert_node(file_a, "table", "orders", "sql")
+        db.insert_columns_batch([(node_a, "col_a", "INT", 0, "definition", None)])
+
+        file_b = db.insert_file(repo_b_id, "orders.sql", "sql", "bbb")
+        node_b = db.insert_node(file_b, "table", "orders", "sql")
+        db.insert_columns_batch([(node_b, "col_b", "TEXT", 0, "definition", None)])
+
+        # Column usage in repo_a only
+        ds_id = db.insert_node(file_a, "query", "downstream_a", "sql")
+        db.insert_edge(ds_id, node_a, "references")
+        db.insert_column_usage(ds_id, "orders", "col_a", "select", file_a)
+
+    result_a = db.query_context("orders", repo="repo_a")
+    assert result_a["model"]["repo"] == "repo_a"
+    col_names = [c["name"] for c in result_a["columns"]]
+    assert "col_a" in col_names
+    assert "col_b" not in col_names
+
+    result_b = db.query_context("orders", repo="repo_b")
+    assert result_b["model"]["repo"] == "repo_b"
+    col_names_b = [c["name"] for c in result_b["columns"]]
+    assert "col_b" in col_names_b
 
     db.close()

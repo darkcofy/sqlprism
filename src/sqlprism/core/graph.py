@@ -1497,23 +1497,29 @@ class GraphDB:
             return schema_result
 
         # 2. Column usage summary
-        where = ["cu.table_name = ?"]
-        params: list = [name]
+        # Note: repo filter scopes to consumers *within* that repo.
+        # Cross-repo usage (consumer in repo X referencing model in repo Y)
+        # is excluded when a repo filter is applied.
         if repo:
-            where.append("r.name = ?")
-            params.append(repo)
-
-        usage_sql = (
-            "SELECT cu.column_name, cu.usage_type, COUNT(*) as cnt "
-            "FROM column_usage cu "
-            "JOIN nodes n ON cu.node_id = n.node_id "
-            "JOIN files f ON cu.file_id = f.file_id "
-            "LEFT JOIN repos r ON f.repo_id = r.repo_id "
-            f"WHERE {' AND '.join(where)} "
-            "GROUP BY cu.column_name, cu.usage_type "
-            "ORDER BY cnt DESC"
-        )
-        usage_rows = self._execute_read(usage_sql, params).fetchall()
+            usage_sql = (
+                "SELECT cu.column_name, cu.usage_type, COUNT(*) as cnt "
+                "FROM column_usage cu "
+                "JOIN files f ON cu.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id "
+                "WHERE cu.table_name = ? AND r.name = ? "
+                "GROUP BY cu.column_name, cu.usage_type "
+                "ORDER BY cnt DESC"
+            )
+            usage_rows = self._execute_read(usage_sql, [name, repo]).fetchall()
+        else:
+            usage_sql = (
+                "SELECT cu.column_name, cu.usage_type, COUNT(*) as cnt "
+                "FROM column_usage cu "
+                "WHERE cu.table_name = ? "
+                "GROUP BY cu.column_name, cu.usage_type "
+                "ORDER BY cnt DESC"
+            )
+            usage_rows = self._execute_read(usage_sql, [name]).fetchall()
 
         # Aggregate total usage per column for top-10
         col_totals: dict[str, int] = {}
@@ -1543,20 +1549,33 @@ class GraphDB:
             max_lines=30,
         )
 
-        # 4. Optional graph metrics
+        # 4. Optional graph metrics (edge-based downstream_count, not usage-based)
         graph_metrics = None
         if self.has_pgq:
             try:
-                pr_rows = self._execute_read(
-                    "SELECT pr.pagerank FROM pagerank(sqlprism_graph, nodes, edges) pr "
-                    "JOIN nodes n ON n.rowid = pr.rowid WHERE n.name = ?",
-                    [name],
-                ).fetchall()
+                repo_name = schema_result["repo"]
+                if repo_name:
+                    pr_rows = self._execute_read(
+                        "SELECT pr.pagerank FROM pagerank(sqlprism_graph, nodes, edges) pr "
+                        "JOIN nodes n ON n.node_id = pr.node_id "
+                        "JOIN files f ON n.file_id = f.file_id "
+                        "JOIN repos r ON f.repo_id = r.repo_id "
+                        "WHERE n.name = ? AND r.name = ?",
+                        [name, repo_name],
+                    ).fetchall()
+                else:
+                    pr_rows = self._execute_read(
+                        "SELECT pr.pagerank FROM pagerank(sqlprism_graph, nodes, edges) pr "
+                        "JOIN nodes n ON n.node_id = pr.node_id WHERE n.name = ?",
+                        [name],
+                    ).fetchall()
+                raw_score = pr_rows[0][0] if pr_rows else None
                 graph_metrics = {
-                    "importance": round(pr_rows[0][0], 6) if pr_rows else None,
+                    "importance": round(raw_score, 6) if raw_score is not None else None,
                     "downstream_count": len(schema_result.get("downstream", [])),
                 }
-            except Exception:
+            except (duckdb.Error, RuntimeError) as e:
+                logger.debug("PageRank query failed: %s", e)
                 graph_metrics = None
 
         # 5. Compose result
@@ -1577,7 +1596,7 @@ class GraphDB:
             },
             "snippet": snippet,
         }
-        if graph_metrics:
+        if graph_metrics is not None:
             result["graph_metrics"] = graph_metrics
         return result
 
