@@ -1808,6 +1808,95 @@ class GraphDB:
             "total_nodes_in_scope": total,
         }
 
+    def query_find_subgraphs(self, repo: str | None = None) -> dict:
+        """Find weakly connected components (subgraphs) in the dependency graph.
+
+        Uses DuckPGQ ``weakly_connected_component`` to partition the graph
+        into disjoint subgraphs.  Phantom nodes (file_id IS NULL) are
+        excluded from the results.
+
+        Args:
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``components``, ``total_components``,
+            ``largest_component``, ``orphaned_models``, and
+            ``total_nodes_in_scope``; or ``error`` when DuckPGQ is not
+            installed or the query fails.
+        """
+        if not self.has_pgq:
+            return {"error": "DuckPGQ not installed. Install with: INSTALL duckpgq FROM community"}
+
+        try:
+            if repo:
+                wcc_sql = (
+                    "SELECT n.name, wcc.component_id "
+                    "FROM weakly_connected_component(sqlprism_graph, nodes, edges) wcc "
+                    "JOIN nodes n ON n.node_id = wcc.node_id "
+                    "JOIN files f ON n.file_id = f.file_id "
+                    "JOIN repos r ON f.repo_id = r.repo_id "
+                    "WHERE n.file_id IS NOT NULL AND r.name = ?"
+                )
+                rows = self._execute_read(wcc_sql, [repo]).fetchall()
+            else:
+                wcc_sql = (
+                    "SELECT n.name, wcc.component_id "
+                    "FROM weakly_connected_component(sqlprism_graph, nodes, edges) wcc "
+                    "JOIN nodes n ON n.node_id = wcc.node_id "
+                    "WHERE n.file_id IS NOT NULL"
+                )
+                rows = self._execute_read(wcc_sql).fetchall()
+        except duckdb.Error as e:
+            logger.warning("WCC query failed: %s", e)
+            return {"error": f"Graph query failed: {e}"}
+
+        # Group by component_id
+        comp_map: dict[int, list[str]] = {}
+        for name, component_id in rows:
+            comp_map.setdefault(component_id, []).append(name)
+
+        # Build components list sorted by size descending
+        components = sorted(
+            [
+                {
+                    "component_id": cid,
+                    "size": len(names),
+                    "models": sorted(names),
+                }
+                for cid, names in comp_map.items()
+            ],
+            key=lambda c: c["size"],
+            reverse=True,
+        )
+
+        largest_component = components[0]["models"][0] if components else None
+        orphaned_models = sorted(
+            name
+            for c in components
+            if c["size"] == 1
+            for name in c["models"]
+        )
+
+        # Total nodes in scope
+        if repo:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id WHERE r.name = ?",
+                [repo],
+            ).fetchone()[0]
+        else:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL"
+            ).fetchone()[0]
+
+        return {
+            "components": components,
+            "total_components": len(components),
+            "largest_component": largest_component,
+            "orphaned_models": orphaned_models,
+            "total_nodes_in_scope": total,
+        }
+
     def query_context(self, name: str, repo: str | None = None) -> dict:
         """Return comprehensive context for a model.
 
