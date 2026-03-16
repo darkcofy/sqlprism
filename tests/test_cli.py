@@ -323,3 +323,62 @@ def test_cli_reindex_file_deleted_cleans_graph(tmp_path):
     )
     assert result.exit_code == 0
     assert "deleted=1" in result.output
+
+
+# ── init command tests ──
+
+
+def test_init_generates_yaml(tmp_path):
+    """sqlprism init generates sqlprism.yml by default."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli, ["init"])
+        assert result.exit_code == 0, result.output
+        yml_path = Path.cwd() / "sqlprism.yml"
+        assert yml_path.exists()
+        import yaml
+        config = yaml.safe_load(yml_path.read_text())
+        assert "repos" in config
+        assert "db_path" in config
+
+
+def test_init_format_json_flag(tmp_path):
+    """sqlprism init --format json generates sqlprism.json."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli, ["init", "--format", "json"])
+        assert result.exit_code == 0, result.output
+        json_path = Path.cwd() / "sqlprism.json"
+        assert json_path.exists()
+        import json
+        config = json.loads(json_path.read_text())
+        assert "repos" in config
+        assert "db_path" in config
+        # YAML file should NOT exist
+        assert not (Path.cwd() / "sqlprism.yml").exists()
+
+
+def test_init_does_not_overwrite_existing(tmp_path):
+    """Second init invocation does not overwrite and warns about existing config."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        # First run creates the file
+        runner.invoke(cli, ["init"])
+        yml_path = Path.cwd() / "sqlprism.yml"
+        original = yml_path.read_text()
+
+        # Second run detects existing config
+        result = runner.invoke(cli, ["init"])
+        assert result.exit_code == 0
+        assert "already exists" in result.output
+        assert yml_path.read_text() == original  # unchanged
+
+
+def test_init_detects_other_format(tmp_path):
+    """init --format json aborts if sqlprism.yml already exists."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        runner.invoke(cli, ["init"])  # creates sqlprism.yml
+        result = runner.invoke(cli, ["init", "--format", "json"])
+        assert "already exists" in result.output
+        assert not (Path.cwd() / "sqlprism.json").exists()
