@@ -64,7 +64,30 @@ dev = [
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.5.0",
     "mkdocstrings[python]>=0.27.0",
+    "ty>=0.0.23",
 ]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+# FastMCP's @mcp.tool decorator has incomplete type stubs
+invalid-argument-type = "warn"
+
+[tool.ty.analysis]
+# Third-party libs with missing or incomplete stubs
+replace-imports-with-any = ["duckdb.**", "sqlglot.**"]
+
+[[tool.ty.overrides]]
+# Tests access module internals (_state) after configure() and use
+# Pydantic alias kwargs — suppress noise from test patterns
+include = ["tests/**"]
+[tool.ty.overrides.rules]
+unresolved-attribute = "warn"
+unknown-argument = "warn"
+not-subscriptable = "warn"
+unsupported-operator = "warn"
+invalid-assignment = "warn"
 
 [tool.coverage.run]
 source = ["sqlprism"]
