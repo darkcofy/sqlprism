@@ -1476,6 +1476,123 @@ class GraphDB:
             },
         }
 
+    def query_find_path(
+        self,
+        from_model: str,
+        to_model: str,
+        max_hops: int = 10,
+    ) -> dict:
+        """Find the shortest path between two models using DuckPGQ.
+
+        Uses ``ANY SHORTEST`` for path-length discovery, then a BFS CTE
+        to recover intermediate node names.
+
+        Args:
+            from_model: Source model name.
+            to_model:   Target model name.
+            max_hops:   Maximum edge traversals (clamped to 1..10).
+
+        Returns:
+            Dict with ``path_found``, ``path`` (list of node names),
+            and ``length``; or an ``error`` key when DuckPGQ is missing.
+        """
+        if not self.has_pgq:
+            return {
+                "error": (
+                    "DuckPGQ not installed. "
+                    "Install with: INSTALL duckpgq FROM community"
+                ),
+            }
+
+        max_hops = max(min(max_hops, 10), 1)
+
+        # Resolve model names to node_ids via parameterized query
+        # (avoids string interpolation into GRAPH_TABLE SQL)
+        from_row = self._execute_read(
+            "SELECT node_id FROM nodes WHERE name = ? LIMIT 1",
+            [from_model],
+        ).fetchone()
+        to_row = self._execute_read(
+            "SELECT node_id FROM nodes WHERE name = ? LIMIT 1",
+            [to_model],
+        ).fetchone()
+        if not from_row or not to_row:
+            return {
+                "from": from_model,
+                "to": to_model,
+                "path_found": False,
+                "path": [],
+                "length": 0,
+            }
+
+        from_id, to_id = from_row[0], to_row[0]
+
+        # Step 1: Find shortest path length via PGQ ANY SHORTEST
+        # DuckPGQ does not support bind parameters inside GRAPH_TABLE,
+        # so we interpolate integer node_ids (safe, no escaping needed).
+        try:
+            rows = self._execute_read(
+                f"FROM GRAPH_TABLE (sqlprism_graph "
+                f"MATCH p = ANY SHORTEST "
+                f"(src:nodes WHERE src.node_id = {from_id})"
+                f"-[e:edges]->{{1,{max_hops}}}"
+                f"(dst:nodes WHERE dst.node_id = {to_id}) "
+                f"COLUMNS (path_length(p) AS hops))",
+            ).fetchall()
+        except duckdb.Error as e:
+            logger.warning("DuckPGQ find_path failed: %s", e)
+            return {"error": f"Graph query failed: {e}"}
+
+        if not rows:
+            return {
+                "from": from_model,
+                "to": to_model,
+                "path_found": False,
+                "path": [],
+                "length": 0,
+            }
+
+        path_length = int(rows[0][0])
+
+        # Step 2: Recover intermediate nodes via BFS CTE
+        # No file_id filter — BFS must traverse the same topology as PGQ
+        path_cte = f"""
+        WITH RECURSIVE path_bfs AS (
+            SELECT n.node_id, n.name, 0 as depth,
+                   ARRAY[n.name] as path_names
+            FROM nodes n
+            WHERE n.node_id = ?
+            UNION ALL
+            SELECT n2.node_id, n2.name, pb.depth + 1,
+                   array_append(pb.path_names, n2.name)
+            FROM edges e
+            JOIN nodes n2 ON e.target_id = n2.node_id
+            JOIN path_bfs pb ON e.source_id = pb.node_id
+            WHERE pb.depth < {path_length}
+            AND NOT array_contains(pb.path_names, n2.name)
+        )
+        SELECT path_names FROM path_bfs
+        WHERE node_id = ? AND depth = {path_length}
+        LIMIT 1
+        """
+        path_rows = self._execute_read(
+            path_cte, [from_id, to_id]
+        ).fetchall()
+
+        if path_rows:
+            path_names = list(path_rows[0][0])
+        else:
+            # BFS could not reconstruct — report as not found
+            path_names = []
+
+        return {
+            "from": from_model,
+            "to": to_model,
+            "path_found": bool(path_names),
+            "path": path_names,
+            "length": path_length if path_names else 0,
+        }
+
     def query_context(self, name: str, repo: str | None = None) -> dict:
         """Return comprehensive context for a model.
 
