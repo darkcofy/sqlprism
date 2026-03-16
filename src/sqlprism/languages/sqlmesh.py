@@ -18,7 +18,7 @@ from pathlib import Path
 
 from sqlprism.languages.sql import SqlParser
 from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
-from sqlprism.types import ParseResult
+from sqlprism.types import ColumnDefResult, ParseResult
 
 logger = logging.getLogger(__name__)
 
@@ -53,16 +53,26 @@ _RENDER_SCRIPT = textwrap.dedent("""\
 
     rendered = {}
     errors = []
+    column_schemas = {}
     for model_name in targets:
         try:
+            model = context.models.get(model_name)
+            if model is None:
+                errors.append({"model": model_name, "error": f"Model {model_name} not found in context"})
+                continue
             query = context.render(model_name)
             sql = query.sql(dialect=dialect)
             if sql:
                 rendered[model_name] = sql
+            if hasattr(model, 'columns_to_types') and model.columns_to_types:
+                column_schemas[model_name] = {
+                    col: (typ.sql() if hasattr(typ, 'sql') else str(typ))
+                    for col, typ in model.columns_to_types.items()
+                }
         except Exception as e:
             errors.append({"model": model_name, "error": str(e)})
 
-    json.dump({"rendered": rendered, "errors": errors}, sys.stdout)
+    json.dump({"rendered": rendered, "errors": errors, "column_schemas": column_schemas}, sys.stdout)
 """)
 
 
@@ -182,7 +192,7 @@ class SqlMeshRenderer:
 
         env = build_env(env_file)
 
-        models, errors = self._run_render_script(
+        models, errors, column_schemas = self._run_render_script(
             project_path=project_path,
             cwd=cwd,
             env=env,
@@ -205,6 +215,18 @@ class SqlMeshRenderer:
             clean_name = model_name.strip('"').replace('"."', "/")
             result = self.sql_parser.parse(clean_name + ".sql", rendered_sql, schema=schema_catalog)
             enrich_nodes(result, "sqlmesh_model", model_name)
+
+            # Attach column definitions from sqlmesh model schema
+            # sqlmesh_schema wins over inferred/definition columns from parser
+            if model_name in column_schemas:
+                col_defs = _build_column_defs(model_name, column_schemas[model_name])
+                schema_names = {c.column_name for c in col_defs}
+                result.columns = [
+                    c for c in result.columns
+                    if c.node_name != model_name or c.column_name not in schema_names
+                ]
+                result.columns.extend(col_defs)
+
             results[model_name] = result
 
         return results
@@ -219,8 +241,13 @@ class SqlMeshRenderer:
         dialect: str,
         sqlmesh_command: str,
         model_filter: list[str],
-    ) -> tuple[dict[str, str], list[dict]]:
-        """Run the inline render script via subprocess. Returns ({model_name: sql}, errors)."""
+    ) -> tuple[dict[str, str], list[dict], dict[str, dict[str, str]]]:
+        """Run the inline render script via subprocess.
+
+        Returns:
+            Tuple of (rendered_models, errors, column_schemas) where
+            column_schemas maps model_name -> {col_name: data_type}.
+        """
         _validate_command(sqlmesh_command, allowed_keywords={"python", "sqlmesh", "uv"})
         cmd = shlex.split(sqlmesh_command) + [
             "-c",
@@ -245,7 +272,33 @@ class SqlMeshRenderer:
             raise RuntimeError(f"sqlmesh render failed (exit {result.returncode}):\n{result.stderr}")
 
         output = json.loads(result.stdout)
-        return output.get("rendered", {}), output.get("errors", [])
+        return output.get("rendered", {}), output.get("errors", []), output.get("column_schemas", {})
+
+
+def _build_column_defs(
+    model_name: str,
+    columns: dict[str, str],
+) -> list[ColumnDefResult]:
+    """Convert a {col_name: data_type} dict into ColumnDefResult entries.
+
+    Args:
+        model_name: The sqlmesh model name (used as node_name).
+        columns: Mapping of column name to SQL data type string.
+
+    Returns:
+        List of ColumnDefResult with source='sqlmesh_schema'.
+    """
+    # Position relies on columns_to_types insertion order, which sqlmesh preserves
+    return [
+        ColumnDefResult(
+            node_name=model_name,
+            column_name=col_name,
+            data_type=data_type,
+            position=idx,
+            source="sqlmesh_schema",
+        )
+        for idx, (col_name, data_type) in enumerate(columns.items())
+    ]
 
 
 def _validate_command(command: str, allowed_keywords: set[str]) -> None:
