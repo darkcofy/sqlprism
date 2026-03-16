@@ -1942,7 +1942,7 @@ class GraphDB:
         limit: int = 100,
         exclude_edges: set[tuple[str, str]] | None = None,
     ) -> dict:
-        """Trace multi-hop dependency chains using a recursive CTE.
+        """Trace multi-hop dependency chains via DuckPGQ or recursive CTE.
 
         Args:
             name: Starting entity name.
@@ -1968,7 +1968,7 @@ class GraphDB:
             ``direction="both"``, paths are split into ``"downstream"``
             and ``"upstream"`` keys instead of a single ``"paths"``.
         """
-        max_depth = min(max_depth, 10)
+        max_depth = max(min(max_depth, 10), 1)
         # Find starting node(s)
         where = ["name = ?"]
         params: list = [name]
@@ -2210,6 +2210,9 @@ class GraphDB:
         depth_map: dict[int, int] = {r[0]: r[1] for r in depth_rows}
 
         # Step 3: Enrich with metadata (file, repo, edge relationship)
+        # Include start_id in edge source lookup so depth-1 nodes get real relationship
+        source_ids = [start_id] + node_ids
+        source_ph = ",".join("?" for _ in source_ids)
         enrich_sql = (
             f"SELECT n.node_id, n.name, n.kind, n.language, "
             f"n.line_start, n.line_end, f.path, r.name, "
@@ -2218,12 +2221,12 @@ class GraphDB:
             f"LEFT JOIN files f ON n.file_id = f.file_id "
             f"LEFT JOIN repos r ON f.repo_id = r.repo_id "
             f"LEFT JOIN edges e ON e.{target_col} = n.node_id "
-            f"AND e.{source_col} IN ({placeholders}) "
+            f"AND e.{source_col} IN ({source_ph}) "
             f"WHERE n.node_id IN ({placeholders}) "
             f"AND n.file_id IS NOT NULL "
             f"ORDER BY n.name"
         )
-        enrich_params = node_ids + node_ids
+        enrich_params = source_ids + node_ids
         rows = self._execute_read(enrich_sql, enrich_params).fetchall()
 
         seen: set[int] = set()

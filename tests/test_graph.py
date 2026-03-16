@@ -1368,14 +1368,14 @@ def test_duckpgq_tools_check_flag():
 def _build_trace_graph():
     """Create a graph with known topology for trace tests.
 
-    Topology:
-        raw_orders <- stg_orders <- marts_revenue
-        raw_orders <- dim_customers
+    Topology (downstream flow):
+        raw_orders -> stg_orders -> marts_revenue
+        raw_orders -> dim_customers
 
-    Edges point source -> target where source references target:
-        stg_orders  -> raw_orders
-        marts_revenue -> stg_orders
-        dim_customers -> raw_orders
+    Edges follow source -> target for downstream traversal:
+        raw_orders  -> stg_orders
+        stg_orders  -> marts_revenue
+        raw_orders  -> dim_customers
     """
     db = GraphDB()
     repo_id = db.upsert_repo("trace-repo", "/tmp/trace")
@@ -1454,6 +1454,7 @@ def test_pr_impact_duckpgq_multi_root():
 
     # Trace from raw_orders — should find all three dependants
     result_raw = db.query_trace("raw_orders", direction="downstream")
+    _assert_trace_structure(result_raw)
     names_raw = {p["name"] for p in result_raw["paths"]}
     assert names_raw == {"stg_orders", "marts_revenue", "dim_customers"}
 
@@ -1476,6 +1477,7 @@ def test_pr_impact_cte_fallback():
         exclude_edges={("raw_orders", "stg_orders")},
     )
 
+    _assert_trace_structure(result)
     names = {p["name"] for p in result["paths"]}
     assert names == {"dim_customers"}
     db.close()
@@ -1499,6 +1501,7 @@ def test_pr_impact_exclude_edges_forces_cte():
         exclude_edges={("raw_orders", "stg_orders")},
     )
 
+    _assert_trace_structure(result)
     names = {p["name"] for p in result["paths"]}
     # CTE with exclusion: stg_orders and marts_revenue unreachable
     assert names == {"dim_customers"}
@@ -1512,6 +1515,7 @@ def test_trace_max_depth_boundary():
 
     result = db.query_trace("raw_orders", direction="downstream", max_depth=1)
 
+    _assert_trace_structure(result)
     names = {p["name"] for p in result["paths"]}
     # Only depth-1 nodes: stg_orders and dim_customers (not marts_revenue at depth 2)
     assert names == {"stg_orders", "dim_customers"}
