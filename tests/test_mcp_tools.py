@@ -1770,3 +1770,190 @@ def test_check_impact_column_change_validation():
     ColumnChange(action="remove_column", column="col")
     ColumnChange(action="add_column", column="col")
     ColumnChange(action="rename_column", old="a", new="b")
+
+
+# ── get_context (query_context) tests ──
+
+
+def test_get_context_full():
+    """query_context returns model metadata, columns, deps, and column_usage_summary."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+        stg_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        raw_id = db.insert_node(file_id, "table", "raw_orders", "sql")
+        mart_id = db.insert_node(file_id, "table", "marts.revenue", "sql")
+        # Columns on staging.orders
+        db.insert_columns_batch([
+            (stg_id, "order_id", "INT", 0, "definition", None),
+            (stg_id, "amount", "DECIMAL", 1, "definition", None),
+            (stg_id, "status", "TEXT", 2, "definition", None),
+        ])
+        # Edges: staging.orders -> raw_orders, marts.revenue -> staging.orders
+        db.insert_edge(stg_id, raw_id, "references")
+        db.insert_edge(mart_id, stg_id, "references")
+        # Column usage: marts.revenue uses staging.orders columns
+        db.insert_column_usage(mart_id, "staging.orders", "order_id", "select", file_id)
+        db.insert_column_usage(mart_id, "staging.orders", "order_id", "join_on", file_id)
+        db.insert_column_usage(mart_id, "staging.orders", "amount", "select", file_id)
+        db.insert_column_usage(mart_id, "staging.orders", "amount", "group_by", file_id)
+
+    result = db.query_context("staging.orders")
+
+    # Model metadata
+    assert result["model"]["name"] == "staging.orders"
+    assert result["model"]["kind"] == "table"
+    assert result["model"]["file"] == "orders.sql"
+    assert result["model"]["repo"] == "test"
+    # Columns
+    assert len(result["columns"]) == 3
+    # Upstream / downstream
+    upstream_names = [u["name"] for u in result["upstream"]]
+    downstream_names = [d["name"] for d in result["downstream"]]
+    assert "raw_orders" in upstream_names
+    assert "marts.revenue" in downstream_names
+    # Column usage summary
+    cus = result["column_usage_summary"]
+    assert set(cus["most_used_columns"]) == {"order_id", "amount"}
+    assert "order_id" in cus["downstream_join_keys"]
+    assert "amount" in cus["downstream_aggregations"]
+    # Snippet is None (no real file on disk)
+    assert result["snippet"] is None
+
+    db.close()
+
+
+def test_get_context_no_pgq():
+    """query_context omits graph_metrics when DuckPGQ is disabled."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+        db.insert_node(file_id, "table", "staging.orders", "sql")
+
+    db._has_pgq = False
+    result = db.query_context("staging.orders")
+
+    assert "graph_metrics" not in result
+    # All other sections present
+    assert "model" in result
+    assert "columns" in result
+    assert "upstream" in result
+    assert "downstream" in result
+    assert "column_usage_summary" in result
+    assert "snippet" in result
+
+    db.close()
+
+
+def test_get_context_with_pgq():
+    """query_context includes graph_metrics when DuckPGQ pagerank succeeds."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ extension not available")
+
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+        stg_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        mart_id = db.insert_node(file_id, "table", "marts.revenue", "sql")
+        db.insert_edge(mart_id, stg_id, "references")
+
+    db.refresh_property_graph()
+    result = db.query_context("staging.orders")
+
+    # DuckPGQ is available and graph refreshed — graph_metrics must be present
+    assert "graph_metrics" in result
+    gm = result["graph_metrics"]
+    assert isinstance(gm["importance"], (float, type(None)))
+    assert gm["downstream_count"] == 1
+
+    db.close()
+
+
+def test_get_context_no_columns():
+    """query_context handles models with no columns and no column_usage."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "procs.sql", "sql", "abc123")
+        proc_id = db.insert_node(file_id, "table", "legacy_proc", "sql")
+        raw_id = db.insert_node(file_id, "table", "raw_data", "sql")
+        mart_id = db.insert_node(file_id, "table", "marts.report", "sql")
+        db.insert_edge(proc_id, raw_id, "references")
+        db.insert_edge(mart_id, proc_id, "references")
+
+    result = db.query_context("legacy_proc")
+
+    assert result["columns"] == []
+    cus = result["column_usage_summary"]
+    assert cus["most_used_columns"] == []
+    assert cus["downstream_join_keys"] == []
+    assert cus["downstream_aggregations"] == []
+    # Upstream and downstream still populated
+    upstream_names = [u["name"] for u in result["upstream"]]
+    downstream_names = [d["name"] for d in result["downstream"]]
+    assert "raw_data" in upstream_names
+    assert "marts.report" in downstream_names
+
+    db.close()
+
+
+def test_get_context_unknown_model():
+    """query_context returns error dict for a nonexistent model."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    result = db.query_context("nonexistent")
+
+    assert "error" in result
+    assert "model" not in result
+
+    db.close()
+
+
+def test_get_context_repo_filter():
+    """query_context with repo filter disambiguates same-named models."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_a_id = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
+    repo_b_id = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
+    with db.write_transaction():
+        file_a = db.insert_file(repo_a_id, "orders.sql", "sql", "aaa")
+        node_a = db.insert_node(file_a, "table", "orders", "sql")
+        db.insert_columns_batch([(node_a, "col_a", "INT", 0, "definition", None)])
+
+        file_b = db.insert_file(repo_b_id, "orders.sql", "sql", "bbb")
+        node_b = db.insert_node(file_b, "table", "orders", "sql")
+        db.insert_columns_batch([(node_b, "col_b", "TEXT", 0, "definition", None)])
+
+        # Column usage in repo_a only
+        ds_id = db.insert_node(file_a, "query", "downstream_a", "sql")
+        db.insert_edge(ds_id, node_a, "references")
+        db.insert_column_usage(ds_id, "orders", "col_a", "select", file_a)
+
+    result_a = db.query_context("orders", repo="repo_a")
+    assert result_a["model"]["repo"] == "repo_a"
+    col_names = [c["name"] for c in result_a["columns"]]
+    assert "col_a" in col_names
+    assert "col_b" not in col_names
+
+    result_b = db.query_context("orders", repo="repo_b")
+    assert result_b["model"]["repo"] == "repo_b"
+    col_names_b = [c["name"] for c in result_b["columns"]]
+    assert "col_b" in col_names_b
+
+    db.close()
