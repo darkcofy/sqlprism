@@ -359,6 +359,38 @@ async def trace_column_lineage(params: TraceColumnLineageInput) -> dict:
     )
 
 
+class GetSchemaInput(BaseModel):
+    name: str = Field(..., description="Table or model name (e.g. 'staging.orders', 'stg_orders')")
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Required if same model name exists in multiple repos.",
+    )
+
+
+@mcp.tool(
+    name="get_schema",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def get_schema(params: GetSchemaInput) -> dict:
+    """Get the schema of a table or model — columns, types, descriptions, and dependencies.
+
+    Returns column definitions (name, type, position, source, description),
+    upstream dependencies (what this model reads from), and downstream
+    dependencies (what reads from this model). The primary tool for
+    understanding table structure.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_schema,
+        name=params.name,
+        repo=params.repo,
+    )
+
+
 class PrImpactInput(BaseModel):
     base_commit: str = Field(
         ...,
