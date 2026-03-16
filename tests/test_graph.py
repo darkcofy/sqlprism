@@ -1268,3 +1268,95 @@ def test_insert_columns_batch_coalesce_data_type():
     assert row[0] == "INT"
     assert row[1] == "inferred"
     db.close()
+
+
+# ── DuckPGQ property graph tests ──
+
+
+def test_duckpgq_init_success():
+    """DuckPGQ installs/loads automatically and the property graph is queryable."""
+    import pytest
+
+    db = GraphDB()
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+
+    # Property graph must be queryable — no try/except, failures are real bugs
+    result = db._execute_read(
+        "FROM GRAPH_TABLE (sqlprism_graph MATCH (n:nodes) COLUMNS (n.node_id)) LIMIT 1"
+    ).fetchall()
+    assert isinstance(result, list)
+
+    db.close()
+
+
+def test_duckpgq_init_fallback():
+    """When DuckPGQ install fails, has_pgq is False and refresh is a no-op."""
+    from unittest.mock import patch
+
+    original_init_pgq = GraphDB._init_pgq
+
+    def _failing_init_pgq(self):
+        # Simulate DuckPGQ not being available by patching _execute_write
+        # to fail on LOAD duckpgq
+        original_execute = self._execute_write
+
+        def _reject_pgq(sql, params=None):
+            if "duckpgq" in sql.lower():
+                raise RuntimeError("Extension not available")
+            return original_execute(sql, params)
+
+        with patch.object(self, "_execute_write", new=_reject_pgq):
+            original_init_pgq(self)
+
+    with patch.object(GraphDB, "_init_pgq", _failing_init_pgq):
+        db = GraphDB()
+
+    assert db.has_pgq is False
+    # refresh_property_graph should be a safe no-op
+    db.refresh_property_graph()
+    db.close()
+
+
+def test_duckpgq_refresh_after_reindex():
+    """Property graph reflects newly inserted nodes after refresh."""
+    import pytest
+
+    db = GraphDB()
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+
+    # Insert test data
+    repo_id = db.upsert_repo("pgq-test", "/tmp/pgq")
+    file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+    src_id = db.insert_node(file_id, "table", "orders", "sql")
+    tgt_id = db.insert_node(file_id, "table", "customers", "sql")
+    db.insert_edge(src_id, tgt_id, "references")
+
+    # Refresh property graph so it picks up the new rows
+    db.refresh_property_graph()
+
+    # Query must succeed — no try/except fallback
+    result = db._execute_read(
+        "FROM GRAPH_TABLE (sqlprism_graph MATCH (n:nodes) COLUMNS (n.name)) LIMIT 10"
+    ).fetchall()
+    names = [r[0] for r in result]
+    assert "orders" in names
+    assert "customers" in names
+
+    db.close()
+
+
+def test_duckpgq_tools_check_flag():
+    """has_pgq property returns a bool usable for feature gating."""
+    import pytest
+
+    db = GraphDB()
+    assert isinstance(db.has_pgq, bool)
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+    assert db.has_pgq is True
+    db.close()
