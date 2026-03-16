@@ -392,6 +392,54 @@ async def get_schema(params: GetSchemaInput) -> dict:
     )
 
 
+class ColumnChange(BaseModel):
+    action: Literal["remove_column", "rename_column", "add_column"] = Field(
+        ...,
+        description="Type of column change: 'remove_column', 'rename_column', or 'add_column'",
+    )
+    column: str | None = Field(None, description="Column name (for remove_column and add_column)")
+    old: str | None = Field(None, description="Old column name (for rename_column)")
+    new: str | None = Field(None, description="New column name (for rename_column)")
+
+
+class CheckImpactInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    model: str = Field(..., description="Model or table name to check impact for (e.g. 'staging.orders')")
+    changes: list[ColumnChange] = Field(
+        ...,
+        description="List of proposed column changes to analyze",
+        min_length=1,
+    )
+    repo: str | None = Field(None, description="Filter by repo name. Omit to search all repos.")
+
+
+@mcp.tool(
+    name="check_impact",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def check_impact(params: CheckImpactInput) -> dict:
+    """Check the downstream impact of proposed column changes BEFORE modifying code.
+
+    Analyzes column usage across downstream models to classify each change as:
+    - **breaking**: SELECT/JOIN usage — downstream model will error
+    - **warning**: WHERE/GROUP BY usage — filter breaks but model may not error
+    - **safe**: column not referenced downstream
+
+    Call this BEFORE removing, renaming, or adding columns to understand the blast radius.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_check_impact,
+        model=params.model,
+        changes=[c.model_dump() for c in params.changes],
+        repo=params.repo,
+    )
+
+
 class PrImpactInput(BaseModel):
     base_commit: str = Field(
         ...,
