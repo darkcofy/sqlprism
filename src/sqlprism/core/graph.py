@@ -2836,6 +2836,27 @@ class GraphDB:
             "(SELECT COUNT(DISTINCT output_node || '.' || output_column) FROM column_lineage)"
         ).fetchone()
 
+        # Cross-repo edges: source and target belong to different repos
+        cross_repo_edges = self._execute_read(
+            "SELECT COUNT(*) FROM edges e "
+            "JOIN nodes n1 ON e.source_id = n1.node_id "
+            "JOIN nodes n2 ON e.target_id = n2.node_id "
+            "JOIN files f1 ON n1.file_id = f1.file_id "
+            "JOIN files f2 ON n2.file_id = f2.file_id "
+            "WHERE f1.repo_id != f2.repo_id"
+        ).fetchone()[0]
+
+        # Name collisions: same node name defined in multiple repos
+        collision_rows = self._execute_read(
+            "SELECT n.name, LIST(DISTINCT r.name ORDER BY r.name) AS repos "
+            "FROM nodes n "
+            "JOIN files f ON n.file_id = f.file_id "
+            "JOIN repos r ON f.repo_id = r.repo_id "
+            "GROUP BY n.name "
+            "HAVING COUNT(DISTINCT r.repo_id) > 1 "
+            "ORDER BY n.name"
+        ).fetchall()
+
         return {
             "repos": [
                 {
@@ -2857,5 +2878,10 @@ class GraphDB:
                 "column_lineage_chains": totals[5],
             },
             "phantom_nodes": totals[4],
+            "cross_repo_edges": cross_repo_edges,
+            "name_collisions": [
+                {"name": row[0], "repos": row[1]}
+                for row in collision_rows
+            ],
             "schema_version": "1.0",
         }
