@@ -23,6 +23,7 @@ Thread-safety model (read/write separation):
 """
 
 import json
+import logging
 import threading
 import warnings
 from contextlib import contextmanager
@@ -30,6 +31,8 @@ from functools import lru_cache
 from pathlib import Path
 
 import duckdb
+
+logger = logging.getLogger(__name__)
 
 _MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB – skip snippets for oversized files
 
@@ -193,6 +196,8 @@ class GraphDB:
         # writes) or a fresh cursor (snapshot isolation).
         self._tlocal = threading.local()
         self._init_schema()
+        self._has_pgq = False
+        self._init_pgq()
 
     def _init_schema(self) -> None:
         """Create tables and indices if they don't exist."""
@@ -208,6 +213,32 @@ class GraphDB:
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS "
             "repo_type TEXT DEFAULT 'sql'"
         )
+
+    def _init_pgq(self) -> None:
+        """Try to install and load DuckPGQ. Non-fatal if unavailable."""
+        try:
+            with self._write_lock:
+                self._execute_write("INSTALL duckpgq FROM community")
+                self._execute_write("LOAD duckpgq")
+            self._has_pgq = True
+            self._create_property_graph()
+        except Exception:
+            self._has_pgq = False
+
+    def _create_property_graph(self) -> None:
+        """Create or replace the DuckPGQ property graph from nodes/edges."""
+        if not self._has_pgq:
+            return
+        try:
+            with self._write_lock:
+                self._execute_write(
+                    "CREATE OR REPLACE PROPERTY GRAPH sqlprism_graph "
+                    "VERTEX TABLES (nodes) "
+                    "EDGE TABLES (edges SOURCE KEY (source_id) REFERENCES nodes (node_id) "
+                    "DESTINATION KEY (target_id) REFERENCES nodes (node_id))"
+                )
+        except Exception as e:
+            logger.warning("Failed to create property graph: %s", e)
 
     def _execute_read(self, sql: str, params=None):
         """Execute a read-only SQL statement.
@@ -255,6 +286,15 @@ class GraphDB:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
+
+    def refresh_property_graph(self) -> None:
+        """Refresh the property graph after data changes (e.g., reindex)."""
+        self._create_property_graph()
+
+    @property
+    def has_pgq(self) -> bool:
+        """Whether DuckPGQ is available for graph queries."""
+        return self._has_pgq
 
     @staticmethod
     def clear_snippet_cache() -> None:
