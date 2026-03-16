@@ -360,6 +360,7 @@ async def trace_column_lineage(params: TraceColumnLineageInput) -> dict:
 
 
 class GetSchemaInput(BaseModel):
+    model_config = {"populate_by_name": True}
     name: str = Field(..., description="Table or model name (e.g. 'staging.orders', 'stg_orders')")
     repo: str | None = Field(
         None,
