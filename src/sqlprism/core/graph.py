@@ -2813,8 +2813,12 @@ class GraphDB:
             ``indexed_at``, ``file_count``, ``node_count``),
             ``"totals"`` (aggregate counts for ``files``, ``nodes``,
             ``edges``, ``column_usage_records``,
-            ``column_lineage_chains``), ``"phantom_nodes"`` (int), and
-            ``"schema_version"`` (str).
+            ``column_lineage_chains``), ``"phantom_nodes"`` (int),
+            ``"cross_repo_edges"`` (int — edges where source and target
+            are in different repos; excludes phantom nodes),
+            ``"name_collisions"`` (list of dicts with ``name``,
+            ``kind``, and ``repos`` for nodes defined in multiple repos),
+            and ``"schema_version"`` (str).
         """
         repos = self._execute_read(
             "SELECT r.name, r.path, r.last_commit, r.last_branch, r.indexed_at, "
@@ -2835,6 +2839,32 @@ class GraphDB:
             "(SELECT COUNT(*) FROM nodes WHERE file_id IS NULL), "
             "(SELECT COUNT(DISTINCT output_node || '.' || output_column) FROM column_lineage)"
         ).fetchone()
+
+        # Cross-repo edges: source and target belong to different repos.
+        # INNER JOINs exclude phantom nodes (file_id IS NULL) which are
+        # transient placeholders created during incremental reindex.
+        cross_repo_edges = self._execute_read(
+            "SELECT COUNT(*) FROM edges e "
+            "JOIN nodes n1 ON e.source_id = n1.node_id "
+            "JOIN nodes n2 ON e.target_id = n2.node_id "
+            "JOIN files f1 ON n1.file_id = f1.file_id "
+            "JOIN files f2 ON n2.file_id = f2.file_id "
+            "WHERE f1.repo_id != f2.repo_id"
+        ).fetchone()[0]
+
+        # Name collisions: same (name, kind) defined in multiple repos.
+        # Discriminates by kind to avoid false positives between e.g.
+        # a table and a CTE sharing the same name.
+        collision_rows = self._execute_read(
+            "SELECT n.name, n.kind, "
+            "LIST(DISTINCT r.name ORDER BY r.name) AS repos "  # DuckDB LIST agg
+            "FROM nodes n "
+            "JOIN files f ON n.file_id = f.file_id "
+            "JOIN repos r ON f.repo_id = r.repo_id "
+            "GROUP BY n.name, n.kind "
+            "HAVING COUNT(DISTINCT r.repo_id) > 1 "
+            "ORDER BY n.name, n.kind"
+        ).fetchall()
 
         return {
             "repos": [
@@ -2857,5 +2887,10 @@ class GraphDB:
                 "column_lineage_chains": totals[5],
             },
             "phantom_nodes": totals[4],
+            "cross_repo_edges": cross_repo_edges,
+            "name_collisions": [
+                {"name": row[0], "kind": row[1], "repos": row[2]}
+                for row in collision_rows
+            ],
             "schema_version": "1.0",
         }
