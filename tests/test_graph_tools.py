@@ -227,3 +227,125 @@ def test_find_critical_models_no_pgq():
     assert result.keys() == {"error"}
     assert "DuckPGQ" in result["error"]
     db.close()
+
+
+# ── detect_cycles tests ──
+
+
+def test_detect_cycles_dag():
+    """DAG with no cycles returns has_cycles=False."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    file_id = db.insert_file(repo_id, "dag.sql", "sql", "abc")
+
+    a = db.insert_node(file_id, "table", "a", "sql")
+    b = db.insert_node(file_id, "table", "b", "sql")
+    c = db.insert_node(file_id, "table", "c", "sql")
+    d = db.insert_node(file_id, "table", "d", "sql")
+
+    db.insert_edge(a, b, "references")
+    db.insert_edge(b, c, "references")
+    db.insert_edge(c, d, "references")
+
+    result = db.query_detect_cycles()
+    assert result["has_cycles"] is False
+    assert result["cycles"] == []
+    db.close()
+
+
+def test_detect_cycles_simple():
+    """Simple cycle a->b->c->a is detected."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    file_id = db.insert_file(repo_id, "cycle.sql", "sql", "abc")
+
+    a = db.insert_node(file_id, "table", "a", "sql")
+    b = db.insert_node(file_id, "table", "b", "sql")
+    c = db.insert_node(file_id, "table", "c", "sql")
+
+    db.insert_edge(a, b, "references")
+    db.insert_edge(b, c, "references")
+    db.insert_edge(c, a, "references")
+
+    result = db.query_detect_cycles()
+    assert result["has_cycles"] is True
+    assert len(result["cycles"]) == 1
+    cycle = result["cycles"][0]
+    assert cycle["length"] == 3
+    # Path should contain a, b, c and end back at start
+    assert len(cycle["path"]) == 4
+    assert cycle["path"][0] == cycle["path"][-1]
+    assert set(cycle["path"][:3]) == {"a", "b", "c"}
+    db.close()
+
+
+def test_detect_cycles_multiple():
+    """Two independent cycles are both detected."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    file_id = db.insert_file(repo_id, "multi.sql", "sql", "abc")
+
+    a = db.insert_node(file_id, "table", "a", "sql")
+    b = db.insert_node(file_id, "table", "b", "sql")
+    c = db.insert_node(file_id, "table", "c", "sql")
+    d = db.insert_node(file_id, "table", "d", "sql")
+    e = db.insert_node(file_id, "table", "e", "sql")
+
+    # Cycle 1: a -> b -> a
+    db.insert_edge(a, b, "references")
+    db.insert_edge(b, a, "references")
+
+    # Cycle 2: c -> d -> e -> c
+    db.insert_edge(c, d, "references")
+    db.insert_edge(d, e, "references")
+    db.insert_edge(e, c, "references")
+
+    result = db.query_detect_cycles()
+    assert result["has_cycles"] is True
+    assert len(result["cycles"]) == 2
+    db.close()
+
+
+def test_detect_cycles_repo_filter():
+    """Repo filter isolates cycles to the specified repo."""
+    db = GraphDB()
+    repo_a = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
+    repo_b = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
+    file_a = db.insert_file(repo_a, "a.sql", "sql", "aaa")
+    file_b = db.insert_file(repo_b, "b.sql", "sql", "bbb")
+
+    # DAG in repo_a
+    a1 = db.insert_node(file_a, "table", "a1", "sql")
+    a2 = db.insert_node(file_a, "table", "a2", "sql")
+    db.insert_edge(a1, a2, "references")
+
+    # Cycle in repo_b
+    b1 = db.insert_node(file_b, "table", "b1", "sql")
+    b2 = db.insert_node(file_b, "table", "b2", "sql")
+    db.insert_edge(b1, b2, "references")
+    db.insert_edge(b2, b1, "references")
+
+    result_a = db.query_detect_cycles(repo="repo_a")
+    assert result_a["has_cycles"] is False
+
+    result_b = db.query_detect_cycles(repo="repo_b")
+    assert result_b["has_cycles"] is True
+    db.close()
+
+
+def test_detect_cycles_no_pgq_not_required():
+    """Cycle detection works without DuckPGQ (CTE-only approach)."""
+    db = GraphDB()
+    db._has_pgq = False
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    file_id = db.insert_file(repo_id, "cycle.sql", "sql", "abc")
+
+    a = db.insert_node(file_id, "table", "a", "sql")
+    b = db.insert_node(file_id, "table", "b", "sql")
+    db.insert_edge(a, b, "references")
+    db.insert_edge(b, a, "references")
+
+    result = db.query_detect_cycles()
+    assert result["has_cycles"] is True
+    assert len(result["cycles"]) == 1
+    db.close()
