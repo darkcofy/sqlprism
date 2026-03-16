@@ -1,6 +1,6 @@
 """CLI entry point for the SQLPrism MCP server.
 
-Reads config from a JSON file or command-line arguments,
+Reads config from a YAML or JSON file (or command-line arguments),
 initialises the server, and runs it.
 """
 
@@ -10,12 +10,16 @@ import sys
 from pathlib import Path
 
 import click
+import yaml
 
 from sqlprism.core.mcp_tools import configure, mcp
 from sqlprism.types import parse_repo_config
 
 DEFAULT_DB_PATH = Path.home() / ".sqlprism" / "graph.duckdb"
-DEFAULT_CONFIG_PATH = Path.home() / ".sqlprism" / "config.json"
+LEGACY_CONFIG_PATH = Path.home() / ".sqlprism" / "config.json"
+
+# Discovery order for config files in the working directory
+_CONFIG_NAMES = ("sqlprism.yml", "sqlprism.yaml", "sqlprism.json")
 
 
 @click.group()
@@ -41,7 +45,7 @@ def cli(ctx, log_level):
     "--config",
     "config_path",
     type=click.Path(),
-    default=str(DEFAULT_CONFIG_PATH),
+    default=None,
     help="Path to config file",
 )
 @click.option(
@@ -69,7 +73,7 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
             datefmt="%Y-%m-%dT%H:%M:%S",
         )
-    config = _load_config(config_path)
+    config = load_config(config_path)
 
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
@@ -92,7 +96,7 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
 
 
 @cli.command()
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--repo", "repo_name", type=str, default=None, help="Reindex a specific repo only")
 def reindex(config_path: str, db_path: str | None, repo_name: str | None):
@@ -100,7 +104,7 @@ def reindex(config_path: str, db_path: str | None, repo_name: str | None):
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = _load_config(config_path)
+    config = load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -208,7 +212,7 @@ def reindex(config_path: str, db_path: str | None, repo_name: str | None):
 
 @cli.command("reindex-file")
 @click.argument("paths", nargs=-1, required=True, type=click.Path())
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 def reindex_file(paths, config_path, db_path):
     """Reindex specific files (fast on-save path).
@@ -223,7 +227,7 @@ def reindex_file(paths, config_path, db_path):
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = _load_config(config_path)
+    config = load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -254,7 +258,7 @@ def reindex_file(paths, config_path, db_path):
 
 
 @cli.command("reindex-sqlmesh")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--name", "repo_name", type=str, required=True, help="Repo name for the index")
 @click.option(
@@ -298,7 +302,7 @@ def reindex_sqlmesh(
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = _load_config(config_path)
+    config = load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -334,7 +338,7 @@ def reindex_sqlmesh(
 
 
 @cli.command("reindex-dbt")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--name", "repo_name", type=str, required=True, help="Repo name for the index")
 @click.option(
@@ -384,7 +388,7 @@ def reindex_dbt_cmd(
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = _load_config(config_path)
+    config = load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -422,7 +426,7 @@ def _open_graph(config_path: str, db_path: str | None):
     """Load config, resolve db_path, and return a GraphDB instance."""
     from sqlprism.core.graph import GraphDB
 
-    config = _load_config(config_path)
+    config = load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     if not Path(effective_db_path).exists():
@@ -434,7 +438,7 @@ def _open_graph(config_path: str, db_path: str | None):
 
 @query.command("search")
 @click.argument("pattern")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--kind", type=str, default=None, help="Filter by node kind")
 @click.option("--schema", type=str, default=None, help="Filter by schema")
@@ -465,7 +469,7 @@ def query_search(
 
 @query.command("references")
 @click.argument("name")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--kind", type=str, default=None, help="Filter by node kind")
 @click.option("--schema", type=str, default=None, help="Filter by schema")
@@ -501,7 +505,7 @@ def query_references(
 
 @query.command("column-usage")
 @click.argument("table")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--column", type=str, default=None, help="Filter by column name")
 @click.option("--usage-type", type=str, default=None, help="Filter by usage type")
@@ -528,7 +532,7 @@ def query_column_usage(
 
 @query.command("trace")
 @click.argument("name")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--kind", type=str, default=None, help="Filter by node kind")
 @click.option(
@@ -563,7 +567,7 @@ def query_trace(
 
 
 @query.command("lineage")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 @click.option("--table", type=str, default=None, help="Filter by hop table name")
 @click.option("--column", type=str, default=None, help="Filter by column name")
@@ -590,13 +594,13 @@ def query_lineage(
 
 
 @cli.command()
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
+@click.option("--config", "config_path", type=click.Path(), default=None)
 @click.option("--db", "db_path", type=click.Path(), default=None)
 def status(config_path: str, db_path: str | None):
     """Show current index status."""
     from sqlprism.core.graph import GraphDB
 
-    config = _load_config(config_path)
+    config = load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     if not Path(effective_db_path).exists():
@@ -611,15 +615,21 @@ def status(config_path: str, db_path: str | None):
 
 
 @cli.command("init")
-@click.option("--config", "config_path", type=click.Path(), default=str(DEFAULT_CONFIG_PATH))
-def init_config(config_path: str):
-    """Create a default config file."""
-    config_file = Path(config_path)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["yaml", "json"], case_sensitive=False),
+    default="yaml",
+    help="Config file format (default: yaml)",
+)
+def init_config(fmt: str):
+    """Create a default config file in the working directory."""
+    ext = ".yml" if fmt == "yaml" else ".json"
+    config_file = Path.cwd() / f"sqlprism{ext}"
+
     if config_file.exists():
         click.echo(f"Config already exists at {config_file}")
         return
-
-    config_file.parent.mkdir(parents=True, exist_ok=True)
 
     default_config = {
         "db_path": str(DEFAULT_DB_PATH),
@@ -653,7 +663,12 @@ def init_config(config_path: str):
         },
     }
 
-    config_file.write_text(json.dumps(default_config, indent=2))
+    if fmt == "yaml":
+        config_file.write_text(
+            yaml.dump(default_config, default_flow_style=False, sort_keys=False)
+        )
+    else:
+        config_file.write_text(json.dumps(default_config, indent=2))
     click.echo(f"Created config at {config_file}")
     click.echo("Edit it to add your repos, then run: sqlprism reindex")
 
@@ -685,13 +700,60 @@ def _build_repo_configs(config: dict) -> dict:
     return result
 
 
-def _load_config(config_path: str) -> dict:
-    """Load config from JSON file, or return defaults."""
-    path = Path(config_path)
-    if path.exists():
-        return json.loads(path.read_text())
-    logging.warning("Config file not found: %s — using defaults", path)
-    return {"repos": {}, "db_path": str(DEFAULT_DB_PATH)}
+def load_config(path: str | None = None) -> dict:
+    """Load config from YAML or JSON file with automatic discovery.
+
+    Discovery order when *path* is ``None``:
+
+    1. ``sqlprism.yml`` in the working directory
+    2. ``sqlprism.yaml`` in the working directory
+    3. ``sqlprism.json`` in the working directory
+    4. ``~/.sqlprism/config.json`` (legacy location)
+
+    Args:
+        path: Explicit config file path.  When provided, only that
+            file is tried (no discovery).
+
+    Returns:
+        Parsed config dict.
+
+    Raises:
+        FileNotFoundError: No config file found in any location.
+    """
+    if path is not None:
+        resolved = Path(path)
+        if not resolved.exists():
+            raise FileNotFoundError(
+                f"Config file not found: {resolved}\n"
+                "Create one with: sqlprism init"
+            )
+        return _parse_config_file(resolved)
+
+    # Auto-discover
+    cwd = Path.cwd()
+    for name in _CONFIG_NAMES:
+        candidate = cwd / name
+        if candidate.exists():
+            return _parse_config_file(candidate)
+
+    # Legacy fallback
+    if LEGACY_CONFIG_PATH.exists():
+        return _parse_config_file(LEGACY_CONFIG_PATH)
+
+    raise FileNotFoundError(
+        "No config file found. Searched:\n"
+        + "".join(f"  - {cwd / n}\n" for n in _CONFIG_NAMES)
+        + f"  - {LEGACY_CONFIG_PATH}\n"
+        "Create one with: sqlprism init"
+    )
+
+
+def _parse_config_file(path: Path) -> dict:
+    """Parse a YAML or JSON config file."""
+    text = path.read_text()
+    if path.suffix in (".yml", ".yaml"):
+        return yaml.safe_load(text) or {}
+    return json.loads(text)
 
 
 def main():
