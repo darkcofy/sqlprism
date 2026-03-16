@@ -1830,7 +1830,7 @@ class GraphDB:
         try:
             if repo:
                 wcc_sql = (
-                    "SELECT n.name, wcc.component_id "
+                    "SELECT n.name, wcc.componentId "
                     "FROM weakly_connected_component(sqlprism_graph, nodes, edges) wcc "
                     "JOIN nodes n ON n.node_id = wcc.node_id "
                     "JOIN files f ON n.file_id = f.file_id "
@@ -1840,15 +1840,31 @@ class GraphDB:
                 rows = self._execute_read(wcc_sql, [repo]).fetchall()
             else:
                 wcc_sql = (
-                    "SELECT n.name, wcc.component_id "
+                    "SELECT n.name, wcc.componentId "
                     "FROM weakly_connected_component(sqlprism_graph, nodes, edges) wcc "
                     "JOIN nodes n ON n.node_id = wcc.node_id "
                     "WHERE n.file_id IS NOT NULL"
                 )
                 rows = self._execute_read(wcc_sql).fetchall()
         except duckdb.Error as e:
-            logger.warning("WCC query failed: %s", e)
-            return {"error": f"Graph query failed: {e}"}
+            # WCC requires at least one edge; when graph has no edges
+            # (all nodes isolated), fall back to treating each as its own component.
+            if "CSR not found" in str(e):
+                if repo:
+                    fallback_sql = (
+                        "SELECT n.name FROM nodes n "
+                        "JOIN files f ON n.file_id = f.file_id "
+                        "JOIN repos r ON f.repo_id = r.repo_id "
+                        "WHERE n.file_id IS NOT NULL AND r.name = ?"
+                    )
+                    fallback_rows = self._execute_read(fallback_sql, [repo]).fetchall()
+                else:
+                    fallback_sql = "SELECT n.name FROM nodes n WHERE n.file_id IS NOT NULL"
+                    fallback_rows = self._execute_read(fallback_sql).fetchall()
+                rows = [(r[0], i) for i, r in enumerate(fallback_rows)]
+            else:
+                logger.warning("WCC query failed: %s", e)
+                return {"error": f"Graph query failed: {e}"}
 
         # Group by component_id
         comp_map: dict[int, list[str]] = {}
@@ -1856,25 +1872,23 @@ class GraphDB:
             comp_map.setdefault(component_id, []).append(name)
 
         # Build components list sorted by size descending
-        components = sorted(
-            [
-                {
-                    "component_id": cid,
-                    "size": len(names),
-                    "models": sorted(names),
-                }
-                for cid, names in comp_map.items()
-            ],
-            key=lambda c: c["size"],
-            reverse=True,
-        )
+        comp_list: list[dict[str, int | list[str]]] = [
+            {
+                "component_id": cid,
+                "size": len(names),
+                "models": sorted(names),
+            }
+            for cid, names in comp_map.items()
+        ]
+        comp_list.sort(key=lambda c: int(c["size"]), reverse=True)
 
-        largest_component = components[0]["models"][0] if components else None
-        orphaned_models = sorted(
-            name
-            for c in components
+        largest_models = comp_list[0]["models"] if comp_list else []
+        largest_component = largest_models[0] if isinstance(largest_models, list) and largest_models else None
+        orphaned_models: list[str] = sorted(
+            str(name)
+            for c in comp_list
             if c["size"] == 1
-            for name in c["models"]
+            for name in (c["models"] if isinstance(c["models"], list) else [])
         )
 
         # Total nodes in scope
@@ -1890,8 +1904,8 @@ class GraphDB:
             ).fetchone()[0]
 
         return {
-            "components": components,
-            "total_components": len(components),
+            "components": comp_list,
+            "total_components": len(comp_list),
             "largest_component": largest_component,
             "orphaned_models": orphaned_models,
             "total_nodes_in_scope": total,
