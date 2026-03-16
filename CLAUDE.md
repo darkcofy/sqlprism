@@ -37,7 +37,7 @@ tests/
 - **Types**: `feat` (enhancement), `fix` (bug), `chore` (maintenance)
 - **Issues**: BDD format with Given/When/Then scenarios
 - **PRs**: Link with `Closes #<number>`, draft first, mark ready after lint+tests pass
-- **Lint before PR**: Always run `uv run ruff check .` before creating or marking a PR ready
+- **Lint before PR**: Always run `uv run ruff check .` and `uv run ty check` before creating or marking a PR ready
 
 ## Skills
 

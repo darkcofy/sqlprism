@@ -1,5 +1,7 @@
 # Claude
-.claude/
+.claude/research/
+.claude/plans/
+.claude/settings.local.json
 .mcp.json
 
 # Coverage

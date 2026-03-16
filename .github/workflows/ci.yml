@@ -32,6 +32,10 @@ jobs:
       - name: Lint (auto-fix)
         run: uv run ruff check --fix src/ tests/
 
+      - name: Type check
+        if: matrix.python-version == '3.12'
+        run: uv run ty check
+
       - name: Test with coverage
         run: uv run pytest --cov=sqlprism --cov-report=xml
 
