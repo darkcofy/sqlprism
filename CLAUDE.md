@@ -18,7 +18,7 @@ src/sqlprism/
   core/
     graph.py       — DuckDB storage layer (MVCC, repo_type tracking)
     indexer.py      — Orchestrates parsing + indexing; file-level reindex with repo-type dispatch
-    mcp_tools.py   — MCP server tools (11 tools, non-blocking reindex, per-repo debounce)
+    mcp_tools.py   — MCP server tools (19 tools, non-blocking reindex, per-repo debounce)
   languages/
     sql.py         — sqlglot-based SQL parser
     dbt.py         — dbt renderer (full project + selective render_models)

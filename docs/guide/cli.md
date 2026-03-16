@@ -34,7 +34,7 @@ sqlprism status [--config PATH] [--db PATH]
 
 ### `sqlprism serve`
 
-Starts the MCP server, exposing all 11 tools to any MCP client.
+Starts the MCP server, exposing all 19 tools to any MCP client.
 
 ```bash
 sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable-http] [--port 8000]

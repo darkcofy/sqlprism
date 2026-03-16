@@ -17,6 +17,7 @@ Grep finds strings. This tool understands SQL structure.
 | Multi-hop impact analysis | Manual tracing | Automatic graph traversal |
 | PR blast radius | DIY with git diff | One call |
 | Cross-CTE column tracing | Basically impossible | Built-in |
+| Graph analytics (PageRank, cycles, bottlenecks) | No | Yes — DuckPGQ integration |
 
 On a 200-model SQLMesh project, a column impact query returns **75 structured results in ~5,000 tokens**. The grep equivalent would need **40-60 files opened, ~100,000+ tokens**, and still wouldn't tell you whether a column appears in a WHERE filter or a SELECT.
 
