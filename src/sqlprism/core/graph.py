@@ -1582,15 +1582,15 @@ class GraphDB:
         if path_rows:
             path_names = list(path_rows[0][0])
         else:
-            # BFS could not reconstruct the path (e.g., topology mismatch)
+            # BFS could not reconstruct — report as not found
             path_names = []
 
         return {
             "from": from_model,
             "to": to_model,
-            "path_found": True,
+            "path_found": bool(path_names),
             "path": path_names,
-            "length": path_length,
+            "length": path_length if path_names else 0,
         }
 
     def query_context(self, name: str, repo: str | None = None) -> dict:
