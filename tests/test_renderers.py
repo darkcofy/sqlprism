@@ -789,7 +789,7 @@ def test_sqlmesh_column_schema_none(tmp_path):
 
 
 def test_sqlmesh_columns_to_types_extraction(tmp_path):
-    """columns_to_types attribute is extracted into column_schemas output by the render script."""
+    """Renderer correctly handles column_schemas payload with mixed presence across models."""
     (tmp_path / ".venv").mkdir()
 
     renderer = SqlMeshRenderer()
@@ -822,3 +822,45 @@ def test_sqlmesh_columns_to_types_extraction(tmp_path):
     # customers should have no column defs
     customers = results['"db"."staging"."customers"']
     assert len(customers.columns) == 0
+
+
+def test_sqlmesh_column_schema_absent_key(tmp_path):
+    """Subprocess JSON without column_schemas key still works (backwards compatible)."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    # Old-format output without column_schemas key
+    rendered = {'"db"."staging"."orders"': "SELECT order_id FROM raw.orders"}
+    stdout_json = json.dumps({
+        "rendered": rendered,
+        "errors": [],
+    })
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    result = results['"db"."staging"."orders"']
+    assert len([c for c in result.columns if c.source == "sqlmesh_schema"]) == 0
+
+
+def test_build_column_defs_realistic_types():
+    """_build_column_defs handles realistic SQL type strings."""
+    from sqlprism.languages.sqlmesh import _build_column_defs
+
+    cols = _build_column_defs("my_model", {
+        "id": "INT64",
+        "name": "VARCHAR(255)",
+        "amount": "DECIMAL(10, 2)",
+        "created_at": "TIMESTAMP",
+    })
+    assert len(cols) == 4
+    assert cols[0].column_name == "id"
+    assert cols[0].data_type == "INT64"
+    assert cols[1].data_type == "VARCHAR(255)"
+    assert cols[2].data_type == "DECIMAL(10, 2)"
+    assert cols[3].data_type == "TIMESTAMP"
+    assert cols[0].position == 0
+    assert cols[3].position == 3
+    assert all(c.source == "sqlmesh_schema" for c in cols)
