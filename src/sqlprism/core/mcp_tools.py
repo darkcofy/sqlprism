@@ -490,6 +490,39 @@ async def find_critical_models(params: FindCriticalModelsInput) -> dict:
     )
 
 
+class DetectCyclesInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    repo: str | None = Field(None, description="Filter by repo name. Omit for all repos.")
+    max_cycle_length: int = Field(
+        10,
+        description="Maximum cycle length to detect (default 10, max 15)",
+        ge=2,
+        le=15,
+    )
+
+
+@mcp.tool(
+    name="detect_cycles",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def detect_cycles(params: DetectCyclesInput) -> dict:
+    """Detect circular dependencies in the SQL dependency graph.
+
+    Finds cycles where models form dependency loops (A -> B -> C -> A).
+    Uses recursive CTE traversal — no DuckPGQ extension required.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_detect_cycles,
+        repo=params.repo,
+        max_cycle_length=params.max_cycle_length,
+    )
+
+
 class ColumnChange(BaseModel):
     action: Literal["remove_column", "rename_column", "add_column"] = Field(
         ...,
