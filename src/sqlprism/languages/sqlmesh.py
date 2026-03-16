@@ -57,13 +57,17 @@ _RENDER_SCRIPT = textwrap.dedent("""\
     for model_name in targets:
         try:
             model = context.models.get(model_name)
+            if model is None:
+                errors.append({"model": model_name, "error": f"Model {model_name} not found in context"})
+                continue
             query = context.render(model_name)
             sql = query.sql(dialect=dialect)
             if sql:
                 rendered[model_name] = sql
-            if model and hasattr(model, 'columns_to_types') and model.columns_to_types:
+            if hasattr(model, 'columns_to_types') and model.columns_to_types:
                 column_schemas[model_name] = {
-                    col: str(typ) for col, typ in model.columns_to_types.items()
+                    col: (typ.sql() if hasattr(typ, 'sql') else str(typ))
+                    for col, typ in model.columns_to_types.items()
                 }
         except Exception as e:
             errors.append({"model": model_name, "error": str(e)})
@@ -213,8 +217,14 @@ class SqlMeshRenderer:
             enrich_nodes(result, "sqlmesh_model", model_name)
 
             # Attach column definitions from sqlmesh model schema
+            # sqlmesh_schema wins over inferred/definition columns from parser
             if model_name in column_schemas:
                 col_defs = _build_column_defs(model_name, column_schemas[model_name])
+                schema_names = {c.column_name for c in col_defs}
+                result.columns = [
+                    c for c in result.columns
+                    if c.node_name != model_name or c.column_name not in schema_names
+                ]
                 result.columns.extend(col_defs)
 
             results[model_name] = result
@@ -278,6 +288,7 @@ def _build_column_defs(
     Returns:
         List of ColumnDefResult with source='sqlmesh_schema'.
     """
+    # Position relies on columns_to_types insertion order, which sqlmesh preserves
     return [
         ColumnDefResult(
             node_name=model_name,
