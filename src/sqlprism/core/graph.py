@@ -1236,6 +1236,191 @@ class GraphDB:
             result["matches"] = len(node_rows)
         return result
 
+    def query_check_impact(
+        self,
+        model: str,
+        changes: list[dict],
+        repo: str | None = None,
+    ) -> dict:
+        """Analyze downstream impact of column changes on a model.
+
+        For each proposed change (column removal, rename, or addition),
+        queries the ``column_usage`` table to classify downstream models
+        as **breaking**, **warning**, or **safe**.
+
+        Note: ``add_column`` does not account for ``SELECT *`` usage —
+        downstream models using wildcard selects may still be affected.
+
+        The ``repo`` filter restricts both model lookup and downstream
+        consumer discovery to the same repo.
+
+        Args:
+            model: The model/table name whose columns are changing.
+            changes: List of change dicts.  Supported actions:
+                - ``{"action": "remove_column", "column": "col"}``
+                - ``{"action": "rename_column", "old": "old", "new": "new"}``
+                - ``{"action": "add_column", "column": "col"}``
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``model``, ``model_found``, ``changes_analyzed``,
+            ``impacts`` (one entry per change with ``breaking``,
+            ``warnings``, and ``safe`` lists), and a ``summary`` with
+            totals.
+        """
+        breaking_types = {"select", "join_on", "insert", "update"}
+        warning_types = {
+            "where", "group_by", "order_by", "having",
+            "partition_by", "window_order", "qualify",
+        }
+
+        # Pre-fetch source node IDs — exclude phantoms (file_id IS NULL)
+        if repo:
+            node_rows = self._execute_read(
+                "SELECT n.node_id FROM nodes n "
+                "JOIN files f ON n.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id "
+                "WHERE n.name = ? AND r.name = ?",
+                [model, repo],
+            ).fetchall()
+        else:
+            node_rows = self._execute_read(
+                "SELECT n.node_id FROM nodes n "
+                "WHERE n.name = ? AND n.file_id IS NOT NULL",
+                [model],
+            ).fetchall()
+
+        if not node_rows:
+            return {
+                "model": model,
+                "model_found": False,
+                "changes_analyzed": len(changes),
+                "impacts": [],
+                "summary": {"total_breaking": 0, "total_warnings": 0, "total_safe": 0},
+            }
+
+        node_ids = [r[0] for r in node_rows]
+        placeholders = ", ".join("?" for _ in node_ids)
+
+        # Fetch downstream models via edges, excluding the model itself
+        ds_rows = self._execute_read(
+            "SELECT DISTINCT n2.name, n2.kind "
+            "FROM edges e "
+            "JOIN nodes n2 ON e.source_id = n2.node_id "
+            f"WHERE e.target_id IN ({placeholders}) "
+            f"AND e.source_id NOT IN ({placeholders})",
+            node_ids + node_ids,
+        ).fetchall()
+        all_downstream = [{"name": r[0], "kind": r[1]} for r in ds_rows]
+
+        impacts: list[dict] = []
+        total_breaking = 0
+        total_warnings = 0
+        total_safe = 0
+
+        for change in changes:
+            action = change.get("action", "")
+
+            # Determine the column name to check
+            if action == "add_column":
+                # Always safe — no downstream references exist yet
+                # (does not account for SELECT * usage)
+                impacts.append({
+                    "change": change,
+                    "breaking": [],
+                    "warnings": [],
+                    "safe": [{"model": d["name"], "kind": d["kind"]} for d in all_downstream],
+                })
+                total_safe += len(all_downstream)
+                continue
+            elif action == "rename_column":
+                col_name = change.get("old", "")
+            elif action == "remove_column":
+                col_name = change.get("column", "")
+            else:
+                # Unknown action — record as skipped so len(impacts) == changes_analyzed
+                impacts.append({
+                    "change": change,
+                    "skipped": True,
+                    "reason": f"unknown action '{action}'",
+                    "breaking": [],
+                    "warnings": [],
+                    "safe": [],
+                })
+                continue
+
+            # Query column_usage for downstream references to this column
+            where = ["cu.table_name = ?", "cu.column_name = ?"]
+            params: list = [model, col_name]
+            if repo:
+                where.append("r.name = ?")
+                params.append(repo)
+
+            usage_sql = (
+                "SELECT DISTINCT n.name AS node_name, n.kind AS node_kind, cu.usage_type "
+                "FROM column_usage cu "
+                "JOIN nodes n ON cu.node_id = n.node_id "
+                "LEFT JOIN files f ON cu.file_id = f.file_id "
+                "LEFT JOIN repos r ON f.repo_id = r.repo_id "
+                f"WHERE {' AND '.join(where)}"
+            )
+            usage_rows = self._execute_read(usage_sql, params).fetchall()
+
+            # Group usage_types per downstream model
+            model_usage: dict[tuple[str, str], list[str]] = {}
+            for r in usage_rows:
+                key = (r[0], r[1])  # (node_name, node_kind)
+                model_usage.setdefault(key, []).append(r[2])
+
+            breaking: list[dict] = []
+            warnings: list[dict] = []
+            affected_names: set[str] = set()
+
+            for (name, kind), usage_types in model_usage.items():
+                affected_names.add(name)
+                types_set = set(usage_types)
+                if types_set & breaking_types:
+                    breaking.append({
+                        "model": name,
+                        "kind": kind,
+                        "usage_types": sorted(types_set),
+                    })
+                elif types_set & warning_types:
+                    warnings.append({
+                        "model": name,
+                        "kind": kind,
+                        "usage_types": sorted(types_set),
+                    })
+
+            # Safe = downstream models not in breaking or warning
+            safe = [
+                {"model": d["name"], "kind": d["kind"]}
+                for d in all_downstream
+                if d["name"] not in affected_names
+            ]
+
+            impacts.append({
+                "change": change,
+                "breaking": breaking,
+                "warnings": warnings,
+                "safe": safe,
+            })
+            total_breaking += len(breaking)
+            total_warnings += len(warnings)
+            total_safe += len(safe)
+
+        return {
+            "model": model,
+            "model_found": True,
+            "changes_analyzed": len(changes),
+            "impacts": impacts,
+            "summary": {
+                "total_breaking": total_breaking,
+                "total_warnings": total_warnings,
+                "total_safe": total_safe,
+            },
+        }
+
     # ── Snippet helper ──
 
     def _read_snippet(
