@@ -73,7 +73,7 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
             datefmt="%Y-%m-%dT%H:%M:%S",
         )
-    config = load_config(config_path)
+    config = _cli_load_config(config_path)
 
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
@@ -104,7 +104,7 @@ def reindex(config_path: str, db_path: str | None, repo_name: str | None):
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = load_config(config_path)
+    config = _cli_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -227,7 +227,7 @@ def reindex_file(paths, config_path, db_path):
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = load_config(config_path)
+    config = _cli_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -302,7 +302,7 @@ def reindex_sqlmesh(
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = load_config(config_path)
+    config = _cli_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -388,7 +388,7 @@ def reindex_dbt_cmd(
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = load_config(config_path)
+    config = _cli_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
     Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -426,7 +426,7 @@ def _open_graph(config_path: str, db_path: str | None):
     """Load config, resolve db_path, and return a GraphDB instance."""
     from sqlprism.core.graph import GraphDB
 
-    config = load_config(config_path)
+    config = _cli_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     if not Path(effective_db_path).exists():
@@ -600,7 +600,7 @@ def status(config_path: str, db_path: str | None):
     """Show current index status."""
     from sqlprism.core.graph import GraphDB
 
-    config = load_config(config_path)
+    config = _cli_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     if not Path(effective_db_path).exists():
@@ -624,12 +624,17 @@ def status(config_path: str, db_path: str | None):
 )
 def init_config(fmt: str):
     """Create a default config file in the working directory."""
-    ext = ".yml" if fmt == "yaml" else ".json"
-    config_file = Path.cwd() / f"sqlprism{ext}"
+    cwd = Path.cwd()
 
-    if config_file.exists():
-        click.echo(f"Config already exists at {config_file}")
-        return
+    # Check for any existing config variant to avoid shadowing
+    for name in _CONFIG_NAMES:
+        existing = cwd / name
+        if existing.exists():
+            click.echo(f"Config already exists at {existing}")
+            return
+
+    ext = ".yml" if fmt == "yaml" else ".json"
+    config_file = cwd / f"sqlprism{ext}"
 
     default_config = {
         "db_path": str(DEFAULT_DB_PATH),
@@ -700,6 +705,14 @@ def _build_repo_configs(config: dict) -> dict:
     return result
 
 
+def _cli_load_config(path: str | None) -> dict:
+    """CLI wrapper: converts FileNotFoundError to a friendly click error."""
+    try:
+        return load_config(path)
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+
+
 def load_config(path: str | None = None) -> dict:
     """Load config from YAML or JSON file with automatic discovery.
 
@@ -744,16 +757,30 @@ def load_config(path: str | None = None) -> dict:
         "No config file found. Searched:\n"
         + "".join(f"  - {cwd / n}\n" for n in _CONFIG_NAMES)
         + f"  - {LEGACY_CONFIG_PATH}\n"
-        "Create one with: sqlprism init"
+        + "Create one with: sqlprism init"
     )
 
 
 def _parse_config_file(path: Path) -> dict:
     """Parse a YAML or JSON config file."""
-    text = path.read_text()
-    if path.suffix in (".yml", ".yaml"):
-        return yaml.safe_load(text) or {}
-    return json.loads(text)
+    suffix = path.suffix.lower()
+    if suffix not in (".yml", ".yaml", ".json"):
+        raise click.ClickException(
+            f"Unsupported config format: {path.suffix}. Use .yml, .yaml, or .json"
+        )
+    try:
+        text = path.read_text()
+        if suffix in (".yml", ".yaml"):
+            result = yaml.safe_load(text) or {}
+        else:
+            result = json.loads(text) if text.strip() else {}
+    except (yaml.YAMLError, json.JSONDecodeError, OSError) as e:
+        raise click.ClickException(f"Failed to parse {path}: {e}") from e
+    if not isinstance(result, dict):
+        raise click.ClickException(
+            f"Config must be a mapping, got {type(result).__name__} in {path}"
+        )
+    return result
 
 
 def main():
