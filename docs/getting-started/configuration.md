@@ -1,44 +1,34 @@
 # Configuration
 
-`sqlprism init` creates a config file at `~/.sqlprism/config.json`. You can override the path with `--config PATH` on any command.
+`sqlprism init` creates a config file at `sqlprism.yml` in the working directory. You can override the path with `--config PATH` on any command. JSON is also supported (`--format json`).
 
 ## Full Config Example
 
-```json
-{
-  "db_path": "~/.sqlprism/graph.duckdb",
-  "sql_dialect": null,
-  "repos": {
-    "my-queries": "/path/to/sql/repo",
-    "multi-dialect-repo": {
-      "path": "/path/to/repo",
-      "dialect": "starrocks",
-      "dialect_overrides": {
-        "athena/": "athena",
-        "postgres/": "postgres"
-      }
-    }
-  },
-  "sqlmesh_repos": {
-    "my-sqlmesh-project": {
-      "project_path": "/path/to/sqlmesh/folder",
-      "env_file": "/path/to/.env",
-      "dialect": "athena",
-      "variables": {
-        "GRACE_PERIOD": 7
-      }
-    }
-  },
-  "dbt_repos": {
-    "my-dbt-project": {
-      "project_path": "/path/to/dbt/project",
-      "env_file": "/path/to/.env",
-      "target": "dev",
-      "dialect": "starrocks",
-      "dbt_command": "uv run dbt"
-    }
-  }
-}
+```yaml
+db_path: ~/.sqlprism/graph.duckdb
+sql_dialect: null
+repos:
+  my-queries: /path/to/sql/repo
+  multi-dialect-repo:
+    path: /path/to/repo
+    dialect: starrocks
+    dialect_overrides:
+      athena/: athena
+      postgres/: postgres
+sqlmesh_repos:
+  my-sqlmesh-project:
+    project_path: /path/to/sqlmesh/folder
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
+dbt_repos:
+  my-dbt-project:
+    project_path: /path/to/dbt/project
+    env_file: /path/to/.env
+    target: dev
+    dialect: starrocks
+    dbt_command: uv run dbt
 ```
 
 ## Top-Level Fields
@@ -56,20 +46,18 @@
 Each entry in `repos` maps a repo name to either a path string or a config object.
 
 **Simple form** — just a path:
-```json
-"my-queries": "/path/to/sql/repo"
+```yaml
+my-queries: /path/to/sql/repo
 ```
 
 **Full form** — with dialect and overrides:
-```json
-"my-repo": {
-  "path": "/path/to/repo",
-  "dialect": "starrocks",
-  "dialect_overrides": {
-    "athena/": "athena",
-    "postgres/": "postgres"
-  }
-}
+```yaml
+my-repo:
+  path: /path/to/repo
+  dialect: starrocks
+  dialect_overrides:
+    athena/: athena
+    postgres/: postgres
 ```
 
 | Field | Type | Description |

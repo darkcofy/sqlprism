@@ -25,7 +25,7 @@ On a 200-model SQLMesh project, a column impact query returns **75 structured re
 ```bash
 git clone <repo-url> && cd sqlprism
 uv sync
-uv run sqlprism init       # creates ~/.sqlprism/config.json
+uv run sqlprism init       # creates sqlprism.yml
 # edit config to add your repos
 uv run sqlprism reindex     # index plain SQL repos
 uv run sqlprism serve       # start MCP server

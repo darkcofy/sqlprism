@@ -15,12 +15,12 @@ All commands use `uv run sqlprism` (or just `sqlprism` if the venv is activated)
 Creates a default config file with example entries.
 
 ```bash
-sqlprism init [--config PATH]
+sqlprism init [--format yaml|json]
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--config` | `~/.sqlprism/config.json` | Where to write the config file. |
+| `--format` | `yaml` | Config file format: `yaml` or `json`. |
 
 ### `sqlprism status`
 
@@ -44,7 +44,7 @@ sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable_http] [
 |---|---|---|
 | `--transport` | `stdio` | Transport mode. Use `stdio` for Claude Code / Claude Desktop. Use `streamable_http` for web-based clients. |
 | `--port` | `8000` | Port for HTTP transport. Only used with `streamable_http`. |
-| `--config` | `~/.sqlprism/config.json` | Path to config file. |
+| `--config` | Auto-discovered (see Configuration) | Path to config file. |
 | `--db` | From config | Path to DuckDB file. Overrides `db_path` in config. |
 
 ## Indexing Commands
@@ -60,7 +60,7 @@ sqlprism reindex-file /path/to/model.sql [/path/to/another.sql ...]
 | Parameter | Required | Description |
 |---|---|---|
 | `PATHS` | Yes | One or more file paths to reindex (positional). |
-| `--config` | No | Path to config file. Default: `~/.sqlprism/config.json`. |
+| `--config` | No | Path to config file. Default: auto-discovered. |
 | `--db` | No | Path to DuckDB file. Overrides config. |
 
 **Editor integration (non-MCP):**
@@ -136,7 +136,7 @@ All query commands output JSON to stdout. They share common parameters:
 
 | Parameter | Description |
 |---|---|
-| `--config PATH` | Path to config file. Default: `~/.sqlprism/config.json`. |
+| `--config PATH` | Path to config file. Default: auto-discovered. |
 | `--db PATH` | Path to DuckDB file. Overrides config. |
 | `--repo TEXT` | Filter results by repo name. Omit to query across all repos. |
 

@@ -24,21 +24,16 @@ sqlprism reindex-sqlmesh \
 
 ## Config Usage
 
-Add to `sqlmesh_repos` in `~/.sqlprism/config.json`:
+Add to `sqlmesh_repos` in `sqlprism.yml`:
 
-```json
-{
-  "sqlmesh_repos": {
-    "my-project": {
-      "project_path": "/path/to/sqlmesh/project",
-      "env_file": "/path/to/.env",
-      "dialect": "athena",
-      "variables": {
-        "GRACE_PERIOD": 7
-      }
-    }
-  }
-}
+```yaml
+sqlmesh_repos:
+  my-project:
+    project_path: /path/to/sqlmesh/project
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
 ```
 
 ## Variables
