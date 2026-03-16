@@ -723,3 +723,144 @@ def test_reindex_sqlmesh_triggers_filtered_render(tmp_path):
     assert len(file_backed) >= 1
 
     db.close()
+
+
+# ── SqlMesh column schema extraction tests (#25) ──
+
+
+from sqlprism.types import ColumnDefResult  # noqa: E402
+
+
+def test_sqlmesh_column_schema_explicit(tmp_path):
+    """Model with explicit column types produces ColumnDefResult entries with source='sqlmesh_schema'."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    rendered = {'"db"."staging"."orders"': "SELECT order_id, status FROM raw.orders"}
+    column_schemas = {
+        '"db"."staging"."orders"': {"order_id": "INT", "status": "TEXT"},
+    }
+    stdout_json = json.dumps({
+        "rendered": rendered,
+        "errors": [],
+        "column_schemas": column_schemas,
+    })
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    result = results['"db"."staging"."orders"']
+    assert len(result.columns) == 2, f"Expected 2 column defs, got {len(result.columns)}"
+
+    col_map = {c.column_name: c for c in result.columns}
+    assert "order_id" in col_map
+    assert "status" in col_map
+
+    assert col_map["order_id"].data_type == "INT"
+    assert col_map["status"].data_type == "TEXT"
+    assert col_map["order_id"].source == "sqlmesh_schema"
+    assert col_map["status"].source == "sqlmesh_schema"
+    assert col_map["order_id"].position == 0
+    assert col_map["status"].position == 1
+    assert col_map["order_id"].node_name == '"db"."staging"."orders"'
+
+
+def test_sqlmesh_column_schema_none(tmp_path):
+    """Model without column definitions produces no ColumnDefResult entries and no error."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    rendered = {'"db"."staging"."orders"': "SELECT order_id, status FROM raw.orders"}
+    stdout_json = json.dumps({
+        "rendered": rendered,
+        "errors": [],
+        "column_schemas": {},
+    })
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    result = results['"db"."staging"."orders"']
+    assert len(result.columns) == 0, "Model without columns_to_types should have no column defs"
+
+
+def test_sqlmesh_columns_to_types_extraction(tmp_path):
+    """Renderer correctly handles column_schemas payload with mixed presence across models."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    # Simulate subprocess output where columns_to_types was available
+    rendered = {
+        '"db"."staging"."orders"': "SELECT order_id, status FROM raw.orders",
+        '"db"."staging"."customers"': "SELECT id, name FROM raw.customers",
+    }
+    column_schemas = {
+        '"db"."staging"."orders"': {"order_id": "INT", "status": "TEXT"},
+        # customers has no column schema (columns_to_types was None/empty)
+    }
+    stdout_json = json.dumps({
+        "rendered": rendered,
+        "errors": [],
+        "column_schemas": column_schemas,
+    })
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    # orders should have column defs
+    orders = results['"db"."staging"."orders"']
+    assert len(orders.columns) == 2
+    assert all(isinstance(c, ColumnDefResult) for c in orders.columns)
+    assert all(c.source == "sqlmesh_schema" for c in orders.columns)
+
+    # customers should have no column defs
+    customers = results['"db"."staging"."customers"']
+    assert len(customers.columns) == 0
+
+
+def test_sqlmesh_column_schema_absent_key(tmp_path):
+    """Subprocess JSON without column_schemas key still works (backwards compatible)."""
+    (tmp_path / ".venv").mkdir()
+
+    renderer = SqlMeshRenderer()
+
+    # Old-format output without column_schemas key
+    rendered = {'"db"."staging"."orders"': "SELECT order_id FROM raw.orders"}
+    stdout_json = json.dumps({
+        "rendered": rendered,
+        "errors": [],
+    })
+
+    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    result = results['"db"."staging"."orders"']
+    assert len([c for c in result.columns if c.source == "sqlmesh_schema"]) == 0
+
+
+def test_build_column_defs_realistic_types():
+    """_build_column_defs handles realistic SQL type strings."""
+    from sqlprism.languages.sqlmesh import _build_column_defs
+
+    cols = _build_column_defs("my_model", {
+        "id": "INT64",
+        "name": "VARCHAR(255)",
+        "amount": "DECIMAL(10, 2)",
+        "created_at": "TIMESTAMP",
+    })
+    assert len(cols) == 4
+    assert cols[0].column_name == "id"
+    assert cols[0].data_type == "INT64"
+    assert cols[1].data_type == "VARCHAR(255)"
+    assert cols[2].data_type == "DECIMAL(10, 2)"
+    assert cols[3].data_type == "TIMESTAMP"
+    assert cols[0].position == 0
+    assert cols[3].position == 3
+    assert all(c.source == "sqlmesh_schema" for c in cols)
