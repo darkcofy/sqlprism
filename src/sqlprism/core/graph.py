@@ -1598,27 +1598,31 @@ class GraphDB:
         top_n: int = 20,
         repo: str | None = None,
     ) -> dict:
-        """Rank models by importance using PageRank and downstream count.
+        """Rank models by importance using PageRank and direct dependent count.
+
+        PageRank is computed over the full graph (all repos). The ``repo``
+        filter limits which models are returned, not the computation scope.
+        This means a model's importance reflects cross-repo references.
 
         Args:
             top_n: Number of top models to return (default 20, max 100).
             repo: Optional repo name filter.
 
         Returns:
-            Dict with ``models`` list and ``total_indexed``; or ``error``
-            when DuckPGQ is not installed.
+            Dict with ``models`` list and ``total_indexed_nodes``; or
+            ``error`` when DuckPGQ is not installed.
         """
         if not self.has_pgq:
             return {"error": "DuckPGQ not installed. Install with: INSTALL duckpgq FROM community"}
 
         top_n = max(min(top_n, 100), 1)
 
-        # PageRank scores — join back to nodes for names
+        # PageRank scores — join back to nodes for names and node_ids
         # pagerank() returns (node_id, pagerank)
         try:
             if repo:
                 pr_sql = (
-                    "SELECT n.name, n.kind, pr.pagerank "
+                    "SELECT n.node_id, n.name, n.kind, pr.pagerank "
                     "FROM pagerank(sqlprism_graph, nodes, edges) pr "
                     "JOIN nodes n ON n.node_id = pr.node_id "
                     "JOIN files f ON n.file_id = f.file_id "
@@ -1629,7 +1633,7 @@ class GraphDB:
                 rows = self._execute_read(pr_sql, [repo, top_n]).fetchall()
             else:
                 pr_sql = (
-                    "SELECT n.name, n.kind, pr.pagerank "
+                    "SELECT n.node_id, n.name, n.kind, pr.pagerank "
                     "FROM pagerank(sqlprism_graph, nodes, edges) pr "
                     "JOIN nodes n ON n.node_id = pr.node_id "
                     "WHERE n.file_id IS NOT NULL "
@@ -1640,23 +1644,33 @@ class GraphDB:
             logger.warning("PageRank query failed: %s", e)
             return {"error": f"Graph query failed: {e}"}
 
-        # Compute downstream count per model
-        models = []
-        for name, kind, pagerank_score in rows:
-            ds_count = self._execute_read(
-                "SELECT COUNT(DISTINCT e.source_id) FROM edges e "
-                "JOIN nodes n ON e.target_id = n.node_id "
-                "WHERE n.name = ?",
-                [name],
+        if not rows:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL"
             ).fetchone()[0]
+            return {"models": [], "total_indexed_nodes": total}
+
+        # Batch downstream count (direct dependents) using node_ids
+        node_ids = [r[0] for r in rows]
+        placeholders = ",".join("?" for _ in node_ids)
+        ds_rows = self._execute_read(
+            f"SELECT e.target_id, COUNT(DISTINCT e.source_id) "
+            f"FROM edges e WHERE e.target_id IN ({placeholders}) "
+            f"GROUP BY e.target_id",
+            node_ids,
+        ).fetchall()
+        ds_map: dict[int, int] = {r[0]: r[1] for r in ds_rows}
+
+        models = []
+        for node_id, name, kind, pagerank_score in rows:
             models.append({
                 "name": name,
                 "kind": kind,
                 "importance": round(pagerank_score, 6),
-                "downstream_count": ds_count,
+                "direct_dependents": ds_map.get(node_id, 0),
             })
 
-        # Total indexed models count
+        # Total indexed node count
         if repo:
             total = self._execute_read(
                 "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.file_id "
@@ -1670,7 +1684,7 @@ class GraphDB:
 
         return {
             "models": models,
-            "total_indexed": total,
+            "total_indexed_nodes": total,
         }
 
     def query_context(self, name: str, repo: str | None = None) -> dict:

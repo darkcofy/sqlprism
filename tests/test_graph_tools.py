@@ -129,23 +129,28 @@ def test_find_path_self():
 
 
 def test_find_critical_models_pagerank():
-    """PageRank returns ranked models with expected fields."""
+    """PageRank returns ranked models with expected fields and values."""
     db = _build_chain_graph()
     if not db.has_pgq:
         db.close()
         pytest.skip("DuckPGQ not installed")
     result = db.query_find_critical_models(top_n=5)
     assert "models" in result
+    assert result["total_indexed_nodes"] == 5
     models = result["models"]
-    assert len(models) > 0
+    assert len(models) == 5
     for m in models:
         assert "name" in m
         assert "kind" in m
         assert isinstance(m["importance"], float)
-        assert isinstance(m["downstream_count"], int)
+        assert isinstance(m["direct_dependents"], int)
     # Sorted by importance descending
     importances = [m["importance"] for m in models]
     assert importances == sorted(importances, reverse=True)
+    # Verify concrete direct_dependents for known topology
+    by_name = {m["name"]: m for m in models}
+    # model_isolated has no dependents
+    assert by_name["model_isolated"]["direct_dependents"] == 0
     db.close()
 
 
@@ -157,8 +162,18 @@ def test_find_critical_models_default_top_n():
         pytest.skip("DuckPGQ not installed")
     result = db.query_find_critical_models()
     assert "models" in result
-    # Chain graph has 5 nodes, all should be returned (< 20)
     assert len(result["models"]) == 5
+    db.close()
+
+
+def test_find_critical_models_top_n_truncation():
+    """top_n=2 returns exactly 2 models."""
+    db = _build_chain_graph()
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not installed")
+    result = db.query_find_critical_models(top_n=2)
+    assert len(result["models"]) == 2
     db.close()
 
 
@@ -185,8 +200,8 @@ def test_find_critical_models_repo_filter():
 
     result = db.query_find_critical_models(repo="repo_a")
     names = {m["name"] for m in result["models"]}
-    assert "model_a1" in names or "model_a2" in names
-    assert "model_b1" not in names
+    assert names == {"model_a1", "model_a2"}
+    assert result["total_indexed_nodes"] == 2
     db.close()
 
 
