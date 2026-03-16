@@ -1986,13 +1986,8 @@ class GraphDB:
 
         start_id = start_nodes[0][0]
 
-        # Direction determines which side of the edge we follow
-        if direction == "downstream":
-            pass
-        elif direction == "upstream":
-            pass
-        else:
-            # Both — run downstream and upstream separately and merge
+        # "both" — run downstream and upstream separately and merge
+        if direction == "both":
             down = self.query_trace(
                 name,
                 kind,
@@ -2149,25 +2144,36 @@ class GraphDB:
         limit: int,
         include_snippets: bool,
     ) -> list[dict]:
-        """Trace dependencies using DuckPGQ GRAPH_TABLE bounded traversal."""
-        if direction == "downstream":
-            edge_pattern = f"(a:nodes WHERE a.node_id = ?)<-[e:edges]-{{1,{max_depth}}}"
-        else:
-            edge_pattern = f"(a:nodes WHERE a.node_id = ?)-[e:edges]->{{1,{max_depth}}}"
+        """Trace dependencies using DuckPGQ GRAPH_TABLE bounded traversal.
 
-        # Get all reachable node_ids via PGQ bounded traversal
+        Note: PGQ bounded traversal does not provide per-hop depth or
+        per-hop edge attributes. Depth is recovered via a lightweight
+        CTE after node discovery. Relationship defaults to the edge's
+        actual value when a direct edge exists.
+        """
+        # Edge direction: source_id -> target_id in our model.
+        # -> follows source-to-target. <- follows target-to-source.
+        # Downstream (what does start_id reach) = follow -> (outgoing).
+        # Upstream (what reaches start_id) = follow <- (incoming).
+        if direction == "downstream":
+            edge_pattern = f"(a:nodes WHERE a.node_id = ?)-[e:edges]->{{1,{max_depth}}}"
+        else:
+            edge_pattern = f"(a:nodes WHERE a.node_id = ?)<-[e:edges]-{{1,{max_depth}}}"
+
+        # Step 1: PGQ bounded traversal to discover reachable node_ids
         pgq_sql = (
+            f"SELECT DISTINCT node_id FROM ("
             f"FROM GRAPH_TABLE (sqlprism_graph "
             f"MATCH {edge_pattern}(b:nodes) "
-            f"COLUMNS (b.node_id)) LIMIT ?"
+            f"COLUMNS (b.node_id))) LIMIT ?"
         )
         try:
             node_ids = [
                 r[0]
                 for r in self._execute_read(pgq_sql, [start_id, limit]).fetchall()
             ]
-        except Exception:
-            logger.debug("DuckPGQ trace failed for %s, falling back to CTE", name)
+        except duckdb.Error as e:
+            logger.warning("DuckPGQ trace failed for %s: %s, falling back to CTE", name, e)
             return self._trace_cte(
                 start_id, direction, max_depth, limit, include_snippets
             )
@@ -2175,34 +2181,70 @@ class GraphDB:
         if not node_ids:
             return []
 
-        # Single enrichment query for all discovered nodes
+        # Step 2: Recover depth via lightweight CTE on discovered nodes only
+        if direction == "downstream":
+            source_col, target_col = "source_id", "target_id"
+        else:
+            source_col, target_col = "target_id", "source_id"
+
         placeholders = ",".join("?" for _ in node_ids)
+        depth_sql = f"""
+        WITH RECURSIVE depth_trace AS (
+            SELECT e.{target_col} as node_id, 1 as depth
+            FROM edges e
+            WHERE e.{source_col} = ?
+            AND e.{target_col} IN ({placeholders})
+
+            UNION ALL
+
+            SELECT e.{target_col}, dt.depth + 1
+            FROM edges e
+            JOIN depth_trace dt ON e.{source_col} = dt.node_id
+            WHERE dt.depth < ?
+            AND e.{target_col} IN ({placeholders})
+        )
+        SELECT node_id, MIN(depth) as min_depth FROM depth_trace GROUP BY node_id
+        """
+        depth_params = [start_id] + node_ids + [max_depth] + node_ids
+        depth_rows = self._execute_read(depth_sql, depth_params).fetchall()
+        depth_map: dict[int, int] = {r[0]: r[1] for r in depth_rows}
+
+        # Step 3: Enrich with metadata (file, repo, edge relationship)
         enrich_sql = (
             f"SELECT n.node_id, n.name, n.kind, n.language, "
-            f"n.line_start, n.line_end, f.path, r.name "
+            f"n.line_start, n.line_end, f.path, r.name, "
+            f"e.relationship, e.context "
             f"FROM nodes n "
             f"LEFT JOIN files f ON n.file_id = f.file_id "
             f"LEFT JOIN repos r ON f.repo_id = r.repo_id "
+            f"LEFT JOIN edges e ON e.{target_col} = n.node_id "
+            f"AND e.{source_col} IN ({placeholders}) "
             f"WHERE n.node_id IN ({placeholders}) "
+            f"AND n.file_id IS NOT NULL "
             f"ORDER BY n.name"
         )
-        rows = self._execute_read(enrich_sql, node_ids).fetchall()
+        enrich_params = node_ids + node_ids
+        rows = self._execute_read(enrich_sql, enrich_params).fetchall()
 
+        seen: set[int] = set()
         paths: list[dict] = []
         for r in rows:
-            _node_id, node_name, node_kind, language, line_start, line_end, file_path, repo_name = r
+            nid, node_name, node_kind, language, line_start, line_end, fp, rn, rel, ctx = r
+            if nid in seen:
+                continue
+            seen.add(nid)
             entry: dict = {
                 "name": node_name,
                 "kind": node_kind,
                 "language": language,
-                "relationship": "references",
-                "context": None,
-                "depth": 1,  # PGQ bounded traversal does not provide per-hop depth
-                "file": file_path,
-                "repo": repo_name,
+                "relationship": rel or "references",
+                "context": ctx,
+                "depth": depth_map.get(nid, 1),
+                "file": fp,
+                "repo": rn,
             }
             if include_snippets:
-                snippet = self._read_snippet(repo_name, file_path, line_start, line_end)
+                snippet = self._read_snippet(rn, fp, line_start, line_end)
                 if snippet:
                     entry["snippet"] = snippet
             paths.append(entry)

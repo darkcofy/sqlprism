@@ -1395,6 +1395,14 @@ def _build_trace_graph():
     return db
 
 
+def _assert_trace_structure(result):
+    """Verify trace result has expected top-level keys."""
+    assert "root" in result
+    assert "paths" in result
+    assert "depth_summary" in result
+    assert "repos_affected" in result
+
+
 def test_trace_deps_duckpgq():
     """PGQ trace from raw_orders downstream finds all dependants."""
     import pytest
@@ -1408,16 +1416,9 @@ def test_trace_deps_duckpgq():
 
     result = db.query_trace("raw_orders", direction="downstream", max_depth=3)
 
-    # Verify result structure
-    assert "root" in result
-    assert "paths" in result
-    assert "depth_summary" in result
-    assert "repos_affected" in result
-
+    _assert_trace_structure(result)
     names = {p["name"] for p in result["paths"]}
-    assert "stg_orders" in names
-    assert "marts_revenue" in names
-    assert "dim_customers" in names
+    assert names == {"stg_orders", "marts_revenue", "dim_customers"}
     db.close()
 
 
@@ -1428,10 +1429,15 @@ def test_trace_deps_cte_fallback():
 
     result = db.query_trace("raw_orders", direction="downstream", max_depth=3)
 
+    _assert_trace_structure(result)
     names = {p["name"] for p in result["paths"]}
-    assert "stg_orders" in names
-    assert "marts_revenue" in names
-    assert "dim_customers" in names
+    assert names == {"stg_orders", "marts_revenue", "dim_customers"}
+
+    # CTE provides real per-hop depth
+    depths = {p["name"]: p["depth"] for p in result["paths"]}
+    assert depths["stg_orders"] == 1
+    assert depths["dim_customers"] == 1
+    assert depths["marts_revenue"] == 2
     db.close()
 
 
@@ -1449,15 +1455,12 @@ def test_pr_impact_duckpgq_multi_root():
     # Trace from raw_orders — should find all three dependants
     result_raw = db.query_trace("raw_orders", direction="downstream")
     names_raw = {p["name"] for p in result_raw["paths"]}
-    assert "stg_orders" in names_raw
-    assert "marts_revenue" in names_raw
-    assert "dim_customers" in names_raw
+    assert names_raw == {"stg_orders", "marts_revenue", "dim_customers"}
 
     # Trace from stg_orders — should find only marts_revenue
     result_stg = db.query_trace("stg_orders", direction="downstream")
     names_stg = {p["name"] for p in result_stg["paths"]}
-    assert "marts_revenue" in names_stg
-    assert "dim_customers" not in names_stg
+    assert names_stg == {"marts_revenue"}
     db.close()
 
 
@@ -1474,17 +1477,50 @@ def test_pr_impact_cte_fallback():
     )
 
     names = {p["name"] for p in result["paths"]}
-    # stg_orders edge was excluded, so it should not appear
-    assert "stg_orders" not in names
-    # marts_revenue depends on stg_orders which was excluded, so not reachable
-    assert "marts_revenue" not in names
-    # dim_customers references raw_orders directly, still found
-    assert "dim_customers" in names
+    assert names == {"dim_customers"}
+    db.close()
+
+
+def test_pr_impact_exclude_edges_forces_cte():
+    """exclude_edges forces CTE dispatch even when PGQ is available."""
+    import pytest
+
+    db = _build_trace_graph()
+    db.refresh_property_graph()
+
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+
+    # PGQ is available but exclude_edges should force CTE
+    result = db.query_trace(
+        "raw_orders",
+        direction="downstream",
+        exclude_edges={("raw_orders", "stg_orders")},
+    )
+
+    names = {p["name"] for p in result["paths"]}
+    # CTE with exclusion: stg_orders and marts_revenue unreachable
+    assert names == {"dim_customers"}
+    db.close()
+
+
+def test_trace_max_depth_boundary():
+    """max_depth=1 excludes models beyond 1 hop."""
+    db = _build_trace_graph()
+    db._has_pgq = False  # Use CTE for reliable depth
+
+    result = db.query_trace("raw_orders", direction="downstream", max_depth=1)
+
+    names = {p["name"] for p in result["paths"]}
+    # Only depth-1 nodes: stg_orders and dim_customers (not marts_revenue at depth 2)
+    assert names == {"stg_orders", "dim_customers"}
+    assert result["depth_summary"] == {1: 2}
     db.close()
 
 
 def test_trace_pgq_cte_parity():
-    """PGQ and CTE produce the same set of node names for the same query."""
+    """PGQ and CTE produce the same set of node names and depths."""
     import pytest
 
     db = _build_trace_graph()
@@ -1508,7 +1544,11 @@ def test_trace_pgq_cte_parity():
 
     # Both engines must find exactly the same nodes
     assert pgq_names == cte_names
-    assert "stg_orders" in pgq_names
-    assert "marts_revenue" in pgq_names
-    assert "dim_customers" in pgq_names
+    assert pgq_names == {"stg_orders", "marts_revenue", "dim_customers"}
+
+    # Depths should also match now that PGQ recovers depth via CTE
+    pgq_depths = {p["name"]: p["depth"] for p in pgq_paths}
+    cte_depths = {p["name"]: p["depth"] for p in cte_paths}
+    assert pgq_depths == cte_depths
+
     db.close()
