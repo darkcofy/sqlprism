@@ -806,6 +806,42 @@ class Indexer:
             if lineage_rows:
                 self.graph.insert_column_lineage_batch(lineage_rows)
 
+        # ── Batch insert column definitions ──
+        if result.columns:
+            col_rows = []
+            for col_def in result.columns:
+                # Try to resolve node_id from local map (search all schemas)
+                node_id = None
+                for key, nid in node_id_map.items():
+                    if key[0] == col_def.node_name:
+                        node_id = nid
+                        break
+                # Fall back to graph resolution
+                if not node_id:
+                    node_id = self.graph.resolve_node(col_def.node_name, "table", repo_id)
+                if not node_id:
+                    node_id = self.graph.resolve_node(col_def.node_name, "view", repo_id)
+                if not node_id:
+                    logger.warning(
+                        "Column def skipped: cannot resolve node '%s' for column '%s'",
+                        col_def.node_name,
+                        col_def.column_name,
+                    )
+                    continue
+                col_rows.append(
+                    (
+                        node_id,
+                        col_def.column_name,
+                        col_def.data_type,
+                        col_def.position,
+                        col_def.source,
+                        col_def.description,
+                    )
+                )
+            if col_rows:
+                self.graph.insert_columns_batch(col_rows)
+            stats["columns_added"] = stats.get("columns_added", 0) + len(col_rows)
+
     def _resolve_edge_endpoint(
         self,
         name: str,
