@@ -1808,6 +1808,101 @@ class GraphDB:
             "total_nodes_in_scope": total,
         }
 
+    def query_find_subgraphs(self, repo: str | None = None) -> dict:
+        """Find weakly connected components (subgraphs) in the dependency graph.
+
+        Uses DuckPGQ ``weakly_connected_component`` to partition the graph
+        into disjoint subgraphs.  Phantom nodes (file_id IS NULL) are
+        excluded from the results.
+
+        Args:
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``components``, ``total_components``,
+            ``largest_component``, ``orphaned_models``, and
+            ``total_nodes_in_scope``; or ``error`` when DuckPGQ is not
+            installed or the query fails.
+        """
+        if not self.has_pgq:
+            return {"error": "DuckPGQ not installed. Install with: INSTALL duckpgq FROM community"}
+
+        # Build WCC query — repo filter applied post-WCC via JOIN.
+        # NOTE: WCC runs on the full property graph; repo filtering only
+        # restricts which nodes appear in the result, not the component
+        # assignments. Cross-repo edges may merge otherwise-disconnected
+        # repo-local subgraphs into one component.
+        repo_join = (
+            "JOIN files f ON n.file_id = f.file_id "
+            "JOIN repos r ON f.repo_id = r.repo_id "
+        ) if repo else ""
+        repo_where = "AND r.name = ? " if repo else ""
+        params: list = [repo] if repo else []
+
+        wcc_sql = (
+            "SELECT n.name, wcc.componentId "
+            "FROM weakly_connected_component(sqlprism_graph, nodes, edges) wcc "
+            "JOIN nodes n ON n.node_id = wcc.node_id "
+            f"{repo_join}"
+            f"WHERE n.file_id IS NOT NULL {repo_where}"
+        )
+        fallback_sql = (
+            "SELECT n.name FROM nodes n "
+            f"{repo_join}"
+            f"WHERE n.file_id IS NOT NULL {repo_where}"
+        )
+
+        try:
+            rows = self._execute_read(wcc_sql, params).fetchall()
+        except duckdb.Error as e:
+            # WCC requires at least one edge; when the graph has no edges
+            # (all nodes isolated) DuckPGQ raises a "CSR not found" error.
+            # Fall back to treating each node as its own component.
+            if "CSR" in str(e):
+                fallback_rows = self._execute_read(fallback_sql, params).fetchall()
+                rows = [(r[0], i) for i, r in enumerate(fallback_rows)]
+            else:
+                logger.warning("WCC query failed: %s", e)
+                return {"error": f"Graph query failed: {e}"}
+
+        # Group by component_id
+        comp_map: dict[int, list[str]] = {}
+        for name, component_id in rows:
+            comp_map.setdefault(component_id, []).append(name)
+
+        # Build components list sorted by size descending
+        comp_list: list[dict[str, int | list[str]]] = [
+            {
+                "component_id": cid,
+                "size": len(names),
+                "models": sorted(names),
+            }
+            for cid, names in comp_map.items()
+        ]
+        comp_list.sort(key=lambda c: c["size"], reverse=True)  # type: ignore[type-var]
+
+        largest_component: dict[str, object] | None = (
+            {"name": comp_list[0]["models"][0], "size": comp_list[0]["size"]}  # type: ignore[index]
+            if comp_list else None
+        )
+        orphaned_models: list[str] = sorted(
+            name  # type: ignore[type-var]
+            for c in comp_list
+            if c["size"] == 1
+            for name in c["models"]  # type: ignore[union-attr]
+        )
+
+        # Derive total from results to guarantee consistency with components
+        total = sum(len(names) for names in comp_map.values())
+
+        return {
+            "components": comp_list,
+            "total_components": len(comp_list),
+            "largest_component": largest_component,
+            "orphaned_models": orphaned_models,
+            "total_nodes_in_scope": total,
+        }
+
     def query_context(self, name: str, repo: str | None = None) -> dict:
         """Return comprehensive context for a model.
 
