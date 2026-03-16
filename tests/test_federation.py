@@ -6,11 +6,15 @@ from sqlprism.core.graph import GraphDB
 def _build_cross_repo_graph():
     """Build two repos with cross-repo dependencies.
 
-    Repo A: raw_orders -> staging_orders (staging depends on raw)
-    Repo B: marts_revenue -> staging_orders (marts depends on staging from repo A)
+    Data flow: raw_orders -> staging_orders -> marts_revenue
+    Edge convention: insert_edge(source, target) = source depends on target.
 
-    This creates a cross-repo edge: marts_revenue (repo_b) -> staging_orders (repo_a)
-    Edge convention: source REFERENCES target = source depends on target.
+    Repo A: staging_orders depends on raw_orders
+    Repo B: marts_revenue depends on staging_orders (cross-repo)
+
+    query_trace direction semantics:
+    - "upstream" follows inbound edges (what depends on this node = downstream impact)
+    - "downstream" follows outbound edges (what this node depends on = upstream deps)
     """
     db = GraphDB()
     repo_a = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
@@ -25,76 +29,63 @@ def _build_cross_repo_graph():
     # Repo B nodes
     marts_revenue = db.insert_node(file_b, "table", "marts_revenue", "sql")
 
-    # Edges: source -> target follows downstream flow
-    db.insert_edge(raw_orders, staging_orders, "references")  # raw -> staging (within repo_a)
-    db.insert_edge(staging_orders, marts_revenue, "references")  # staging -> marts (cross-repo)
+    # Edges: source REFERENCES target = source depends on target
+    db.insert_edge(staging_orders, raw_orders, "references")     # staging depends on raw (within repo_a)
+    db.insert_edge(marts_revenue, staging_orders, "references")  # marts depends on staging (cross-repo)
 
-    return db
+    return db, file_b
 
 
 def test_cross_repo_trace():
-    """Upstream trace from marts_revenue should cross repo boundaries to reach raw_orders."""
-    db = _build_cross_repo_graph()
+    """Trace what marts_revenue depends on — should cross into repo_a."""
+    db, _ = _build_cross_repo_graph()
     try:
-        if db.has_pgq:
-            db._create_property_graph()
-        result = db.query_trace("marts_revenue", direction="upstream", max_depth=3)
+        # "downstream" in query_trace = follow outbound edges = what this node depends on
+        result = db.query_trace("marts_revenue", direction="downstream", max_depth=3)
 
         path_names = [step["name"] for step in result["paths"]]
-        assert "staging_orders" in path_names, "staging_orders should appear in upstream trace"
-        assert "raw_orders" in path_names, "raw_orders should appear (traced through staging_orders)"
+        assert "staging_orders" in path_names
+        assert "raw_orders" in path_names
 
-        # Nodes from both repos must appear
+        # Both repos should appear
         path_repos = {step["repo"] for step in result["paths"]}
-        assert "repo_a" in path_repos, "trace should include nodes from repo_a"
+        assert "repo_a" in path_repos
     finally:
         db.close()
 
 
 def test_cross_repo_get_context():
-    """Context for staging_orders should show cross-repo downstream dependency marts_revenue."""
-    db = _build_cross_repo_graph()
+    """Context for marts_revenue shows staging_orders (repo_a) as upstream dependency."""
+    db, _ = _build_cross_repo_graph()
     try:
-        if db.has_pgq:
-            db._create_property_graph()
-        # query_context for staging_orders: it has an outgoing edge to marts_revenue
-        # which query_schema exposes in "upstream" (targets of edges where node is source)
-        result = db.query_context("staging_orders")
+        result = db.query_context("marts_revenue")
 
+        # marts_revenue depends on staging_orders → staging_orders is upstream
         upstream_names = [u["name"] for u in result["upstream"]]
-        assert "marts_revenue" in upstream_names, (
-            "marts_revenue should appear as a dependency of staging_orders"
-        )
+        assert "staging_orders" in upstream_names
 
-        # Verify staging_orders lives in repo_a
-        assert result["model"]["repo"] == "repo_a", "staging_orders should belong to repo_a"
-
-        # Confirm marts_revenue is in a different repo (repo_b) — cross-repo dependency
-        marts_schema = db.query_schema("marts_revenue")
-        assert marts_schema["repo"] == "repo_b", "marts_revenue should belong to repo_b"
+        # Verify repos
+        assert result["model"]["repo"] == "repo_b"
+        staging_schema = db.query_schema("staging_orders")
+        assert staging_schema["repo"] == "repo_a"
     finally:
         db.close()
 
 
 def test_cross_repo_name_collision():
-    """A node with the same name in two repos should appear in name_collisions."""
-    db = _build_cross_repo_graph()
+    """Same (name, kind) in two repos appears in name_collisions."""
+    db, file_b = _build_cross_repo_graph()
     try:
-        # Add a second staging_orders node in repo_b's file
-        file_b_row = db._execute_read(
-            "SELECT f.file_id FROM files f "
-            "JOIN repos r ON f.repo_id = r.repo_id "
-            "WHERE r.name = 'repo_b'",
-        ).fetchone()
-        db.insert_node(file_b_row[0], "table", "staging_orders", "sql")
+        # Add a second staging_orders table in repo_b
+        db.insert_node(file_b, "table", "staging_orders", "sql")
 
         status = db.get_index_status()
         collision_names = {c["name"] for c in status["name_collisions"]}
-        assert "staging_orders" in collision_names, "staging_orders should be a name collision"
+        assert "staging_orders" in collision_names
 
-        # Verify both repos are listed
         for collision in status["name_collisions"]:
             if collision["name"] == "staging_orders":
+                assert collision["kind"] == "table"
                 assert sorted(collision["repos"]) == ["repo_a", "repo_b"]
                 break
     finally:
@@ -102,33 +93,52 @@ def test_cross_repo_name_collision():
 
 
 def test_index_status_cross_repo_edges():
-    """Index status should report exactly 1 cross-repo edge (marts_revenue -> staging_orders)."""
-    db = _build_cross_repo_graph()
+    """Index status reports exactly 1 cross-repo edge (marts_revenue -> staging_orders)."""
+    db, _ = _build_cross_repo_graph()
     try:
         status = db.get_index_status()
-        assert status["cross_repo_edges"] == 1, (
-            f"Expected 1 cross-repo edge, got {status['cross_repo_edges']}"
-        )
+        assert status["cross_repo_edges"] == 1
     finally:
         db.close()
 
 
 def test_cross_repo_pr_impact():
-    """Downstream trace from raw_orders should reach marts_revenue in repo_b (cross-repo blast radius)."""
-    db = _build_cross_repo_graph()
+    """Downstream impact from raw_orders reaches marts_revenue in repo_b.
+
+    Uses query_trace as a proxy for PR impact — the full pr_impact tool
+    requires git operations that are complex to mock in unit tests.
+    "upstream" in query_trace follows inbound edges = downstream impact.
+    """
+    db, _ = _build_cross_repo_graph()
     try:
-        if db.has_pgq:
-            db._create_property_graph()
-        result = db.query_trace("raw_orders", direction="downstream", max_depth=3)
+        # "upstream" = follow inbound edges = what depends on this node
+        result = db.query_trace("raw_orders", direction="upstream", max_depth=3)
 
         path_names = [step["name"] for step in result["paths"]]
-        assert "marts_revenue" in path_names, (
-            "marts_revenue from repo_b should appear in downstream trace of raw_orders"
-        )
+        assert "staging_orders" in path_names
+        assert "marts_revenue" in path_names
 
         # Confirm the trace spans repos
-        repos_affected = result.get("repos_affected", [])
-        assert "repo_a" in repos_affected, "repo_a should be in repos_affected"
-        assert "repo_b" in repos_affected, "repo_b should be in repos_affected"
+        repos_affected = result["repos_affected"]
+        assert "repo_a" in repos_affected
+        assert "repo_b" in repos_affected
+    finally:
+        db.close()
+
+
+def test_single_repo_no_cross_repo_edges():
+    """Single-repo graph has zero cross-repo edges and no name collisions."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("only_repo", "/tmp/only", repo_type="sql")
+        file_id = db.insert_file(repo_id, "models.sql", "sql", "abc")
+
+        a = db.insert_node(file_id, "table", "a", "sql")
+        b = db.insert_node(file_id, "table", "b", "sql")
+        db.insert_edge(a, b, "references")
+
+        status = db.get_index_status()
+        assert status["cross_repo_edges"] == 0
+        assert status["name_collisions"] == []
     finally:
         db.close()
