@@ -7,6 +7,7 @@ SQL knowledge graph MCP server — indexes SQL, dbt, and sqlmesh repos into a Du
 - **Language**: Python 3.12+
 - **Package manager**: uv
 - **Lint**: `uv run ruff check .`
+- **Type check**: `uv run ty check`
 - **Tests**: `uv run pytest tests/ -v`
 - **Single test**: `uv run pytest tests/test_indexer.py::test_name -v`
 
@@ -36,7 +37,7 @@ tests/
 - **Types**: `feat` (enhancement), `fix` (bug), `chore` (maintenance)
 - **Issues**: BDD format with Given/When/Then scenarios
 - **PRs**: Link with `Closes #<number>`, draft first, mark ready after lint+tests pass
-- **Lint before PR**: Always run `uv run ruff check .` before creating or marking a PR ready
+- **Lint before PR**: Always run `uv run ruff check .` and `uv run ty check` before creating or marking a PR ready
 
 ## Skills
 

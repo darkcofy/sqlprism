@@ -1038,7 +1038,7 @@ class GraphDB:
         rows = self._execute_read(sql, params + [limit, offset]).fetchall()
 
         # Group by (output_node, output_column, chain_index) into chains
-        chains: dict[tuple[str, str, int], list] = {}
+        chains: dict[tuple[str, str, int], dict] = {}
         for r in rows:
             key = (r[0], r[1], r[2])
             if key not in chains:
