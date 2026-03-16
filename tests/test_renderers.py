@@ -892,3 +892,107 @@ models:
 
     assert "stg_customers" in result
     assert result["stg_customers"][0].column_name == "customer_id"
+
+
+def test_extract_schema_yml_no_models_dir(tmp_path):
+    """Missing models/ directory returns empty dict."""
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    assert result == {}
+
+
+def test_extract_schema_yml_malformed_yaml(tmp_path):
+    """Malformed YAML files are skipped without raising."""
+    _write_yaml(
+        tmp_path / "models" / "broken.yml",
+        "!!invalid: [yaml\n  bad: {indent",
+    )
+    _write_yaml(
+        tmp_path / "models" / "good.yml",
+        """\
+version: 2
+
+models:
+  - name: good_model
+    columns:
+      - name: id
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    # Broken file skipped, good file still parsed
+    assert "good_model" in result
+    assert result["good_model"][0].column_name == "id"
+
+
+def test_extract_schema_yml_duplicate_model_across_files(tmp_path):
+    """Same model in two files: columns merged with offset positions."""
+    _write_yaml(
+        tmp_path / "models" / "a.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: order_id
+      - name: status
+""",
+    )
+    _write_yaml(
+        tmp_path / "models" / "b.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: amount
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    assert "stg_orders" in result
+    cols = result["stg_orders"]
+    assert len(cols) == 3
+    names = [c.column_name for c in cols]
+    assert "order_id" in names
+    assert "status" in names
+    assert "amount" in names
+    # Positions should not collide — second file offset by first file's count
+    positions = [c.position for c in cols]
+    assert len(set(positions)) == 3  # all unique
+
+
+def test_extract_schema_yml_sources(tmp_path):
+    """sources: blocks with tables and columns are extracted."""
+    _write_yaml(
+        tmp_path / "models" / "sources.yml",
+        """\
+version: 2
+
+sources:
+  - name: raw
+    tables:
+      - name: orders
+        columns:
+          - name: order_id
+            description: "PK"
+          - name: total
+      - name: customers
+        columns:
+          - name: customer_id
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    assert "raw.orders" in result
+    assert len(result["raw.orders"]) == 2
+    assert result["raw.orders"][0].column_name == "order_id"
+    assert result["raw.orders"][0].description == "PK"
+    assert result["raw.orders"][0].source == "schema_yml"
+    assert "raw.customers" in result
+    assert result["raw.customers"][0].column_name == "customer_id"
