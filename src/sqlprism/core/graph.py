@@ -1593,6 +1593,86 @@ class GraphDB:
             "length": path_length if path_names else 0,
         }
 
+    def query_find_critical_models(
+        self,
+        top_n: int = 20,
+        repo: str | None = None,
+    ) -> dict:
+        """Rank models by importance using PageRank and downstream count.
+
+        Args:
+            top_n: Number of top models to return (default 20, max 100).
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``models`` list and ``total_indexed``; or ``error``
+            when DuckPGQ is not installed.
+        """
+        if not self.has_pgq:
+            return {"error": "DuckPGQ not installed. Install with: INSTALL duckpgq FROM community"}
+
+        top_n = max(min(top_n, 100), 1)
+
+        # PageRank scores — join back to nodes for names
+        # pagerank() returns (node_id, pagerank)
+        try:
+            if repo:
+                pr_sql = (
+                    "SELECT n.name, n.kind, pr.pagerank "
+                    "FROM pagerank(sqlprism_graph, nodes, edges) pr "
+                    "JOIN nodes n ON n.node_id = pr.node_id "
+                    "JOIN files f ON n.file_id = f.file_id "
+                    "JOIN repos r ON f.repo_id = r.repo_id "
+                    "WHERE n.file_id IS NOT NULL AND r.name = ? "
+                    "ORDER BY pr.pagerank DESC LIMIT ?"
+                )
+                rows = self._execute_read(pr_sql, [repo, top_n]).fetchall()
+            else:
+                pr_sql = (
+                    "SELECT n.name, n.kind, pr.pagerank "
+                    "FROM pagerank(sqlprism_graph, nodes, edges) pr "
+                    "JOIN nodes n ON n.node_id = pr.node_id "
+                    "WHERE n.file_id IS NOT NULL "
+                    "ORDER BY pr.pagerank DESC LIMIT ?"
+                )
+                rows = self._execute_read(pr_sql, [top_n]).fetchall()
+        except duckdb.Error as e:
+            logger.warning("PageRank query failed: %s", e)
+            return {"error": f"Graph query failed: {e}"}
+
+        # Compute downstream count per model
+        models = []
+        for name, kind, pagerank_score in rows:
+            ds_count = self._execute_read(
+                "SELECT COUNT(DISTINCT e.source_id) FROM edges e "
+                "JOIN nodes n ON e.target_id = n.node_id "
+                "WHERE n.name = ?",
+                [name],
+            ).fetchone()[0]
+            models.append({
+                "name": name,
+                "kind": kind,
+                "importance": round(pagerank_score, 6),
+                "downstream_count": ds_count,
+            })
+
+        # Total indexed models count
+        if repo:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id WHERE r.name = ?",
+                [repo],
+            ).fetchone()[0]
+        else:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL"
+            ).fetchone()[0]
+
+        return {
+            "models": models,
+            "total_indexed": total,
+        }
+
     def query_context(self, name: str, repo: str | None = None) -> dict:
         """Return comprehensive context for a model.
 
