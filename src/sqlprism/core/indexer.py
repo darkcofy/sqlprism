@@ -178,6 +178,7 @@ class Indexer:
         commit, branch = self._get_git_info(path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
+        self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
 
@@ -249,6 +250,7 @@ class Indexer:
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
+        self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
 
@@ -320,6 +322,7 @@ class Indexer:
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
+        self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
 
@@ -508,7 +511,8 @@ class Indexer:
 
         if did_reindex:
             self.graph.cleanup_phantoms()
-            self.graph.clear_snippet_cache()
+            self.graph.refresh_property_graph()
+        self.graph.clear_snippet_cache()
 
     def _delete_stored_files_by_stem(self, repo_id: int, stem: str, stats: dict, display_path: str) -> None:
         """Delete stored file data for dbt/sqlmesh models by stem.
@@ -584,6 +588,7 @@ class Indexer:
             stats["reindexed"] += 1
             stats["details"].append({"path": model_path, "status": "reindexed"})
 
+        self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
 
     def _reindex_sqlmesh_files(
@@ -649,6 +654,7 @@ class Indexer:
             stats["reindexed"] += 1
             stats["details"].append({"path": file_path_key, "status": "reindexed"})
 
+        self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
 
     def _resolve_model_names_by_stem(
