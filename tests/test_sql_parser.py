@@ -1408,6 +1408,9 @@ def test_extract_columns_ctas_no_defs():
     )
     definition_cols = [c for c in result.columns if c.source == "definition"]
     assert len(definition_cols) == 0
+    # SELECT * can't be inferred without schema, so no inferred columns either
+    inferred_cols = [c for c in result.columns if c.source == "inferred"]
+    assert len(inferred_cols) == 0
 
 
 def test_extract_columns_cte_output():
@@ -1418,6 +1421,21 @@ def test_extract_columns_cte_output():
         "CREATE VIEW cte_view AS WITH cte AS (SELECT a, b FROM t) SELECT a, b FROM cte",
     )
     inferred = [c for c in result.columns if c.source == "inferred"]
+    assert len(inferred) == 2
+    col_names = [c.column_name for c in inferred]
+    assert "a" in col_names
+    assert "b" in col_names
+
+
+def test_extract_columns_create_view_union():
+    """CREATE VIEW with UNION infers columns from the first SELECT branch."""
+    parser = SqlParser()
+    result = parser.parse(
+        "v_combined.sql",
+        "CREATE VIEW v_combined AS SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2",
+    )
+    inferred = [c for c in result.columns if c.source == "inferred"]
+    assert len(inferred) == 2
     col_names = [c.column_name for c in inferred]
     assert "a" in col_names
     assert "b" in col_names
