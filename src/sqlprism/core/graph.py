@@ -1942,7 +1942,7 @@ class GraphDB:
         limit: int = 100,
         exclude_edges: set[tuple[str, str]] | None = None,
     ) -> dict:
-        """Trace multi-hop dependency chains using a recursive CTE.
+        """Trace multi-hop dependency chains via DuckPGQ or recursive CTE.
 
         Args:
             name: Starting entity name.
@@ -1968,7 +1968,7 @@ class GraphDB:
             ``direction="both"``, paths are split into ``"downstream"``
             and ``"upstream"`` keys instead of a single ``"paths"``.
         """
-        max_depth = min(max_depth, 10)
+        max_depth = max(min(max_depth, 10), 1)
         # Find starting node(s)
         where = ["name = ?"]
         params: list = [name]
@@ -1986,13 +1986,8 @@ class GraphDB:
 
         start_id = start_nodes[0][0]
 
-        # Direction determines which side of the edge we follow
-        if direction == "downstream":
-            source_col, target_col = "source_id", "target_id"
-        elif direction == "upstream":
-            source_col, target_col = "target_id", "source_id"
-        else:
-            # Both — run downstream and upstream separately and merge
+        # "both" — run downstream and upstream separately and merge
+        if direction == "both":
             down = self.query_trace(
                 name,
                 kind,
@@ -2023,6 +2018,46 @@ class GraphDB:
                 },
                 "repos_affected": list(set(down["repos_affected"] + up["repos_affected"])),
             }
+
+        # Dispatch to PGQ or CTE
+        use_pgq = self.has_pgq and exclude_edges is None
+        if use_pgq:
+            paths = self._trace_pgq(
+                start_id, name, direction, max_depth, limit, include_snippets
+            )
+        else:
+            paths = self._trace_cte(
+                start_id, direction, max_depth, limit, include_snippets, exclude_edges
+            )
+
+        depth_summary: dict[int, int] = {}
+        repos_affected: set[str] = set()
+        for p in paths:
+            depth_summary[p["depth"]] = depth_summary.get(p["depth"], 0) + 1
+            if p["repo"]:
+                repos_affected.add(p["repo"])
+
+        return {
+            "root": {"name": start_nodes[0][1], "kind": start_nodes[0][2]},
+            "paths": paths,
+            "depth_summary": depth_summary,
+            "repos_affected": sorted(repos_affected),
+        }
+
+    def _trace_cte(
+        self,
+        start_id: int,
+        direction: str,
+        max_depth: int,
+        limit: int,
+        include_snippets: bool,
+        exclude_edges: set[tuple[str, str]] | None = None,
+    ) -> list[dict]:
+        """Trace dependencies using recursive CTE (fallback when DuckPGQ unavailable)."""
+        if direction == "downstream":
+            source_col, target_col = "source_id", "target_id"
+        else:
+            source_col, target_col = "target_id", "source_id"
 
         # Pre-resolve exclude_edges name pairs to ID pairs
         exclude_clause = ""
@@ -2080,7 +2115,7 @@ class GraphDB:
 
         rows = self._execute_read(recursive_sql, [start_id, max_depth, limit]).fetchall()
 
-        paths = []
+        paths: list[dict] = []
         for r in rows:
             entry = {
                 "name": r[4],
@@ -2098,19 +2133,126 @@ class GraphDB:
                     entry["snippet"] = snippet
             paths.append(entry)
 
-        depth_summary: dict[int, int] = {}
-        repos_affected: set[str] = set()
-        for p in paths:
-            depth_summary[p["depth"]] = depth_summary.get(p["depth"], 0) + 1
-            if p["repo"]:
-                repos_affected.add(p["repo"])
+        return paths
 
-        return {
-            "root": {"name": start_nodes[0][1], "kind": start_nodes[0][2]},
-            "paths": paths,
-            "depth_summary": depth_summary,
-            "repos_affected": sorted(repos_affected),
-        }
+    def _trace_pgq(
+        self,
+        start_id: int,
+        name: str,
+        direction: str,
+        max_depth: int,
+        limit: int,
+        include_snippets: bool,
+    ) -> list[dict]:
+        """Trace dependencies using DuckPGQ GRAPH_TABLE bounded traversal.
+
+        Note: PGQ bounded traversal does not provide per-hop depth or
+        per-hop edge attributes. Depth is recovered via a lightweight
+        CTE after node discovery. Relationship defaults to the edge's
+        actual value when a direct edge exists.
+        """
+        # Edge direction: source_id -> target_id in our model.
+        # -> follows source-to-target. <- follows target-to-source.
+        # Downstream (what does start_id reach) = follow -> (outgoing).
+        # Upstream (what reaches start_id) = follow <- (incoming).
+        if direction == "downstream":
+            edge_pattern = f"(a:nodes WHERE a.node_id = ?)-[e:edges]->{{1,{max_depth}}}"
+        else:
+            edge_pattern = f"(a:nodes WHERE a.node_id = ?)<-[e:edges]-{{1,{max_depth}}}"
+
+        # Step 1: PGQ bounded traversal to discover reachable node_ids
+        pgq_sql = (
+            f"SELECT DISTINCT node_id FROM ("
+            f"FROM GRAPH_TABLE (sqlprism_graph "
+            f"MATCH {edge_pattern}(b:nodes) "
+            f"COLUMNS (b.node_id))) LIMIT ?"
+        )
+        try:
+            node_ids = [
+                r[0]
+                for r in self._execute_read(pgq_sql, [start_id, limit]).fetchall()
+            ]
+        except duckdb.Error as e:
+            logger.warning("DuckPGQ trace failed for %s: %s, falling back to CTE", name, e)
+            return self._trace_cte(
+                start_id, direction, max_depth, limit, include_snippets
+            )
+
+        if not node_ids:
+            return []
+
+        # Step 2: Recover depth via lightweight CTE on discovered nodes only
+        if direction == "downstream":
+            source_col, target_col = "source_id", "target_id"
+        else:
+            source_col, target_col = "target_id", "source_id"
+
+        placeholders = ",".join("?" for _ in node_ids)
+        depth_sql = f"""
+        WITH RECURSIVE depth_trace AS (
+            SELECT e.{target_col} as node_id, 1 as depth
+            FROM edges e
+            WHERE e.{source_col} = ?
+            AND e.{target_col} IN ({placeholders})
+
+            UNION ALL
+
+            SELECT e.{target_col}, dt.depth + 1
+            FROM edges e
+            JOIN depth_trace dt ON e.{source_col} = dt.node_id
+            WHERE dt.depth < ?
+            AND e.{target_col} IN ({placeholders})
+        )
+        SELECT node_id, MIN(depth) as min_depth FROM depth_trace GROUP BY node_id
+        """
+        depth_params = [start_id] + node_ids + [max_depth] + node_ids
+        depth_rows = self._execute_read(depth_sql, depth_params).fetchall()
+        depth_map: dict[int, int] = {r[0]: r[1] for r in depth_rows}
+
+        # Step 3: Enrich with metadata (file, repo, edge relationship)
+        # Include start_id in edge source lookup so depth-1 nodes get real relationship
+        source_ids = [start_id] + node_ids
+        source_ph = ",".join("?" for _ in source_ids)
+        enrich_sql = (
+            f"SELECT n.node_id, n.name, n.kind, n.language, "
+            f"n.line_start, n.line_end, f.path, r.name, "
+            f"e.relationship, e.context "
+            f"FROM nodes n "
+            f"LEFT JOIN files f ON n.file_id = f.file_id "
+            f"LEFT JOIN repos r ON f.repo_id = r.repo_id "
+            f"LEFT JOIN edges e ON e.{target_col} = n.node_id "
+            f"AND e.{source_col} IN ({source_ph}) "
+            f"WHERE n.node_id IN ({placeholders}) "
+            f"AND n.file_id IS NOT NULL "
+            f"ORDER BY n.name"
+        )
+        enrich_params = source_ids + node_ids
+        rows = self._execute_read(enrich_sql, enrich_params).fetchall()
+
+        seen: set[int] = set()
+        paths: list[dict] = []
+        for r in rows:
+            nid, node_name, node_kind, language, line_start, line_end, fp, rn, rel, ctx = r
+            if nid in seen:
+                continue
+            seen.add(nid)
+            entry: dict = {
+                "name": node_name,
+                "kind": node_kind,
+                "language": language,
+                "relationship": rel or "references",
+                "context": ctx,
+                "depth": depth_map.get(nid, 1),
+                "file": fp,
+                "repo": rn,
+            }
+            if include_snippets:
+                snippet = self._read_snippet(rn, fp, line_start, line_end)
+                if snippet:
+                    entry["snippet"] = snippet
+            paths.append(entry)
+
+        return paths
 
     def get_index_status(self) -> dict:
         """Return a summary of the current index state.

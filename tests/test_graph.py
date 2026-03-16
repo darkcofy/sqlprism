@@ -1360,3 +1360,199 @@ def test_duckpgq_tools_check_flag():
         pytest.skip("DuckPGQ not available in this environment")
     assert db.has_pgq is True
     db.close()
+
+
+# ── Trace dispatch and CTE parity tests ──
+
+
+def _build_trace_graph():
+    """Create a graph with known topology for trace tests.
+
+    Topology (downstream flow):
+        raw_orders -> stg_orders -> marts_revenue
+        raw_orders -> dim_customers
+
+    Edges follow source -> target for downstream traversal:
+        raw_orders  -> stg_orders
+        stg_orders  -> marts_revenue
+        raw_orders  -> dim_customers
+    """
+    db = GraphDB()
+    repo_id = db.upsert_repo("trace-repo", "/tmp/trace")
+    file_id = db.insert_file(repo_id, "models.sql", "sql", "trace123")
+
+    raw_orders = db.insert_node(file_id, "table", "raw_orders", "sql")
+    stg_orders = db.insert_node(file_id, "table", "stg_orders", "sql")
+    marts_revenue = db.insert_node(file_id, "table", "marts_revenue", "sql")
+    dim_customers = db.insert_node(file_id, "table", "dim_customers", "sql")
+
+    # Edges follow source->target for downstream traversal
+    # raw_orders -> stg_orders -> marts_revenue, raw_orders -> dim_customers
+    db.insert_edge(raw_orders, stg_orders, "references")
+    db.insert_edge(stg_orders, marts_revenue, "references")
+    db.insert_edge(raw_orders, dim_customers, "references")
+
+    return db
+
+
+def _assert_trace_structure(result):
+    """Verify trace result has expected top-level keys."""
+    assert "root" in result
+    assert "paths" in result
+    assert "depth_summary" in result
+    assert "repos_affected" in result
+
+
+def test_trace_deps_duckpgq():
+    """PGQ trace from raw_orders downstream finds all dependants."""
+    import pytest
+
+    db = _build_trace_graph()
+    db.refresh_property_graph()
+
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+
+    result = db.query_trace("raw_orders", direction="downstream", max_depth=3)
+
+    _assert_trace_structure(result)
+    names = {p["name"] for p in result["paths"]}
+    assert names == {"stg_orders", "marts_revenue", "dim_customers"}
+    db.close()
+
+
+def test_trace_deps_cte_fallback():
+    """CTE fallback finds the same dependants when PGQ is disabled."""
+    db = _build_trace_graph()
+    db._has_pgq = False
+
+    result = db.query_trace("raw_orders", direction="downstream", max_depth=3)
+
+    _assert_trace_structure(result)
+    names = {p["name"] for p in result["paths"]}
+    assert names == {"stg_orders", "marts_revenue", "dim_customers"}
+
+    # CTE provides real per-hop depth
+    depths = {p["name"]: p["depth"] for p in result["paths"]}
+    assert depths["stg_orders"] == 1
+    assert depths["dim_customers"] == 1
+    assert depths["marts_revenue"] == 2
+    db.close()
+
+
+def test_pr_impact_duckpgq_multi_root():
+    """PGQ trace from multiple roots finds expected downstream models."""
+    import pytest
+
+    db = _build_trace_graph()
+    db.refresh_property_graph()
+
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+
+    # Trace from raw_orders — should find all three dependants
+    result_raw = db.query_trace("raw_orders", direction="downstream")
+    _assert_trace_structure(result_raw)
+    names_raw = {p["name"] for p in result_raw["paths"]}
+    assert names_raw == {"stg_orders", "marts_revenue", "dim_customers"}
+
+    # Trace from stg_orders — should find only marts_revenue
+    result_stg = db.query_trace("stg_orders", direction="downstream")
+    names_stg = {p["name"] for p in result_stg["paths"]}
+    assert names_stg == {"marts_revenue"}
+    db.close()
+
+
+def test_pr_impact_cte_fallback():
+    """CTE path with exclude_edges filters out excluded edges and their dependants."""
+    db = _build_trace_graph()
+    db._has_pgq = False
+
+    # Exclude the edge raw_orders -> stg_orders
+    result = db.query_trace(
+        "raw_orders",
+        direction="downstream",
+        exclude_edges={("raw_orders", "stg_orders")},
+    )
+
+    _assert_trace_structure(result)
+    names = {p["name"] for p in result["paths"]}
+    assert names == {"dim_customers"}
+    db.close()
+
+
+def test_pr_impact_exclude_edges_forces_cte():
+    """exclude_edges forces CTE dispatch even when PGQ is available."""
+    import pytest
+
+    db = _build_trace_graph()
+    db.refresh_property_graph()
+
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+
+    # PGQ is available but exclude_edges should force CTE
+    result = db.query_trace(
+        "raw_orders",
+        direction="downstream",
+        exclude_edges={("raw_orders", "stg_orders")},
+    )
+
+    _assert_trace_structure(result)
+    names = {p["name"] for p in result["paths"]}
+    # CTE with exclusion: stg_orders and marts_revenue unreachable
+    assert names == {"dim_customers"}
+    db.close()
+
+
+def test_trace_max_depth_boundary():
+    """max_depth=1 excludes models beyond 1 hop."""
+    db = _build_trace_graph()
+    db._has_pgq = False  # Use CTE for reliable depth
+
+    result = db.query_trace("raw_orders", direction="downstream", max_depth=1)
+
+    _assert_trace_structure(result)
+    names = {p["name"] for p in result["paths"]}
+    # Only depth-1 nodes: stg_orders and dim_customers (not marts_revenue at depth 2)
+    assert names == {"stg_orders", "dim_customers"}
+    assert result["depth_summary"] == {1: 2}
+    db.close()
+
+
+def test_trace_pgq_cte_parity():
+    """PGQ and CTE produce the same set of node names and depths."""
+    import pytest
+
+    db = _build_trace_graph()
+    db.refresh_property_graph()
+
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not available in this environment")
+
+    start_id = db._execute_read(
+        "SELECT node_id FROM nodes WHERE name = ?", ["raw_orders"]
+    ).fetchone()[0]
+
+    pgq_paths = db._trace_pgq(
+        start_id, "raw_orders", "downstream", 3, 100, False
+    )
+    cte_paths = db._trace_cte(start_id, "downstream", 3, 100, False)
+
+    pgq_names = {p["name"] for p in pgq_paths}
+    cte_names = {p["name"] for p in cte_paths}
+
+    # Both engines must find exactly the same nodes
+    assert pgq_names == cte_names
+    assert pgq_names == {"stg_orders", "marts_revenue", "dim_customers"}
+
+    # Depths should also match now that PGQ recovers depth via CTE
+    pgq_depths = {p["name"]: p["depth"] for p in pgq_paths}
+    cte_depths = {p["name"]: p["depth"] for p in cte_paths}
+    assert pgq_depths == cte_depths
+
+    db.close()
