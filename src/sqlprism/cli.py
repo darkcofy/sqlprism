@@ -53,7 +53,7 @@ def cli(ctx, log_level):
 )
 @click.option(
     "--transport",
-    type=click.Choice(["stdio", "streamable_http"]),
+    type=click.Choice(["stdio", "streamable-http"]),
     default="stdio",
     help="MCP transport mode",
 )
@@ -87,7 +87,8 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
     if transport == "stdio":
         mcp.run()
     else:
-        mcp.run(transport="streamable_http", port=port)
+        mcp.settings.port = port
+        mcp.run(transport="streamable-http")
 
 
 @cli.command()

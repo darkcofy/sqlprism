@@ -7,6 +7,7 @@ SQL knowledge graph MCP server — indexes SQL, dbt, and sqlmesh repos into a Du
 - **Language**: Python 3.12+
 - **Package manager**: uv
 - **Lint**: `uv run ruff check .`
+- **Type check**: `uv run ty check`
 - **Tests**: `uv run pytest tests/ -v`
 - **Single test**: `uv run pytest tests/test_indexer.py::test_name -v`
 
