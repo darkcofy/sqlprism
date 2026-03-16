@@ -414,81 +414,95 @@ def test_find_subgraphs_single():
     db = GraphDB()
     if not db.has_pgq:
         pytest.skip("DuckPGQ not installed")
-    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
-    file_id = db.insert_file(repo_id, "chain.sql", "sql", "abc")
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "chain.sql", "sql", "abc")
 
-    a = db.insert_node(file_id, "table", "a", "sql")
-    b = db.insert_node(file_id, "table", "b", "sql")
-    c = db.insert_node(file_id, "table", "c", "sql")
-    db.insert_edge(a, b, "references")
-    db.insert_edge(b, c, "references")
+        a = db.insert_node(file_id, "table", "a", "sql")
+        b = db.insert_node(file_id, "table", "b", "sql")
+        c = db.insert_node(file_id, "table", "c", "sql")
+        db.insert_edge(a, b, "references")
+        db.insert_edge(b, c, "references")
 
-    db._create_property_graph()
-    result = db.query_find_subgraphs()
+        db._create_property_graph()
+        result = db.query_find_subgraphs()
 
-    assert result["total_components"] == 1
-    assert result["total_nodes_in_scope"] == 3
-    assert len(result["components"]) == 1
-    assert result["components"][0]["size"] == 3
-    assert set(result["components"][0]["models"]) == {"a", "b", "c"}
-    assert result["largest_component"] is not None
-    assert result["orphaned_models"] == []
-    db.close()
+        assert result["total_components"] == 1
+        assert result["total_nodes_in_scope"] == 3
+        assert len(result["components"]) == 1
+        assert result["components"][0]["size"] == 3
+        assert set(result["components"][0]["models"]) == {"a", "b", "c"}
+        assert result["largest_component"] == {"name": "a", "size": 3}
+        assert result["orphaned_models"] == []
+    finally:
+        db.close()
 
 
 def test_find_subgraphs_multiple():
-    """Multiple disconnected components are detected separately."""
+    """Multiple disconnected components with an orphan are detected separately."""
     db = GraphDB()
     if not db.has_pgq:
         pytest.skip("DuckPGQ not installed")
-    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
-    file_id = db.insert_file(repo_id, "multi.sql", "sql", "abc")
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "multi.sql", "sql", "abc")
 
-    # Component 1: a -> b -> c
-    a = db.insert_node(file_id, "table", "a", "sql")
-    b = db.insert_node(file_id, "table", "b", "sql")
-    c = db.insert_node(file_id, "table", "c", "sql")
-    db.insert_edge(a, b, "references")
-    db.insert_edge(b, c, "references")
+        # Component 1: a -> b -> c
+        a = db.insert_node(file_id, "table", "a", "sql")
+        b = db.insert_node(file_id, "table", "b", "sql")
+        c = db.insert_node(file_id, "table", "c", "sql")
+        db.insert_edge(a, b, "references")
+        db.insert_edge(b, c, "references")
 
-    # Component 2: x -> y
-    x = db.insert_node(file_id, "table", "x", "sql")
-    y = db.insert_node(file_id, "table", "y", "sql")
-    db.insert_edge(x, y, "references")
+        # Component 2: x -> y
+        x = db.insert_node(file_id, "table", "x", "sql")
+        y = db.insert_node(file_id, "table", "y", "sql")
+        db.insert_edge(x, y, "references")
 
-    db._create_property_graph()
-    result = db.query_find_subgraphs()
+        # Orphan
+        db.insert_node(file_id, "table", "z_orphan", "sql")
 
-    assert result["total_components"] == 2
-    assert result["total_nodes_in_scope"] == 5
-    # Largest first
-    assert result["components"][0]["size"] == 3
-    assert result["components"][1]["size"] == 2
-    assert set(result["components"][0]["models"]) == {"a", "b", "c"}
-    assert set(result["components"][1]["models"]) == {"x", "y"}
-    assert result["orphaned_models"] == []
-    db.close()
+        db._create_property_graph()
+        result = db.query_find_subgraphs()
+
+        assert result["total_components"] == 3
+        assert result["total_nodes_in_scope"] == 6
+        # Largest first
+        assert result["components"][0]["size"] == 3
+        assert result["components"][1]["size"] == 2
+        assert result["components"][2]["size"] == 1
+        assert set(result["components"][0]["models"]) == {"a", "b", "c"}
+        assert set(result["components"][1]["models"]) == {"x", "y"}
+        assert result["largest_component"] == {"name": "a", "size": 3}
+        assert result["orphaned_models"] == ["z_orphan"]
+    finally:
+        db.close()
 
 
 def test_find_subgraphs_orphans():
-    """Isolated models appear as size-1 components and in orphaned_models."""
+    """Isolated models (no edges) appear as size-1 components via CSR fallback."""
     db = GraphDB()
     if not db.has_pgq:
         pytest.skip("DuckPGQ not installed")
-    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
-    file_id = db.insert_file(repo_id, "orphans.sql", "sql", "abc")
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "orphans.sql", "sql", "abc")
 
-    db.insert_node(file_id, "table", "orphan_a", "sql")
-    db.insert_node(file_id, "table", "orphan_b", "sql")
-    db.insert_node(file_id, "table", "orphan_c", "sql")
+        db.insert_node(file_id, "table", "orphan_a", "sql")
+        db.insert_node(file_id, "table", "orphan_b", "sql")
+        db.insert_node(file_id, "table", "orphan_c", "sql")
 
-    db._create_property_graph()
-    result = db.query_find_subgraphs()
+        db._create_property_graph()
+        result = db.query_find_subgraphs()
 
-    assert result["total_components"] == 3
-    assert all(c["size"] == 1 for c in result["components"])
-    assert sorted(result["orphaned_models"]) == ["orphan_a", "orphan_b", "orphan_c"]
-    db.close()
+        assert result["total_components"] == 3
+        assert result["total_nodes_in_scope"] == 3
+        assert all(c["size"] == 1 for c in result["components"])
+        assert sorted(result["orphaned_models"]) == ["orphan_a", "orphan_b", "orphan_c"]
+        # largest_component is one of the orphans (all size 1)
+        assert result["largest_component"]["size"] == 1
+    finally:
+        db.close()
 
 
 def test_find_subgraphs_repo_filter():
@@ -496,38 +510,66 @@ def test_find_subgraphs_repo_filter():
     db = GraphDB()
     if not db.has_pgq:
         pytest.skip("DuckPGQ not installed")
-    repo_a = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
-    repo_b = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
-    file_a = db.insert_file(repo_a, "a.sql", "sql", "abc")
-    file_b = db.insert_file(repo_b, "b.sql", "sql", "def")
+    try:
+        repo_a = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
+        repo_b = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
+        file_a = db.insert_file(repo_a, "a.sql", "sql", "abc")
+        file_b = db.insert_file(repo_b, "b.sql", "sql", "def")
 
-    # repo_a: m1 -> m2
-    m1 = db.insert_node(file_a, "table", "m1", "sql")
-    m2 = db.insert_node(file_a, "table", "m2", "sql")
-    db.insert_edge(m1, m2, "references")
+        # repo_a: m1 -> m2
+        m1 = db.insert_node(file_a, "table", "m1", "sql")
+        m2 = db.insert_node(file_a, "table", "m2", "sql")
+        db.insert_edge(m1, m2, "references")
 
-    # repo_b: n1 (isolated)
-    db.insert_node(file_b, "table", "n1", "sql")
+        # repo_b: n1 (isolated)
+        db.insert_node(file_b, "table", "n1", "sql")
 
-    db._create_property_graph()
+        db._create_property_graph()
 
-    result_a = db.query_find_subgraphs(repo="repo_a")
-    assert result_a["total_components"] == 1
-    assert result_a["total_nodes_in_scope"] == 2
-    assert set(result_a["components"][0]["models"]) == {"m1", "m2"}
+        result_a = db.query_find_subgraphs(repo="repo_a")
+        assert result_a["total_components"] == 1
+        assert result_a["total_nodes_in_scope"] == 2
+        assert set(result_a["components"][0]["models"]) == {"m1", "m2"}
 
-    result_b = db.query_find_subgraphs(repo="repo_b")
-    assert result_b["total_components"] == 1
-    assert result_b["total_nodes_in_scope"] == 1
-    assert result_b["orphaned_models"] == ["n1"]
-    db.close()
+        result_b = db.query_find_subgraphs(repo="repo_b")
+        assert result_b["total_components"] == 1
+        assert result_b["total_nodes_in_scope"] == 1
+        assert result_b["orphaned_models"] == ["n1"]
+
+        # Non-existent repo returns empty results
+        result_none = db.query_find_subgraphs(repo="nonexistent")
+        assert result_none["total_components"] == 0
+        assert result_none["total_nodes_in_scope"] == 0
+        assert result_none["largest_component"] is None
+    finally:
+        db.close()
 
 
 def test_find_subgraphs_no_pgq():
-    """Returns error when DuckPGQ is not installed."""
+    """Returns error dict only when DuckPGQ is not installed."""
     db = GraphDB()
     db._has_pgq = False
-    result = db.query_find_subgraphs()
-    assert "error" in result
-    assert "DuckPGQ not installed" in result["error"]
-    db.close()
+    try:
+        result = db.query_find_subgraphs()
+        assert result == {"error": "DuckPGQ not installed. Install with: INSTALL duckpgq FROM community"}
+    finally:
+        db.close()
+
+
+def test_find_subgraphs_empty():
+    """Empty graph (no nodes, no edges) returns zero components."""
+    db = GraphDB()
+    if not db.has_pgq:
+        pytest.skip("DuckPGQ not installed")
+    try:
+        db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        db._create_property_graph()
+        result = db.query_find_subgraphs()
+
+        assert result["total_components"] == 0
+        assert result["total_nodes_in_scope"] == 0
+        assert result["components"] == []
+        assert result["largest_component"] is None
+        assert result["orphaned_models"] == []
+    finally:
+        db.close()
