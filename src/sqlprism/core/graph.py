@@ -1506,19 +1506,37 @@ class GraphDB:
 
         max_hops = max(min(max_hops, 10), 1)
 
-        # Step 1: Find shortest path length via PGQ ANY SHORTEST
-        # Note: DuckPGQ does not support bind parameters inside
-        # GRAPH_TABLE, so we escape the values manually.
-        def _esc(v: str) -> str:
-            return v.replace("'", "''")
+        # Resolve model names to node_ids via parameterized query
+        # (avoids string interpolation into GRAPH_TABLE SQL)
+        from_row = self._execute_read(
+            "SELECT node_id FROM nodes WHERE name = ? LIMIT 1",
+            [from_model],
+        ).fetchone()
+        to_row = self._execute_read(
+            "SELECT node_id FROM nodes WHERE name = ? LIMIT 1",
+            [to_model],
+        ).fetchone()
+        if not from_row or not to_row:
+            return {
+                "from": from_model,
+                "to": to_model,
+                "path_found": False,
+                "path": [],
+                "length": 0,
+            }
 
+        from_id, to_id = from_row[0], to_row[0]
+
+        # Step 1: Find shortest path length via PGQ ANY SHORTEST
+        # DuckPGQ does not support bind parameters inside GRAPH_TABLE,
+        # so we interpolate integer node_ids (safe, no escaping needed).
         try:
             rows = self._execute_read(
                 f"FROM GRAPH_TABLE (sqlprism_graph "
                 f"MATCH p = ANY SHORTEST "
-                f"(src:nodes WHERE src.name = '{_esc(from_model)}')"
+                f"(src:nodes WHERE src.node_id = {from_id})"
                 f"-[e:edges]->{{1,{max_hops}}}"
-                f"(dst:nodes WHERE dst.name = '{_esc(to_model)}') "
+                f"(dst:nodes WHERE dst.node_id = {to_id}) "
                 f"COLUMNS (path_length(p) AS hops))",
             ).fetchall()
         except duckdb.Error as e:
@@ -1534,15 +1552,16 @@ class GraphDB:
                 "length": 0,
             }
 
-        path_length = rows[0][0]
+        path_length = int(rows[0][0])
 
         # Step 2: Recover intermediate nodes via BFS CTE
+        # No file_id filter — BFS must traverse the same topology as PGQ
         path_cte = f"""
         WITH RECURSIVE path_bfs AS (
             SELECT n.node_id, n.name, 0 as depth,
                    ARRAY[n.name] as path_names
             FROM nodes n
-            WHERE n.name = ? AND n.file_id IS NOT NULL
+            WHERE n.node_id = ?
             UNION ALL
             SELECT n2.node_id, n2.name, pb.depth + 1,
                    array_append(pb.path_names, n2.name)
@@ -1553,17 +1572,18 @@ class GraphDB:
             AND NOT array_contains(pb.path_names, n2.name)
         )
         SELECT path_names FROM path_bfs
-        WHERE name = ? AND depth = {path_length}
+        WHERE node_id = ? AND depth = {path_length}
         LIMIT 1
         """
         path_rows = self._execute_read(
-            path_cte, [from_model, to_model]
+            path_cte, [from_id, to_id]
         ).fetchall()
 
         if path_rows:
             path_names = list(path_rows[0][0])
         else:
-            path_names = [from_model, to_model]
+            # BFS could not reconstruct the path (e.g., topology mismatch)
+            path_names = []
 
         return {
             "from": from_model,
