@@ -250,6 +250,7 @@ def test_detect_cycles_dag():
     result = db.query_detect_cycles()
     assert result["has_cycles"] is False
     assert result["cycles"] == []
+    assert result["total_nodes_in_scope"] == 4
     db.close()
 
 
@@ -269,10 +270,10 @@ def test_detect_cycles_simple():
 
     result = db.query_detect_cycles()
     assert result["has_cycles"] is True
+    assert result["total_nodes_in_scope"] == 3
     assert len(result["cycles"]) == 1
     cycle = result["cycles"][0]
     assert cycle["length"] == 3
-    # Path should contain a, b, c and end back at start
     assert len(cycle["path"]) == 4
     assert cycle["path"][0] == cycle["path"][-1]
     assert set(cycle["path"][:3]) == {"a", "b", "c"}
@@ -280,7 +281,7 @@ def test_detect_cycles_simple():
 
 
 def test_detect_cycles_multiple():
-    """Two independent cycles are both detected."""
+    """Two independent cycles are both detected with correct content."""
     db = GraphDB()
     repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
     file_id = db.insert_file(repo_id, "multi.sql", "sql", "abc")
@@ -291,11 +292,11 @@ def test_detect_cycles_multiple():
     d = db.insert_node(file_id, "table", "d", "sql")
     e = db.insert_node(file_id, "table", "e", "sql")
 
-    # Cycle 1: a -> b -> a
+    # Cycle 1: a -> b -> a (length 2)
     db.insert_edge(a, b, "references")
     db.insert_edge(b, a, "references")
 
-    # Cycle 2: c -> d -> e -> c
+    # Cycle 2: c -> d -> e -> c (length 3)
     db.insert_edge(c, d, "references")
     db.insert_edge(d, e, "references")
     db.insert_edge(e, c, "references")
@@ -303,6 +304,11 @@ def test_detect_cycles_multiple():
     result = db.query_detect_cycles()
     assert result["has_cycles"] is True
     assert len(result["cycles"]) == 2
+    # Verify cycle lengths and node sets
+    lengths = {cy["length"] for cy in result["cycles"]}
+    assert lengths == {2, 3}
+    node_sets = {frozenset(cy["path"][:-1]) for cy in result["cycles"]}
+    assert node_sets == {frozenset({"a", "b"}), frozenset({"c", "d", "e"})}
     db.close()
 
 
@@ -327,9 +333,58 @@ def test_detect_cycles_repo_filter():
 
     result_a = db.query_detect_cycles(repo="repo_a")
     assert result_a["has_cycles"] is False
+    assert result_a["total_nodes_in_scope"] == 2
 
     result_b = db.query_detect_cycles(repo="repo_b")
     assert result_b["has_cycles"] is True
+    assert len(result_b["cycles"]) == 1
+    assert set(result_b["cycles"][0]["path"][:-1]) == {"b1", "b2"}
+    db.close()
+
+
+def test_detect_cycles_cross_repo_no_leak():
+    """Cross-repo edges don't produce false-positive cycles in filtered results."""
+    db = GraphDB()
+    repo_a = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
+    repo_b = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
+    file_a = db.insert_file(repo_a, "a.sql", "sql", "aaa")
+    file_b = db.insert_file(repo_b, "b.sql", "sql", "bbb")
+
+    # Cross-repo "cycle": a1 (repo_a) -> b1 (repo_b) -> a1 (repo_a)
+    a1 = db.insert_node(file_a, "table", "a1", "sql")
+    b1 = db.insert_node(file_b, "table", "b1", "sql")
+    db.insert_edge(a1, b1, "references")
+    db.insert_edge(b1, a1, "references")
+
+    # Neither repo should see a cycle when filtered
+    assert db.query_detect_cycles(repo="repo_a")["has_cycles"] is False
+    assert db.query_detect_cycles(repo="repo_b")["has_cycles"] is False
+    # But unfiltered should see it
+    assert db.query_detect_cycles()["has_cycles"] is True
+    db.close()
+
+
+def test_detect_cycles_max_length_boundary():
+    """Cycle longer than max_cycle_length is not detected."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    file_id = db.insert_file(repo_id, "long.sql", "sql", "abc")
+
+    # Build a cycle of length 4: a -> b -> c -> d -> a
+    nodes = []
+    for name in ["a", "b", "c", "d"]:
+        nodes.append(db.insert_node(file_id, "table", name, "sql"))
+    for i in range(len(nodes)):
+        db.insert_edge(nodes[i], nodes[(i + 1) % len(nodes)], "references")
+
+    # max_cycle_length=3 should miss the length-4 cycle
+    result_short = db.query_detect_cycles(max_cycle_length=3)
+    assert result_short["has_cycles"] is False
+
+    # max_cycle_length=4 should find it
+    result_long = db.query_detect_cycles(max_cycle_length=4)
+    assert result_long["has_cycles"] is True
+    assert result_long["cycles"][0]["length"] == 4
     db.close()
 
 

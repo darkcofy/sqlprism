@@ -1702,27 +1702,39 @@ class GraphDB:
         """Detect circular dependencies in the SQL dependency graph.
 
         Uses a recursive CTE with revisit detection. No DuckPGQ required.
+        Self-loops (a -> a) are not detected since they require depth < 1.
+
+        ``length`` in each cycle dict counts edges (equals number of
+        distinct nodes in the cycle).
 
         Args:
-            repo: Optional repo name filter.
-            max_cycle_length: Maximum cycle length to detect (default 10, max 15).
+            repo: Optional repo name filter (both edge endpoints must
+                belong to the specified repo).
+            max_cycle_length: Maximum cycle length in edges (default 10,
+                max 15, min 2).
 
         Returns:
-            Dict with ``has_cycles``, ``cycles`` list, and ``total_nodes_checked``.
+            Dict with ``has_cycles``, ``cycles`` list, and
+            ``total_nodes_in_scope``.
         """
         max_cycle_length = max(min(max_cycle_length, 15), 2)
 
-        # Build a filtered edge CTE when repo is specified
+        # Build a filtered edge CTE when repo is specified.
+        # Both source and target must be in the repo to prevent
+        # cross-repo edge leakage.
         if repo:
             edge_cte = (
                 "edge_set AS ("
                 "SELECT e.source_id, e.target_id FROM edges e "
-                "JOIN nodes n ON e.source_id = n.node_id "
-                "JOIN files f ON n.file_id = f.file_id "
-                "JOIN repos r ON f.repo_id = r.repo_id "
-                "WHERE r.name = ?), "
+                "JOIN nodes n1 ON e.source_id = n1.node_id "
+                "JOIN files f1 ON n1.file_id = f1.file_id "
+                "JOIN repos r1 ON f1.repo_id = r1.repo_id "
+                "JOIN nodes n2 ON e.target_id = n2.node_id "
+                "JOIN files f2 ON n2.file_id = f2.file_id "
+                "JOIN repos r2 ON f2.repo_id = r2.repo_id "
+                "WHERE r1.name = ? AND r2.name = ?), "
             )
-            params: list = [repo]
+            params: list = [repo, repo]
         else:
             edge_cte = "edge_set AS (SELECT source_id, target_id FROM edges), "
             params = []
@@ -1745,6 +1757,7 @@ class GraphDB:
         SELECT DISTINCT start_node, path_ids, depth
         FROM cycle_detect WHERE is_cycle
         ORDER BY depth, start_node
+        LIMIT 100
         """
         params.append(max_cycle_length)
 
@@ -1792,7 +1805,7 @@ class GraphDB:
         return {
             "has_cycles": len(cycles) > 0,
             "cycles": cycles,
-            "total_nodes_checked": total,
+            "total_nodes_in_scope": total,
         }
 
     def query_context(self, name: str, repo: str | None = None) -> dict:
