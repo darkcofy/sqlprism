@@ -1086,8 +1086,10 @@ class GraphDB:
         """
         schema: dict[str, dict[str, str]] = {}
 
-        # 1. Authoritative columns from columns table (with real types)
-        if repo_id:
+        # 1. Authoritative columns from columns table (with real types).
+        # Note: phantom nodes (file_id IS NULL) are intentionally excluded
+        # since they lack a verified repo association.
+        if repo_id is not None:
             col_rows = self._execute_read(
                 "SELECT n.name, c.column_name, c.data_type "
                 "FROM columns c "
@@ -1109,7 +1111,7 @@ class GraphDB:
             schema[table][col] = dtype or "TEXT"
 
         # 2. Fallback: fill gaps from column_usage
-        if repo_id:
+        if repo_id is not None:
             usage_rows = self._execute_read(
                 "SELECT DISTINCT cu.table_name, cu.column_name "
                 "FROM column_usage cu "

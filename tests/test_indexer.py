@@ -1566,21 +1566,29 @@ def test_insert_parse_result_stores_columns():
         "nodes_added": 0,
         "edges_added": 0,
         "column_usage_added": 0,
+        "columns_added": 0,
         "lineage_chains": 0,
     }
 
     with db.write_transaction():
         indexer._insert_parse_result(result, file_id, repo_id, stats)
 
+    # Verify node_id matches the orders node
+    orders_node_id = db._execute_read(
+        "SELECT node_id FROM nodes WHERE name = 'orders'"
+    ).fetchone()[0]
+
     rows = db._execute_read(
         "SELECT node_id, column_name, data_type, position, source FROM columns ORDER BY position"
     ).fetchall()
 
     assert len(rows) == 2
+    assert rows[0][0] == orders_node_id
     assert rows[0][1] == "order_id"
     assert rows[0][2] == "INT"
     assert rows[0][3] == 0
     assert rows[0][4] == "definition"
+    assert rows[1][0] == orders_node_id
     assert rows[1][1] == "status"
     assert rows[1][2] == "TEXT"
     assert rows[1][3] == 1
@@ -1621,6 +1629,7 @@ def test_columns_multiple_sources_merged():
         "nodes_added": 0,
         "edges_added": 0,
         "column_usage_added": 0,
+        "columns_added": 0,
         "lineage_chains": 0,
     }
 
@@ -1645,11 +1654,15 @@ def test_columns_multiple_sources_merged():
     ).fetchall()
 
     assert len(rows) == 2
-    # Upsert: schema_yml wins for source, but data_type is preserved via COALESCE
-    for row in rows:
-        assert row[1] is not None  # data_type preserved from definition
-        assert row[2] == "schema_yml"  # source updated
-        assert row[3] is not None  # description set from schema_yml
+    # Build dict for robust lookup regardless of ordering
+    by_name = {r[0]: r for r in rows}
+    # Upsert: schema_yml wins for source, data_type preserved via COALESCE
+    assert by_name["order_id"][1] == "INT"  # data_type preserved from definition
+    assert by_name["order_id"][2] == "schema_yml"  # source updated
+    assert by_name["order_id"][3] == "The unique order identifier"
+    assert by_name["status"][1] == "TEXT"  # data_type preserved from definition
+    assert by_name["status"][2] == "schema_yml"  # source updated
+    assert by_name["status"][3] == "Current order status"
 
     db.close()
 
@@ -1778,6 +1791,7 @@ def test_columns_batch_insert():
         "nodes_added": 0,
         "edges_added": 0,
         "column_usage_added": 0,
+        "columns_added": 0,
         "lineage_chains": 0,
     }
 
@@ -1787,6 +1801,91 @@ def test_columns_batch_insert():
     rows = db._execute_read("SELECT COUNT(*) FROM columns").fetchone()
     assert rows[0] == num_columns
 
-    assert stats["columns_added"] >= 50
+    assert stats["columns_added"] == 55
+
+    db.close()
+
+
+def test_column_def_unresolved_node_skipped():
+    """Column definitions for unresolved node names are skipped with warning."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "ghost.sql", "sql", "abc123")
+
+    # ColumnDefResult references a node that doesn't exist anywhere
+    result = ParseResult(
+        language="sql",
+        nodes=[],  # no nodes — ghost_table won't be found
+        columns=[
+            ColumnDefResult(
+                node_name="ghost_table", column_name="col_a",
+                data_type="INT", position=0, source="definition",
+            ),
+        ],
+    )
+
+    stats = {
+        "nodes_added": 0,
+        "edges_added": 0,
+        "column_usage_added": 0,
+        "columns_added": 0,
+        "lineage_chains": 0,
+    }
+
+    with db.write_transaction():
+        indexer._insert_parse_result(result, file_id, repo_id, stats)
+
+    assert stats["columns_added"] == 0
+    rows = db._execute_read("SELECT COUNT(*) FROM columns").fetchone()
+    assert rows[0] == 0
+
+    db.close()
+
+
+def test_column_def_null_data_type_returns_text():
+    """Column with data_type=None is returned as TEXT by get_table_columns."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "inferred.sql", "sql", "abc123")
+
+    result = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="inferred_table")],
+        columns=[
+            ColumnDefResult(
+                node_name="inferred_table", column_name="unknown_col",
+                data_type=None, position=0, source="inferred",
+            ),
+        ],
+    )
+
+    stats = {
+        "nodes_added": 0,
+        "edges_added": 0,
+        "column_usage_added": 0,
+        "columns_added": 0,
+        "lineage_chains": 0,
+    }
+
+    with db.write_transaction():
+        indexer._insert_parse_result(result, file_id, repo_id, stats)
+
+    assert stats["columns_added"] == 1
+
+    schema = db.get_table_columns(repo_id)
+    assert "inferred_table" in schema
+    assert schema["inferred_table"]["unknown_col"] == "TEXT"
 
     db.close()
