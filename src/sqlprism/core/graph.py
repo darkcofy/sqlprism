@@ -1694,6 +1694,107 @@ class GraphDB:
             "total_indexed_nodes": total,
         }
 
+    def query_detect_cycles(
+        self,
+        repo: str | None = None,
+        max_cycle_length: int = 10,
+    ) -> dict:
+        """Detect circular dependencies in the SQL dependency graph.
+
+        Uses a recursive CTE with revisit detection. No DuckPGQ required.
+
+        Args:
+            repo: Optional repo name filter.
+            max_cycle_length: Maximum cycle length to detect (default 10, max 15).
+
+        Returns:
+            Dict with ``has_cycles``, ``cycles`` list, and ``total_nodes_checked``.
+        """
+        max_cycle_length = max(min(max_cycle_length, 15), 2)
+
+        # Build a filtered edge CTE when repo is specified
+        if repo:
+            edge_cte = (
+                "edge_set AS ("
+                "SELECT e.source_id, e.target_id FROM edges e "
+                "JOIN nodes n ON e.source_id = n.node_id "
+                "JOIN files f ON n.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id "
+                "WHERE r.name = ?), "
+            )
+            params: list = [repo]
+        else:
+            edge_cte = "edge_set AS (SELECT source_id, target_id FROM edges), "
+            params = []
+
+        sql = f"""
+        WITH RECURSIVE {edge_cte}
+        cycle_detect AS (
+            SELECT es.source_id AS start_node, es.target_id AS current_node,
+                   [es.source_id] AS path_ids, 1 AS depth, false AS is_cycle
+            FROM edge_set es
+            UNION ALL
+            SELECT cd.start_node, es.target_id,
+                   list_append(cd.path_ids, cd.current_node),
+                   cd.depth + 1, es.target_id = cd.start_node
+            FROM edge_set es
+            JOIN cycle_detect cd ON es.source_id = cd.current_node
+            WHERE cd.depth < ? AND NOT cd.is_cycle
+            AND NOT list_contains(cd.path_ids, cd.current_node)
+        )
+        SELECT DISTINCT start_node, path_ids, depth
+        FROM cycle_detect WHERE is_cycle
+        ORDER BY depth, start_node
+        """
+        params.append(max_cycle_length)
+
+        rows = self._execute_read(sql, params).fetchall()
+
+        # Deduplicate rotations: normalize each cycle by sorting and using min rotation
+        seen_cycles: set[tuple] = set()
+        cycles = []
+        for start_node, path_ids, depth in rows:
+            # Normalize: find the canonical rotation (start from smallest node_id)
+            node_list = list(path_ids)
+            min_idx = node_list.index(min(node_list))
+            canonical = tuple(node_list[min_idx:] + node_list[:min_idx])
+            if canonical in seen_cycles:
+                continue
+            seen_cycles.add(canonical)
+
+            # Resolve names
+            full_path_ids = node_list + [start_node]
+            placeholders = ",".join("?" for _ in full_path_ids)
+            name_rows = self._execute_read(
+                f"SELECT node_id, name FROM nodes WHERE node_id IN ({placeholders})",
+                full_path_ids,
+            ).fetchall()
+            id_to_name = {r[0]: r[1] for r in name_rows}
+            path_names = [id_to_name.get(nid, str(nid)) for nid in full_path_ids]
+
+            cycles.append({
+                "path": path_names,
+                "length": depth,
+            })
+
+        # Total nodes checked
+        if repo:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.file_id "
+                "JOIN repos r ON f.repo_id = r.repo_id WHERE r.name = ?",
+                [repo],
+            ).fetchone()[0]
+        else:
+            total = self._execute_read(
+                "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL"
+            ).fetchone()[0]
+
+        return {
+            "has_cycles": len(cycles) > 0,
+            "cycles": cycles,
+            "total_nodes_checked": total,
+        }
+
     def query_context(self, name: str, repo: str | None = None) -> dict:
         """Return comprehensive context for a model.
 
