@@ -523,6 +523,32 @@ async def detect_cycles(params: DetectCyclesInput) -> dict:
     )
 
 
+class FindSubgraphsInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    repo: str | None = Field(None, description="Filter by repo name. Omit for all repos.")
+
+
+@mcp.tool(
+    name="find_subgraphs",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def find_subgraphs(params: FindSubgraphsInput) -> dict:
+    """Identify weakly connected components (subgraphs) in the dependency graph.
+
+    Reveals isolated model clusters, orphaned models, and overall graph topology.
+    Requires DuckPGQ extension.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_find_subgraphs,
+        repo=params.repo,
+    )
+
+
 class ColumnChange(BaseModel):
     action: Literal["remove_column", "rename_column", "add_column"] = Field(
         ...,
