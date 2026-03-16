@@ -1,44 +1,34 @@
 # Configuration
 
-`sqlprism init` creates a config file at `~/.sqlprism/config.json`. You can override the path with `--config PATH` on any command.
+`sqlprism init` creates a config file at `sqlprism.yml` in the working directory. You can override the path with `--config PATH` on any command. JSON is also supported (`--format json`).
 
 ## Full Config Example
 
-```json
-{
-  "db_path": "~/.sqlprism/graph.duckdb",
-  "sql_dialect": null,
-  "repos": {
-    "my-queries": "/path/to/sql/repo",
-    "multi-dialect-repo": {
-      "path": "/path/to/repo",
-      "dialect": "starrocks",
-      "dialect_overrides": {
-        "athena/": "athena",
-        "postgres/": "postgres"
-      }
-    }
-  },
-  "sqlmesh_repos": {
-    "my-sqlmesh-project": {
-      "project_path": "/path/to/sqlmesh/folder",
-      "env_file": "/path/to/.env",
-      "dialect": "athena",
-      "variables": {
-        "GRACE_PERIOD": 7
-      }
-    }
-  },
-  "dbt_repos": {
-    "my-dbt-project": {
-      "project_path": "/path/to/dbt/project",
-      "env_file": "/path/to/.env",
-      "target": "dev",
-      "dialect": "starrocks",
-      "dbt_command": "uv run dbt"
-    }
-  }
-}
+```yaml
+db_path: ~/.sqlprism/graph.duckdb
+sql_dialect: null
+repos:
+  my-queries: /path/to/sql/repo
+  multi-dialect-repo:
+    path: /path/to/repo
+    dialect: starrocks
+    dialect_overrides:
+      athena/: athena
+      postgres/: postgres
+sqlmesh_repos:
+  my-sqlmesh-project:
+    project_path: /path/to/sqlmesh/folder
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
+dbt_repos:
+  my-dbt-project:
+    project_path: /path/to/dbt/project
+    env_file: /path/to/.env
+    target: dev
+    dialect: starrocks
+    dbt_command: uv run dbt
 ```
 
 ## Top-Level Fields
@@ -56,20 +46,18 @@
 Each entry in `repos` maps a repo name to either a path string or a config object.
 
 **Simple form** — just a path:
-```json
-"my-queries": "/path/to/sql/repo"
+```yaml
+my-queries: /path/to/sql/repo
 ```
 
 **Full form** — with dialect and overrides:
-```json
-"my-repo": {
-  "path": "/path/to/repo",
-  "dialect": "starrocks",
-  "dialect_overrides": {
-    "athena/": "athena",
-    "postgres/": "postgres"
-  }
-}
+```yaml
+my-repo:
+  path: /path/to/repo
+  dialect: starrocks
+  dialect_overrides:
+    athena/: athena
+    postgres/: postgres
 ```
 
 | Field | Type | Description |
@@ -85,7 +73,8 @@ Each entry in `repos` maps a repo name to either a path string or a config objec
 | `project_path` | Yes | Path to the sqlmesh project directory (containing `config.yaml`). |
 | `env_file` | No | Path to `.env` file. Loaded into the subprocess environment before rendering. |
 | `dialect` | No | SQL dialect for rendering. Default: `athena`. |
-| `variables` | No | SQLMesh macro variables as key-value pairs (e.g. `{"GRACE_PERIOD": 7}`). |
+| `variables` | No | SQLMesh macro variables as key-value pairs (e.g. `GRACE_PERIOD: 7`). |
+| `sqlmesh_command` | No | Command to run Python in the sqlmesh project's venv. Default: `uv run python`. |
 
 ## dbt Repos
 
@@ -96,6 +85,7 @@ Each entry in `repos` maps a repo name to either a path string or a config objec
 | `target` | No | dbt target name (e.g. `dev`, `prod`). |
 | `dialect` | No | SQL dialect for parsing compiled output (e.g. `starrocks`, `postgres`). |
 | `dbt_command` | No | Base command to invoke dbt. Default: `uv run dbt`. `compile` is appended automatically. |
+| `profiles_dir` | No | Path to directory containing `profiles.yml`. Defaults to the project directory. |
 
 ## SQL Dialect Support
 

@@ -39,8 +39,8 @@ uv sync
 ### 2. Configure
 
 ```bash
-uv run sqlprism init                    # creates ~/.sqlprism/config.json
-# edit ~/.sqlprism/config.json to add your repos (see Configuration below)
+uv run sqlprism init                    # creates sqlprism.yml in the current directory
+# edit sqlprism.yml to add your repos (see Configuration below)
 uv run sqlprism reindex                 # index plain SQL repos
 ```
 
@@ -138,43 +138,33 @@ autocmd BufWritePost *.sql silent !sqlprism reindex-file %:p
 
 ## Configuration
 
-`sqlprism init` creates a default config at `~/.sqlprism/config.json`. Override the path with `--config PATH` on any command.
+`sqlprism init` creates a default config at `sqlprism.yml` in the working directory. YAML is the default format; JSON is also supported (`--format json`). Existing `sqlprism.json` files are auto-discovered for backwards compatibility. Override the config path with `--config PATH` on any command.
 
-```json
-{
-  "db_path": "~/.sqlprism/graph.duckdb",
-  "sql_dialect": null,
-  "repos": {
-    "my-queries": "/path/to/sql/repo",
-    "multi-dialect-repo": {
-      "path": "/path/to/repo",
-      "dialect": "starrocks",
-      "dialect_overrides": {
-        "athena/": "athena",
-        "postgres/": "postgres"
-      }
-    }
-  },
-  "sqlmesh_repos": {
-    "my-sqlmesh-project": {
-      "project_path": "/path/to/sqlmesh/folder",
-      "env_file": "/path/to/.env",
-      "dialect": "athena",
-      "variables": {
-        "GRACE_PERIOD": 7
-      }
-    }
-  },
-  "dbt_repos": {
-    "my-dbt-project": {
-      "project_path": "/path/to/dbt/project",
-      "env_file": "/path/to/.env",
-      "target": "dev",
-      "dialect": "starrocks",
-      "dbt_command": "uv run dbt"
-    }
-  }
-}
+```yaml
+db_path: ~/.sqlprism/graph.duckdb
+sql_dialect: null
+repos:
+  my-queries: /path/to/sql/repo
+  multi-dialect-repo:
+    path: /path/to/repo
+    dialect: starrocks
+    dialect_overrides:
+      athena/: athena
+      postgres/: postgres
+sqlmesh_repos:
+  my-sqlmesh-project:
+    project_path: /path/to/sqlmesh/folder
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
+dbt_repos:
+  my-dbt-project:
+    project_path: /path/to/dbt/project
+    env_file: /path/to/.env
+    target: dev
+    dialect: starrocks
+    dbt_command: uv run dbt
 ```
 
 | Field | Description |

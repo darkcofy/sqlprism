@@ -24,20 +24,16 @@ sqlprism reindex-dbt \
 
 ## Config Usage
 
-Add to `dbt_repos` in `~/.sqlprism/config.json`:
+Add to `dbt_repos` in `sqlprism.yml`:
 
-```json
-{
-  "dbt_repos": {
-    "my-project": {
-      "project_path": "/path/to/dbt/project",
-      "env_file": "/path/to/.env",
-      "target": "dev",
-      "dialect": "starrocks",
-      "dbt_command": "uv run dbt"
-    }
-  }
-}
+```yaml
+dbt_repos:
+  my-project:
+    project_path: /path/to/dbt/project
+    env_file: /path/to/.env
+    target: dev
+    dialect: starrocks
+    dbt_command: uv run dbt
 ```
 
 ## dbt Command

@@ -24,21 +24,16 @@ sqlprism reindex-sqlmesh \
 
 ## Config Usage
 
-Add to `sqlmesh_repos` in `~/.sqlprism/config.json`:
+Add to `sqlmesh_repos` in `sqlprism.yml`:
 
-```json
-{
-  "sqlmesh_repos": {
-    "my-project": {
-      "project_path": "/path/to/sqlmesh/project",
-      "env_file": "/path/to/.env",
-      "dialect": "athena",
-      "variables": {
-        "GRACE_PERIOD": 7
-      }
-    }
-  }
-}
+```yaml
+sqlmesh_repos:
+  my-project:
+    project_path: /path/to/sqlmesh/project
+    env_file: /path/to/.env
+    dialect: athena
+    variables:
+      GRACE_PERIOD: 7
 ```
 
 ## Variables
@@ -48,7 +43,7 @@ SQLMesh projects often define macro variables in `config.yaml` under the `variab
 You must pass variables explicitly:
 
 - **CLI**: `--var KEY VALUE` (repeatable)
-- **Config**: `"variables": {"KEY": value}`
+- **Config**: `variables:` with `KEY: value` entries
 
 If a variable is missing, the render will fail with `Macro variable 'X' is undefined.`
 

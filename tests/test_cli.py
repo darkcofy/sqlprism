@@ -382,3 +382,12 @@ def test_init_detects_other_format(tmp_path):
         result = runner.invoke(cli, ["init", "--format", "json"])
         assert "already exists" in result.output
         assert not (Path.cwd() / "sqlprism.json").exists()
+
+
+def test_init_help_mentions_yaml():
+    """init --help references YAML as default format."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["init", "--help"])
+    assert result.exit_code == 0
+    assert "yaml" in result.output.lower()
+    assert "default: yaml" in result.output.lower()

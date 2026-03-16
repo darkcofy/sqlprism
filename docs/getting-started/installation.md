@@ -30,7 +30,7 @@ uv run sqlprism --help
 # 1. Create default config
 uv run sqlprism init
 
-# 2. Edit ~/.sqlprism/config.json to add your repos
+# 2. Edit sqlprism.yml to add your repos
 #    (see Configuration for details)
 
 # 3. Index your SQL files
