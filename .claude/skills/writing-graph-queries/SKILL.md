@@ -82,7 +82,7 @@ SELECT * FROM local_clustering_coefficient(sqlprism_graph, nodes, edges)
 
 - `COLUMNS` not `RETURN` (parser error)
 - Bounds required: `{1,N}` not `+` or `*` (infinite results error)
-- Shortest path: forward `->` only (`<-` not implemented)
+- Shortest path (`ANY SHORTEST`): forward `->` only (`<-` not implemented). Regular multi-hop `<-` works fine.
 - Vertex tables must be base tables, not views
 - Phantom nodes (`file_id IS NULL`) are included — filter in COLUMNS or post-processing
 - Filter with `WHERE` inside MATCH, not outside
