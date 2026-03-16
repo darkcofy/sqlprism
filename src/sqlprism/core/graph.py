@@ -215,18 +215,32 @@ class GraphDB:
         )
 
     def _init_pgq(self) -> None:
-        """Try to install and load DuckPGQ. Non-fatal if unavailable."""
+        """Try to load DuckPGQ, installing if needed. Non-fatal if unavailable.
+
+        Tries ``LOAD`` first (fast, no network). Only falls back to
+        ``INSTALL FROM community`` (network call) if the load fails.
+        Both ``INSTALL`` and ``LOAD`` are individually idempotent in DuckDB.
+        """
         try:
             with self._write_lock:
-                self._execute_write("INSTALL duckpgq FROM community")
-                self._execute_write("LOAD duckpgq")
+                try:
+                    self._execute_write("LOAD duckpgq")
+                except Exception:
+                    self._execute_write("INSTALL duckpgq FROM community")
+                    self._execute_write("LOAD duckpgq")
             self._has_pgq = True
             self._create_property_graph()
-        except Exception:
+        except Exception as e:
+            logger.debug("DuckPGQ unavailable: %s", e)
             self._has_pgq = False
 
     def _create_property_graph(self) -> None:
-        """Create or replace the DuckPGQ property graph from nodes/edges."""
+        """Create or replace the DuckPGQ property graph from nodes/edges.
+
+        Note: DuckPGQ does not support views as vertex tables, so phantom
+        nodes (``file_id IS NULL``) are included. Graph query consumers
+        should filter phantoms in their result processing if needed.
+        """
         if not self._has_pgq:
             return
         try:
@@ -239,6 +253,7 @@ class GraphDB:
                 )
         except Exception as e:
             logger.warning("Failed to create property graph: %s", e)
+            self._has_pgq = False
 
     def _execute_read(self, sql: str, params=None):
         """Execute a read-only SQL statement.

@@ -400,6 +400,10 @@ class Indexer:
                         "path": str(f), "status": "skipped", "reason": f"unknown repo_type '{repo_type}'",
                     })
 
+        # Single refresh after all file groups processed (not per-file)
+        if files_by_repo:
+            self.graph.refresh_property_graph()
+
         return stats
 
     @staticmethod
@@ -511,7 +515,6 @@ class Indexer:
 
         if did_reindex:
             self.graph.cleanup_phantoms()
-            self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
 
     def _delete_stored_files_by_stem(self, repo_id: int, stem: str, stats: dict, display_path: str) -> None:
@@ -588,7 +591,6 @@ class Indexer:
             stats["reindexed"] += 1
             stats["details"].append({"path": model_path, "status": "reindexed"})
 
-        self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
 
     def _reindex_sqlmesh_files(
@@ -654,7 +656,6 @@ class Indexer:
             stats["reindexed"] += 1
             stats["details"].append({"path": file_path_key, "status": "reindexed"})
 
-        self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
 
     def _resolve_model_names_by_stem(
