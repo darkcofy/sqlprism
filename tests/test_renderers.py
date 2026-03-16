@@ -864,3 +864,276 @@ def test_build_column_defs_realistic_types():
     assert cols[0].position == 0
     assert cols[3].position == 3
     assert all(c.source == "sqlmesh_schema" for c in cols)
+
+
+# ── DbtRenderer.extract_schema_yml tests (#24) ──
+
+
+def _write_yaml(path, content):
+    """Helper to write YAML content to a file, creating parent dirs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def test_extract_schema_yml_standard(tmp_path):
+    """Extract columns from a standard schema.yml with descriptions."""
+    models_dir = tmp_path / "models"
+    _write_yaml(
+        models_dir / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: order_id
+        description: "Primary key"
+      - name: status
+        description: "Order status"
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+
+    assert "stg_orders" in result
+    cols = result["stg_orders"]
+    assert len(cols) == 2
+
+    assert cols[0].column_name == "order_id"
+    assert cols[0].description == "Primary key"
+    assert cols[0].source == "schema_yml"
+    assert cols[0].node_name == "stg_orders"
+    assert cols[0].position == 0
+
+    assert cols[1].column_name == "status"
+    assert cols[1].description == "Order status"
+    assert cols[1].position == 1
+
+
+def test_extract_schema_yml_multiple_files(tmp_path):
+    """Extract columns from multiple YAML files across subdirectories."""
+    _write_yaml(
+        tmp_path / "models" / "staging" / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: order_id
+        description: "PK"
+""",
+    )
+    _write_yaml(
+        tmp_path / "models" / "marts" / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: fct_revenue
+    columns:
+      - name: revenue
+        description: "Total revenue"
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+
+    assert "stg_orders" in result
+    assert "fct_revenue" in result
+    assert result["stg_orders"][0].column_name == "order_id"
+    assert result["fct_revenue"][0].column_name == "revenue"
+
+
+def test_extract_schema_yml_no_columns(tmp_path):
+    """Model with no columns key produces no ColumnDefResult entries."""
+    _write_yaml(
+        tmp_path / "models" / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    description: "Staging orders model"
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+
+    assert "stg_orders" not in result
+
+
+def test_extract_schema_yml_tests_no_desc(tmp_path):
+    """Columns with tests but no description produce entries with description=None."""
+    _write_yaml(
+        tmp_path / "models" / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: status
+        tests:
+          - not_null
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+
+    assert "stg_orders" in result
+    cols = result["stg_orders"]
+    assert len(cols) == 2
+    assert cols[0].column_name == "order_id"
+    assert cols[0].description is None
+    assert cols[1].column_name == "status"
+    assert cols[1].description is None
+
+
+def test_extract_schema_yml_non_standard_names(tmp_path):
+    """Non-standard YAML filenames like _sources.yml and _models.yml are parsed."""
+    _write_yaml(
+        tmp_path / "models" / "_sources.yml",
+        """\
+version: 2
+
+models:
+  - name: src_payments
+    columns:
+      - name: payment_id
+        description: "Payment PK"
+""",
+    )
+    _write_yaml(
+        tmp_path / "models" / "staging" / "_models.yaml",
+        """\
+version: 2
+
+models:
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        description: "Customer PK"
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+
+    assert "src_payments" in result
+    assert result["src_payments"][0].column_name == "payment_id"
+
+    assert "stg_customers" in result
+    assert result["stg_customers"][0].column_name == "customer_id"
+
+
+def test_extract_schema_yml_no_models_dir(tmp_path):
+    """Missing models/ directory returns empty dict."""
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    assert result == {}
+
+
+def test_extract_schema_yml_malformed_yaml(tmp_path):
+    """Malformed YAML files are skipped without raising."""
+    _write_yaml(
+        tmp_path / "models" / "broken.yml",
+        "!!invalid: [yaml\n  bad: {indent",
+    )
+    _write_yaml(
+        tmp_path / "models" / "good.yml",
+        """\
+version: 2
+
+models:
+  - name: good_model
+    columns:
+      - name: id
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    # Broken file skipped, good file still parsed
+    assert "good_model" in result
+    assert result["good_model"][0].column_name == "id"
+
+
+def test_extract_schema_yml_duplicate_model_across_files(tmp_path):
+    """Same model in two files: columns merged with offset positions."""
+    _write_yaml(
+        tmp_path / "models" / "a.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: order_id
+      - name: status
+""",
+    )
+    _write_yaml(
+        tmp_path / "models" / "b.yml",
+        """\
+version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: amount
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    assert "stg_orders" in result
+    cols = result["stg_orders"]
+    assert len(cols) == 3
+    names = [c.column_name for c in cols]
+    assert "order_id" in names
+    assert "status" in names
+    assert "amount" in names
+    # Positions should not collide — second file offset by first file's count
+    positions = [c.position for c in cols]
+    assert len(set(positions)) == 3  # all unique
+
+
+def test_extract_schema_yml_sources(tmp_path):
+    """sources: blocks with tables and columns are extracted."""
+    _write_yaml(
+        tmp_path / "models" / "sources.yml",
+        """\
+version: 2
+
+sources:
+  - name: raw
+    tables:
+      - name: orders
+        columns:
+          - name: order_id
+            description: "PK"
+          - name: total
+      - name: customers
+        columns:
+          - name: customer_id
+""",
+    )
+
+    renderer = DbtRenderer()
+    result = renderer.extract_schema_yml(tmp_path)
+    assert "raw.orders" in result
+    assert len(result["raw.orders"]) == 2
+    assert result["raw.orders"][0].column_name == "order_id"
+    assert result["raw.orders"][0].description == "PK"
+    assert result["raw.orders"][0].source == "schema_yml"
+    assert "raw.customers" in result
+    assert result["raw.customers"][0].column_name == "customer_id"

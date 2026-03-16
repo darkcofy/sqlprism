@@ -17,6 +17,7 @@ The dbt command can be customised (e.g. "uvx --with dbt-starrocks dbt" or
 just "dbt" if globally installed).
 """
 
+import logging
 import shlex
 import subprocess
 from pathlib import Path
@@ -24,7 +25,9 @@ from pathlib import Path
 from sqlprism.languages.sql import SqlParser
 from sqlprism.languages.sqlmesh import _validate_command
 from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
-from sqlprism.types import ParseResult
+from sqlprism.types import ColumnDefResult, ParseResult
+
+logger = logging.getLogger(__name__)
 
 
 class DbtRenderer:
@@ -270,3 +273,100 @@ class DbtRenderer:
                 return name
 
         raise ValueError(f"Could not find 'name:' in {dbt_project_file}")
+
+    def extract_schema_yml(
+        self, project_path: str | Path
+    ) -> dict[str, list[ColumnDefResult]]:
+        """Extract column definitions from dbt schema.yml files.
+
+        Scans all ``*.yml`` and ``*.yaml`` files under the project's ``models/``
+        directory for model and source entries with ``columns:`` lists. Returns
+        a mapping of model name to ``ColumnDefResult`` entries with
+        ``source='schema_yml'``.
+
+        Args:
+            project_path: Path to dbt project dir (containing ``models/``).
+
+        Returns:
+            Dict mapping model name -> list of ``ColumnDefResult``.
+        """
+        import yaml
+
+        project_path = Path(project_path).resolve()
+        models_dir = project_path / "models"
+        if not models_dir.exists():
+            return {}
+
+        result: dict[str, list[ColumnDefResult]] = {}
+
+        yml_files = [f for f in models_dir.rglob("*") if f.suffix in (".yml", ".yaml")]
+        for yml_file in yml_files:
+            try:
+                data = yaml.safe_load(yml_file.read_text())
+            except Exception as e:
+                logger.warning("Skipping malformed YAML %s: %s", yml_file, e)
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            # Extract columns from models: entries
+            for model in data.get("models") or []:
+                if not isinstance(model, dict):
+                    continue
+                model_name = model.get("name")
+                if not model_name:
+                    continue
+                self._extract_yml_columns(model_name, model.get("columns"), result)
+
+            # Extract columns from sources: entries
+            for source_entry in data.get("sources") or []:
+                if not isinstance(source_entry, dict):
+                    continue
+                source_name = source_entry.get("name", "")
+                for table_entry in source_entry.get("tables") or []:
+                    if not isinstance(table_entry, dict):
+                        continue
+                    table_name = table_entry.get("name")
+                    if not table_name:
+                        continue
+                    full_name = f"{source_name}.{table_name}" if source_name else table_name
+                    self._extract_yml_columns(full_name, table_entry.get("columns"), result)
+
+        return result
+
+    @staticmethod
+    def _extract_yml_columns(
+        model_name: str,
+        columns: list | None,
+        result: dict[str, list[ColumnDefResult]],
+    ) -> None:
+        """Extract ColumnDefResult entries from a YAML columns list."""
+        if not isinstance(columns, list):
+            return
+
+        # Offset position to avoid collision when same model spans multiple files
+        offset = len(result[model_name]) if model_name in result else 0
+        col_defs: list[ColumnDefResult] = []
+        for i, col in enumerate(columns):
+            if not isinstance(col, dict):
+                continue
+            col_name = col.get("name")
+            if not col_name:
+                continue
+            col_defs.append(
+                ColumnDefResult(
+                    node_name=model_name,
+                    column_name=col_name,
+                    data_type=col.get("data_type"),
+                    position=offset + i,
+                    source="schema_yml",
+                    description=col.get("description"),
+                )
+            )
+
+        if col_defs:
+            if model_name in result:
+                result[model_name].extend(col_defs)
+            else:
+                result[model_name] = col_defs
