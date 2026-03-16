@@ -1262,3 +1262,141 @@ def test_reindex_concurrent_waits_for_lock(tmp_path):
     # Verify the graph was actually updated after lock release
     status = graph.get_index_status()
     assert status["totals"]["files"] == 1
+
+
+# ── get_schema (query_schema) tests ──
+
+
+def test_get_schema_with_columns():
+    """query_schema returns columns with correct types, positions, and sources."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+        node_id = db.insert_node(file_id, "table", "orders", "sql")
+        db.insert_columns_batch([
+            (node_id, "order_id", "INT", 0, "definition", None),
+            (node_id, "status", "TEXT", 1, "definition", None),
+            (node_id, "amount", "DECIMAL", 2, "definition", None),
+        ])
+
+    result = db.query_schema("orders")
+
+    assert result["name"] == "orders"
+    assert result["kind"] == "table"
+    assert result["file"] == "orders.sql"
+    assert result["repo"] == "test"
+    assert len(result["columns"]) == 3
+
+    cols_by_name = {c["name"]: c for c in result["columns"]}
+    assert cols_by_name["order_id"]["type"] == "INT"
+    assert cols_by_name["order_id"]["position"] == 0
+    assert cols_by_name["status"]["type"] == "TEXT"
+    assert cols_by_name["status"]["position"] == 1
+    assert cols_by_name["amount"]["type"] == "DECIMAL"
+    assert cols_by_name["amount"]["position"] == 2
+    for col in result["columns"]:
+        assert col["source"] == "definition"
+
+    db.close()
+
+
+def test_get_schema_dbt_descriptions():
+    """query_schema merges dbt schema_yml descriptions with definition types."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("dbt_proj", "/tmp/dbt", repo_type="dbt")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "stg_orders.sql", "sql", "def456")
+        node_id = db.insert_node(file_id, "table", "stg_orders", "sql")
+        # First pass: definition columns with types but no descriptions
+        db.insert_columns_batch([
+            (node_id, "order_id", "INT", 0, "definition", None),
+            (node_id, "status", "TEXT", 1, "definition", None),
+        ])
+        # Second pass: schema_yml upsert adds descriptions (types left as None
+        # so COALESCE preserves the original type from definition)
+        db.insert_columns_batch([
+            (node_id, "order_id", None, None, "schema_yml", "Primary key for orders"),
+            (node_id, "status", None, None, "schema_yml", "Current order status"),
+        ])
+
+    result = db.query_schema("stg_orders")
+
+    assert len(result["columns"]) == 2
+    cols_by_name = {c["name"]: c for c in result["columns"]}
+    # Types preserved from definition pass
+    assert cols_by_name["order_id"]["type"] == "INT"
+    assert cols_by_name["status"]["type"] == "TEXT"
+    # Descriptions added from schema_yml pass
+    assert cols_by_name["order_id"]["description"] == "Primary key for orders"
+    assert cols_by_name["status"]["description"] == "Current order status"
+
+    db.close()
+
+
+def test_get_schema_unknown_model():
+    """query_schema returns error dict for a nonexistent table."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    result = db.query_schema("nonexistent_table")
+
+    assert "error" in result
+    assert "nonexistent_table" in result["error"]
+
+    db.close()
+
+
+def test_get_schema_repo_filter():
+    """query_schema filters results by repo name."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_a_id = db.upsert_repo("repo_a", "/tmp/repo_a", repo_type="sql")
+    repo_b_id = db.upsert_repo("repo_b", "/tmp/repo_b", repo_type="sql")
+    with db.write_transaction():
+        file_a = db.insert_file(repo_a_id, "orders.sql", "sql", "aaa")
+        db.insert_node(file_a, "table", "orders", "sql")
+        file_b = db.insert_file(repo_b_id, "orders.sql", "sql", "bbb")
+        db.insert_node(file_b, "table", "orders", "sql")
+
+    result_a = db.query_schema("orders", repo="repo_a")
+    assert result_a["repo"] == "repo_a"
+
+    result_b = db.query_schema("orders", repo="repo_b")
+    assert result_b["repo"] == "repo_b"
+
+    db.close()
+
+
+def test_get_schema_upstream_downstream():
+    """query_schema returns upstream and downstream dependencies."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "pipeline.sql", "sql", "xyz789")
+        raw_id = db.insert_node(file_id, "table", "raw_orders", "sql")
+        stg_id = db.insert_node(file_id, "table", "staging_orders", "sql")
+        mart_id = db.insert_node(file_id, "table", "marts_revenue", "sql")
+        # staging_orders references raw_orders
+        db.insert_edge(stg_id, raw_id, "references")
+        # marts_revenue references staging_orders
+        db.insert_edge(mart_id, stg_id, "references")
+
+    result = db.query_schema("staging_orders")
+
+    upstream_names = {u["name"] for u in result["upstream"]}
+    assert "raw_orders" in upstream_names
+
+    downstream_names = {d["name"] for d in result["downstream"]}
+    assert "marts_revenue" in downstream_names
+
+    db.close()
