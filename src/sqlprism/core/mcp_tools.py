@@ -393,6 +393,39 @@ async def get_schema(params: GetSchemaInput) -> dict:
     )
 
 
+class GetContextInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    name: str = Field(..., description="Table or model name (e.g. 'staging.orders', 'stg_orders')")
+    repo: str | None = Field(None, description="Filter by repo name. Omit to search all repos.")
+
+
+@mcp.tool(
+    name="get_context",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def get_context(params: GetContextInput) -> dict:
+    """Get comprehensive context for a model — the first tool to call when working with a model.
+
+    Returns a complete context dump including:
+    - Model metadata (name, kind, file, repo)
+    - Column definitions with types and descriptions
+    - Upstream and downstream dependencies
+    - Column usage summary (most used columns, join keys, aggregations)
+    - Source code snippet (first 30 lines)
+    - Graph metrics (PageRank importance) when DuckPGQ is available
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_context,
+        name=params.name,
+        repo=params.repo,
+    )
+
+
 class ColumnChange(BaseModel):
     action: Literal["remove_column", "rename_column", "add_column"] = Field(
         ...,
