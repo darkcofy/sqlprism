@@ -1507,15 +1507,19 @@ class GraphDB:
         max_hops = max(min(max_hops, 10), 1)
 
         # Step 1: Find shortest path length via PGQ ANY SHORTEST
+        # Note: DuckPGQ does not support bind parameters inside
+        # GRAPH_TABLE, so we escape the values manually.
+        def _esc(v: str) -> str:
+            return v.replace("'", "''")
+
         try:
             rows = self._execute_read(
                 f"FROM GRAPH_TABLE (sqlprism_graph "
                 f"MATCH p = ANY SHORTEST "
-                f"(src:nodes WHERE src.name = ?)"
+                f"(src:nodes WHERE src.name = '{_esc(from_model)}')"
                 f"-[e:edges]->{{1,{max_hops}}}"
-                f"(dst:nodes WHERE dst.name = ?) "
+                f"(dst:nodes WHERE dst.name = '{_esc(to_model)}') "
                 f"COLUMNS (path_length(p) AS hops))",
-                [from_model, to_model],
             ).fetchall()
         except duckdb.Error as e:
             logger.warning("DuckPGQ find_path failed: %s", e)
