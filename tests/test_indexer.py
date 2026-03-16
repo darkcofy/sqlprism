@@ -6,6 +6,7 @@ from sqlprism.core.indexer import _resolve_dialect
 from sqlprism.core.mcp_tools import _compute_structural_diff
 from sqlprism.languages.sqlmesh import _validate_command
 from sqlprism.types import (
+    ColumnDefResult,
     ColumnUsageResult,
     EdgeResult,
     NodeResult,
@@ -1530,5 +1531,262 @@ def test_reindex_file_outside_repos_skipped(tmp_path):
     detail = stats["details"][0]
     assert detail["path"] == str(outside_file)
     assert "no matching repo" in detail["reason"]
+
+    db.close()
+
+
+def test_insert_parse_result_stores_columns():
+    """_insert_parse_result stores ColumnDefResult entries in the columns table."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+
+    result = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="orders")],
+        columns=[
+            ColumnDefResult(
+                node_name="orders", column_name="order_id",
+                data_type="INT", position=0, source="definition",
+            ),
+            ColumnDefResult(
+                node_name="orders", column_name="status",
+                data_type="TEXT", position=1, source="definition",
+            ),
+        ],
+    )
+
+    stats = {
+        "nodes_added": 0,
+        "edges_added": 0,
+        "column_usage_added": 0,
+        "lineage_chains": 0,
+    }
+
+    with db.write_transaction():
+        indexer._insert_parse_result(result, file_id, repo_id, stats)
+
+    rows = db._execute_read(
+        "SELECT node_id, column_name, data_type, position, source FROM columns ORDER BY position"
+    ).fetchall()
+
+    assert len(rows) == 2
+    assert rows[0][1] == "order_id"
+    assert rows[0][2] == "INT"
+    assert rows[0][3] == 0
+    assert rows[0][4] == "definition"
+    assert rows[1][1] == "status"
+    assert rows[1][2] == "TEXT"
+    assert rows[1][3] == 1
+    assert stats["columns_added"] == 2
+
+    db.close()
+
+
+def test_columns_multiple_sources_merged():
+    """Column definitions from multiple sources are merged with upsert semantics."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+
+    # First: insert columns via _insert_parse_result (source="definition")
+    result = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="orders")],
+        columns=[
+            ColumnDefResult(
+                node_name="orders", column_name="order_id",
+                data_type="INT", position=0, source="definition",
+            ),
+            ColumnDefResult(
+                node_name="orders", column_name="status",
+                data_type="TEXT", position=1, source="definition",
+            ),
+        ],
+    )
+
+    stats = {
+        "nodes_added": 0,
+        "edges_added": 0,
+        "column_usage_added": 0,
+        "lineage_chains": 0,
+    }
+
+    with db.write_transaction():
+        indexer._insert_parse_result(result, file_id, repo_id, stats)
+
+    # Get the node_id for orders
+    node_row = db._execute_read(
+        "SELECT node_id FROM nodes WHERE name = 'orders'"
+    ).fetchone()
+    node_id = node_row[0]
+
+    # Second: insert from schema_yml source with description
+    db.insert_columns_batch([
+        (node_id, "order_id", None, None, "schema_yml", "The unique order identifier"),
+        (node_id, "status", None, None, "schema_yml", "Current order status"),
+    ])
+
+    rows = db._execute_read(
+        "SELECT column_name, data_type, source, description FROM columns WHERE node_id = ? ORDER BY column_name",
+        [node_id],
+    ).fetchall()
+
+    assert len(rows) == 2
+    # Upsert: schema_yml wins for source, but data_type is preserved via COALESCE
+    for row in rows:
+        assert row[1] is not None  # data_type preserved from definition
+        assert row[2] == "schema_yml"  # source updated
+        assert row[3] is not None  # description set from schema_yml
+
+    db.close()
+
+
+def test_get_table_columns_prefers_columns_table():
+    """get_table_columns returns types from columns table over column_usage."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+        node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Insert real types in columns table
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+        (node_id, "amount", "VARCHAR", 1, "definition", None),
+    ])
+
+    # Also insert column_usage for the same columns
+    db.insert_column_usage(node_id, "orders", "order_id", "select", file_id)
+    db.insert_column_usage(node_id, "orders", "amount", "select", file_id)
+
+    schema = db.get_table_columns(repo_id)
+
+    assert "orders" in schema
+    assert schema["orders"]["order_id"] == "INT"
+    assert schema["orders"]["amount"] == "VARCHAR"
+
+    db.close()
+
+
+def test_get_table_columns_fallback_column_usage():
+    """get_table_columns falls back to column_usage with TEXT type when columns table is empty."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+        node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Only insert column_usage — no columns table entries
+    db.insert_column_usage(node_id, "orders", "order_id", "select", file_id)
+    db.insert_column_usage(node_id, "orders", "status", "where", file_id)
+
+    schema = db.get_table_columns(repo_id)
+
+    assert "orders" in schema
+    assert schema["orders"]["order_id"] == "TEXT"
+    assert schema["orders"]["status"] == "TEXT"
+
+    db.close()
+
+
+def test_get_table_columns_merged_result():
+    """get_table_columns merges columns table and column_usage, preferring real types."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc123")
+        node_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # 3 columns in columns table with real types
+    db.insert_columns_batch([
+        (node_id, "order_id", "INT", 0, "definition", None),
+        (node_id, "amount", "DECIMAL", 1, "definition", None),
+        (node_id, "status", "VARCHAR", 2, "definition", None),
+    ])
+
+    # 1 additional column only in column_usage
+    db.insert_column_usage(node_id, "orders", "order_id", "select", file_id)
+    db.insert_column_usage(node_id, "orders", "created_at", "select", file_id)
+
+    schema = db.get_table_columns(repo_id)
+
+    assert "orders" in schema
+    assert len(schema["orders"]) == 4
+    # Columns from columns table have real types
+    assert schema["orders"]["order_id"] == "INT"
+    assert schema["orders"]["amount"] == "DECIMAL"
+    assert schema["orders"]["status"] == "VARCHAR"
+    # Column from usage only has TEXT
+    assert schema["orders"]["created_at"] == "TEXT"
+
+    db.close()
+
+
+def test_columns_batch_insert():
+    """Batch insert of 50+ column definitions works correctly."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB()
+    indexer = Indexer(db)
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "wide_table.sql", "sql", "abc123")
+
+    num_columns = 55
+    col_defs = [
+        ColumnDefResult(
+            node_name="wide_table",
+            column_name=f"col_{i}",
+            data_type="TEXT",
+            position=i,
+            source="definition",
+        )
+        for i in range(num_columns)
+    ]
+
+    result = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="wide_table")],
+        columns=col_defs,
+    )
+
+    stats = {
+        "nodes_added": 0,
+        "edges_added": 0,
+        "column_usage_added": 0,
+        "lineage_chains": 0,
+    }
+
+    with db.write_transaction():
+        indexer._insert_parse_result(result, file_id, repo_id, stats)
+
+    rows = db._execute_read("SELECT COUNT(*) FROM columns").fetchone()
+    assert rows[0] == num_columns
+
+    assert stats["columns_added"] >= 50
 
     db.close()
