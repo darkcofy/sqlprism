@@ -390,3 +390,4 @@ def test_init_help_mentions_yaml():
     result = runner.invoke(cli, ["init", "--help"])
     assert result.exit_code == 0
     assert "yaml" in result.output.lower()
+    assert "default: yaml" in result.output.lower()

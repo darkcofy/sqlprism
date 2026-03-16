@@ -43,7 +43,7 @@ SQLMesh projects often define macro variables in `config.yaml` under the `variab
 You must pass variables explicitly:
 
 - **CLI**: `--var KEY VALUE` (repeatable)
-- **Config**: `"variables": {"KEY": value}`
+- **Config**: `variables:` with `KEY: value` entries
 
 If a variable is missing, the render will fail with `Macro variable 'X' is undefined.`
 

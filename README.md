@@ -138,7 +138,7 @@ autocmd BufWritePost *.sql silent !sqlprism reindex-file %:p
 
 ## Configuration
 
-`sqlprism init` creates a default config at `sqlprism.yml` in the working directory. YAML is the default format; JSON is also supported (`--format json`). Override the config path with `--config PATH` on any command.
+`sqlprism init` creates a default config at `sqlprism.yml` in the working directory. YAML is the default format; JSON is also supported (`--format json`). Existing `sqlprism.json` files are auto-discovered for backwards compatibility. Override the config path with `--config PATH` on any command.
 
 ```yaml
 db_path: ~/.sqlprism/graph.duckdb

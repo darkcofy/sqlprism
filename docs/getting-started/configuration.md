@@ -73,7 +73,8 @@ my-repo:
 | `project_path` | Yes | Path to the sqlmesh project directory (containing `config.yaml`). |
 | `env_file` | No | Path to `.env` file. Loaded into the subprocess environment before rendering. |
 | `dialect` | No | SQL dialect for rendering. Default: `athena`. |
-| `variables` | No | SQLMesh macro variables as key-value pairs (e.g. `{"GRACE_PERIOD": 7}`). |
+| `variables` | No | SQLMesh macro variables as key-value pairs (e.g. `GRACE_PERIOD: 7`). |
+| `sqlmesh_command` | No | Command to run Python in the sqlmesh project's venv. Default: `uv run python`. |
 
 ## dbt Repos
 
@@ -84,6 +85,7 @@ my-repo:
 | `target` | No | dbt target name (e.g. `dev`, `prod`). |
 | `dialect` | No | SQL dialect for parsing compiled output (e.g. `starrocks`, `postgres`). |
 | `dbt_command` | No | Base command to invoke dbt. Default: `uv run dbt`. `compile` is appended automatically. |
+| `profiles_dir` | No | Path to directory containing `profiles.yml`. Defaults to the project directory. |
 
 ## SQL Dialect Support
 

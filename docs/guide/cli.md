@@ -37,13 +37,13 @@ sqlprism status [--config PATH] [--db PATH]
 Starts the MCP server, exposing all 11 tools to any MCP client.
 
 ```bash
-sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable_http] [--port 8000]
+sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable-http] [--port 8000]
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--transport` | `stdio` | Transport mode. Use `stdio` for Claude Code / Claude Desktop. Use `streamable_http` for web-based clients. |
-| `--port` | `8000` | Port for HTTP transport. Only used with `streamable_http`. |
+| `--transport` | `stdio` | Transport mode. Use `stdio` for Claude Code / Claude Desktop. Use `streamable-http` for web-based clients. |
+| `--port` | `8000` | Port for HTTP transport. Only used with `streamable-http`. |
 | `--config` | Auto-discovered (see Configuration) | Path to config file. |
 | `--db` | From config | Path to DuckDB file. Overrides `db_path` in config. |
 
