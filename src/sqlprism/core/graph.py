@@ -1132,6 +1132,106 @@ class GraphDB:
 
         return schema
 
+    def query_schema(
+        self,
+        name: str,
+        repo: str | None = None,
+    ) -> dict:
+        """Return the full schema for a named table or model.
+
+        Includes column definitions with types, descriptions, and the
+        node's upstream/downstream dependencies.
+
+        Args:
+            name: Entity name to look up.
+            repo: Optional repo name filter for disambiguation.
+
+        Returns:
+            Dict with ``name``, ``kind``, ``file``, ``repo``, ``columns``,
+            ``upstream``, and ``downstream`` keys.  Returns an ``error``
+            key when the entity is not found.
+        """
+        # 1. Find the node
+        if repo:
+            node_rows = self._execute_read(
+                "SELECT n.node_id, n.kind, f.path, r.name "
+                "FROM nodes n "
+                "LEFT JOIN files f ON n.file_id = f.file_id "
+                "LEFT JOIN repos r ON f.repo_id = r.repo_id "
+                "WHERE n.name = ? AND r.name = ?",
+                [name, repo],
+            ).fetchall()
+        else:
+            node_rows = self._execute_read(
+                "SELECT n.node_id, n.kind, f.path, r.name "
+                "FROM nodes n "
+                "LEFT JOIN files f ON n.file_id = f.file_id "
+                "LEFT JOIN repos r ON f.repo_id = r.repo_id "
+                "WHERE n.name = ?",
+                [name],
+            ).fetchall()
+
+        if not node_rows:
+            return {"error": f"Model '{name}' not found in the index."}
+
+        # Use the first match; collect all node_ids for edge queries
+        first = node_rows[0]
+        node_kind = first[1]
+        file_path = first[2]
+        repo_name = first[3]
+        node_ids = [row[0] for row in node_rows]
+        placeholders = ",".join(["?"] * len(node_ids))
+
+        # 2. Get columns from the first node
+        col_rows = self._execute_read(
+            "SELECT column_name, data_type, position, source, description "
+            "FROM columns WHERE node_id = ? ORDER BY position",
+            [node_ids[0]],
+        ).fetchall()
+
+        columns = [
+            {
+                "name": r[0],
+                "type": r[1] or "UNKNOWN",
+                "position": r[2],
+                "source": r[3],
+                "description": r[4],
+            }
+            for r in col_rows
+        ]
+
+        # 3. Get upstream (outbound edges — what this node references)
+        upstream_rows = self._execute_read(
+            f"SELECT DISTINCT n2.name, n2.kind "
+            f"FROM edges e "
+            f"JOIN nodes n2 ON e.target_id = n2.node_id "
+            f"WHERE e.source_id IN ({placeholders})",
+            node_ids,
+        ).fetchall()
+
+        upstream = [{"name": r[0], "kind": r[1]} for r in upstream_rows]
+
+        # 4. Get downstream (inbound edges — what depends on this node)
+        downstream_rows = self._execute_read(
+            f"SELECT DISTINCT n2.name, n2.kind "
+            f"FROM edges e "
+            f"JOIN nodes n2 ON e.source_id = n2.node_id "
+            f"WHERE e.target_id IN ({placeholders})",
+            node_ids,
+        ).fetchall()
+
+        downstream = [{"name": r[0], "kind": r[1]} for r in downstream_rows]
+
+        return {
+            "name": name,
+            "kind": node_kind,
+            "file": file_path,
+            "repo": repo_name,
+            "columns": columns,
+            "upstream": upstream,
+            "downstream": downstream,
+        }
+
     # ── Snippet helper ──
 
     def _read_snippet(
