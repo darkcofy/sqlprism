@@ -1064,21 +1064,53 @@ class GraphDB:
     # ── Schema catalog ──
 
     def get_table_columns(self, repo_id: int | None = None) -> dict[str, dict[str, str]]:
-        """Build a schema catalog from indexed column usage.
+        """Build a schema catalog from indexed columns and column usage.
+
+        Prefers the authoritative ``columns`` table (joined with ``nodes``)
+        which carries real ``data_type`` information.  Falls back to
+        ``column_usage`` for any additional columns not present in the
+        ``columns`` table, assigning them the default type ``"TEXT"``.
+
+        When the ``columns`` table is empty the behaviour is identical to
+        the previous column-usage-only implementation.
 
         Suitable for passing to ``sqlglot.optimizer.qualify_columns`` or
-        ``sqlglot.lineage``. All types are set to ``"TEXT"`` since the
-        indexer does not track actual column types.
+        ``sqlglot.lineage``.
 
         Args:
             repo_id: Restrict to columns from this repo. ``None`` returns
                 columns across all repos.
 
         Returns:
-            ``{table_name: {column_name: "TEXT", ...}}`` mapping.
+            ``{table_name: {column_name: data_type, ...}}`` mapping.
         """
+        schema: dict[str, dict[str, str]] = {}
+
+        # 1. Authoritative columns from columns table (with real types)
         if repo_id:
-            rows = self._execute_read(
+            col_rows = self._execute_read(
+                "SELECT n.name, c.column_name, c.data_type "
+                "FROM columns c "
+                "JOIN nodes n ON c.node_id = n.node_id "
+                "JOIN files f ON n.file_id = f.file_id "
+                "WHERE f.repo_id = ?",
+                [repo_id],
+            ).fetchall()
+        else:
+            col_rows = self._execute_read(
+                "SELECT n.name, c.column_name, c.data_type "
+                "FROM columns c "
+                "JOIN nodes n ON c.node_id = n.node_id"
+            ).fetchall()
+
+        for table, col, dtype in col_rows:
+            if table not in schema:
+                schema[table] = {}
+            schema[table][col] = dtype or "TEXT"
+
+        # 2. Fallback: fill gaps from column_usage
+        if repo_id:
+            usage_rows = self._execute_read(
                 "SELECT DISTINCT cu.table_name, cu.column_name "
                 "FROM column_usage cu "
                 "JOIN files f ON cu.file_id = f.file_id "
@@ -1086,15 +1118,16 @@ class GraphDB:
                 [repo_id],
             ).fetchall()
         else:
-            rows = self._execute_read(
+            usage_rows = self._execute_read(
                 "SELECT DISTINCT table_name, column_name FROM column_usage WHERE column_name != '*'"
             ).fetchall()
 
-        schema: dict[str, dict[str, str]] = {}
-        for table, col in rows:
+        for table, col in usage_rows:
             if table not in schema:
                 schema[table] = {}
-            schema[table][col] = "TEXT"
+            if col not in schema[table]:  # Don't overwrite columns table entries
+                schema[table][col] = "TEXT"
+
         return schema
 
     # ── Snippet helper ──
