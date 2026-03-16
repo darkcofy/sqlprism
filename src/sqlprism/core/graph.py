@@ -1476,6 +1476,111 @@ class GraphDB:
             },
         }
 
+    def query_context(self, name: str, repo: str | None = None) -> dict:
+        """Return comprehensive context for a model.
+
+        Composes schema info, column usage summary, a code snippet,
+        and optional graph metrics into a single response.
+
+        Args:
+            name: Entity name to look up.
+            repo: Optional repo name filter for disambiguation.
+
+        Returns:
+            Dict with ``model``, ``columns``, ``upstream``, ``downstream``,
+            ``column_usage_summary``, ``snippet``, and optionally
+            ``graph_metrics`` keys.
+        """
+        # 1. Schema lookup
+        schema_result = self.query_schema(name, repo)
+        if "error" in schema_result:
+            return schema_result
+
+        # 2. Column usage summary
+        where = ["cu.table_name = ?"]
+        params: list = [name]
+        if repo:
+            where.append("r.name = ?")
+            params.append(repo)
+
+        usage_sql = (
+            "SELECT cu.column_name, cu.usage_type, COUNT(*) as cnt "
+            "FROM column_usage cu "
+            "JOIN nodes n ON cu.node_id = n.node_id "
+            "JOIN files f ON cu.file_id = f.file_id "
+            "LEFT JOIN repos r ON f.repo_id = r.repo_id "
+            f"WHERE {' AND '.join(where)} "
+            "GROUP BY cu.column_name, cu.usage_type "
+            "ORDER BY cnt DESC"
+        )
+        usage_rows = self._execute_read(usage_sql, params).fetchall()
+
+        # Aggregate total usage per column for top-10
+        col_totals: dict[str, int] = {}
+        join_keys: list[str] = []
+        aggregations: list[str] = []
+        seen_join: set[str] = set()
+        seen_agg: set[str] = set()
+
+        for col_name, usage_type, cnt in usage_rows:
+            col_totals[col_name] = col_totals.get(col_name, 0) + cnt
+            if usage_type == "join_on" and col_name not in seen_join:
+                join_keys.append(col_name)
+                seen_join.add(col_name)
+            if usage_type in ("group_by", "partition_by") and col_name not in seen_agg:
+                aggregations.append(col_name)
+                seen_agg.add(col_name)
+
+        most_used = sorted(col_totals, key=lambda c: col_totals[c], reverse=True)[:10]
+
+        # 3. Code snippet (first 30 lines)
+        snippet = self._read_snippet(
+            schema_result["repo"],
+            schema_result["file"],
+            1,
+            None,
+            context_lines=0,
+            max_lines=30,
+        )
+
+        # 4. Optional graph metrics
+        graph_metrics = None
+        if self.has_pgq:
+            try:
+                pr_rows = self._execute_read(
+                    "SELECT pr.pagerank FROM pagerank(sqlprism_graph, nodes, edges) pr "
+                    "JOIN nodes n ON n.rowid = pr.rowid WHERE n.name = ?",
+                    [name],
+                ).fetchall()
+                graph_metrics = {
+                    "importance": round(pr_rows[0][0], 6) if pr_rows else None,
+                    "downstream_count": len(schema_result.get("downstream", [])),
+                }
+            except Exception:
+                graph_metrics = None
+
+        # 5. Compose result
+        result: dict = {
+            "model": {
+                "name": name,
+                "kind": schema_result["kind"],
+                "file": schema_result["file"],
+                "repo": schema_result["repo"],
+            },
+            "columns": schema_result["columns"],
+            "upstream": schema_result["upstream"],
+            "downstream": schema_result["downstream"],
+            "column_usage_summary": {
+                "most_used_columns": most_used,
+                "downstream_join_keys": join_keys,
+                "downstream_aggregations": aggregations,
+            },
+            "snippet": snippet,
+        }
+        if graph_metrics:
+            result["graph_metrics"] = graph_metrics
+        return result
+
     # ── Snippet helper ──
 
     def _read_snippet(
