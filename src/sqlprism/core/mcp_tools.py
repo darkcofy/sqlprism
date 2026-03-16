@@ -426,6 +426,39 @@ async def get_context(params: GetContextInput) -> dict:
     )
 
 
+class FindPathInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    from_model: str = Field(..., description="Starting model name (e.g. 'raw.orders')")
+    to_model: str = Field(..., description="Target model name (e.g. 'marts.revenue')")
+    max_hops: int = Field(10, description="Maximum path length (default 10, max 10)", ge=1, le=10)
+
+
+@mcp.tool(
+    name="find_path",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def find_path(params: FindPathInput) -> dict:
+    """Find the shortest dependency path between two models.
+
+    Uses DuckPGQ graph traversal to find the shortest chain of
+    dependencies connecting two models. Returns the full path
+    with intermediate models and path length.
+
+    Requires DuckPGQ extension. Returns an error if not installed.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_find_path,
+        from_model=params.from_model,
+        to_model=params.to_model,
+        max_hops=params.max_hops,
+    )
+
+
 class ColumnChange(BaseModel):
     action: Literal["remove_column", "rename_column", "add_column"] = Field(
         ...,
