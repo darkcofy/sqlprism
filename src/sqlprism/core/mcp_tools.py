@@ -459,6 +459,37 @@ async def find_path(params: FindPathInput) -> dict:
     )
 
 
+class FindCriticalModelsInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    top_n: int = Field(20, description="Number of top models to return (default 20, max 100)", ge=1, le=100)
+    repo: str | None = Field(None, description="Filter by repo name. Omit for all repos.")
+
+
+@mcp.tool(
+    name="find_critical_models",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def find_critical_models(params: FindCriticalModelsInput) -> dict:
+    """Find the most critical models by importance (PageRank) and downstream impact.
+
+    Ranks models by their graph centrality — models with high PageRank are
+    referenced by many important models. Use to identify high-impact models
+    that need extra care when modifying.
+
+    Requires DuckPGQ extension.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_find_critical_models,
+        top_n=params.top_n,
+        repo=params.repo,
+    )
+
+
 class ColumnChange(BaseModel):
     action: Literal["remove_column", "rename_column", "add_column"] = Field(
         ...,
