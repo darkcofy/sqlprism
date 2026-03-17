@@ -13,6 +13,7 @@ Design principles:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
@@ -82,6 +83,131 @@ class ConventionEngine:
     def __init__(self, db: GraphDB, repo_id: int) -> None:
         self.db = db
         self.repo_id = repo_id
+
+    def run_inference(self) -> dict:
+        """Run all convention inference steps and store results.
+
+        Detects layers, infers naming patterns, reference rules,
+        common columns, and column style for each layer. Upserts
+        results into the ``conventions`` table.
+
+        Returns:
+            Stats dict with layers_detected and conventions_stored counts.
+        """
+        layers = self.detect_layers()
+        if not layers:
+            logger.debug("No layers detected for repo %d", self.repo_id)
+            return {"layers_detected": 0, "conventions_stored": 0}
+
+        reference_rules = self.infer_reference_rules(layers)
+        ref_rules_by_layer = {r.source_layer: r for r in reference_rules}
+
+        stored = 0
+        for layer in layers:
+            # Step 2: Naming pattern
+            naming = self.infer_naming_pattern(layer.model_names)
+            self._store_convention(
+                layer.name,
+                "naming",
+                {
+                    "pattern": naming.pattern,
+                    "matching_count": naming.matching_count,
+                    "total_count": naming.total_count,
+                    "exceptions": naming.exceptions,
+                },
+                naming.confidence,
+                layer.model_count,
+            )
+            stored += 1
+
+            # Step 3: Reference rules
+            ref_rule = ref_rules_by_layer.get(layer.name)
+            if ref_rule:
+                self._store_convention(
+                    layer.name,
+                    "references",
+                    {
+                        "allowed_targets": ref_rule.allowed_targets,
+                        "target_distribution": ref_rule.target_distribution,
+                    },
+                    ref_rule.confidence,
+                    layer.model_count,
+                )
+                stored += 1
+
+            # Step 4: Common columns
+            common_cols = self.infer_common_columns(layer)
+            if common_cols:
+                self._store_convention(
+                    layer.name,
+                    "required_columns",
+                    {
+                        "columns": [
+                            {
+                                "name": c.column_name,
+                                "frequency": c.frequency,
+                                "source": c.source,
+                                "missing_in": c.missing_in,
+                            }
+                            for c in common_cols
+                        ]
+                    },
+                    max(c.frequency for c in common_cols),
+                    layer.model_count,
+                )
+                stored += 1
+
+            # Step 5: Column style
+            style = self.detect_column_style(layer)
+            if style.confidence > 0.0:
+                self._store_convention(
+                    layer.name,
+                    "column_style",
+                    {"style": style.style},
+                    style.confidence,
+                    layer.model_count,
+                )
+                stored += 1
+
+        logger.info(
+            "Convention inference: %d layers, %d conventions stored",
+            len(layers),
+            stored,
+        )
+        return {
+            "layers_detected": len(layers),
+            "conventions_stored": stored,
+        }
+
+    def _store_convention(
+        self,
+        layer: str,
+        convention_type: str,
+        payload: dict,
+        confidence: float,
+        model_count: int,
+    ) -> None:
+        """Upsert a convention into the conventions table."""
+        with self.db._write_lock:
+            self.db._execute_write(
+                "INSERT INTO conventions "
+                "(repo_id, layer, convention_type, payload, "
+                "confidence, source, model_count) "
+                "VALUES (?, ?, ?, ?, ?, 'inferred', ?) "
+                "ON CONFLICT (repo_id, layer, convention_type) "
+                "DO UPDATE SET "
+                "payload = EXCLUDED.payload, "
+                "confidence = EXCLUDED.confidence, "
+                "model_count = EXCLUDED.model_count",
+                [
+                    self.repo_id,
+                    layer,
+                    convention_type,
+                    json.dumps(payload),
+                    confidence,
+                    model_count,
+                ],
+            )
 
     def detect_layers(self) -> list[Layer]:
         """Detect layers from directory structure.
