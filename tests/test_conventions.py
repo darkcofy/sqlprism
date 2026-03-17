@@ -790,8 +790,8 @@ def test_conventions_computed_after_reindex():
         engine = ConventionEngine(db, repo_id)
         result = engine.run_inference()
 
-        assert result["layers_detected"] >= 2
-        assert result["conventions_stored"] > 0
+        assert result["layers_detected"] == 3  # raw, staging, marts
+        assert result["conventions_stored"] >= 4  # at least naming per layer + refs + cols
 
         # Verify conventions table has entries
         rows = db.conn.execute(
@@ -799,7 +799,7 @@ def test_conventions_computed_after_reindex():
             "FROM conventions WHERE repo_id = ? ORDER BY layer, convention_type",
             [repo_id],
         ).fetchall()
-        assert len(rows) > 0
+        assert len(rows) >= 4
 
         # Check naming convention stored for staging
         staging_naming = next(
@@ -808,6 +808,7 @@ def test_conventions_computed_after_reindex():
         )
         assert staging_naming is not None
         assert staging_naming[3] == "inferred"  # source
+        assert staging_naming[2] > 0  # confidence > 0
     finally:
         db.close()
 
@@ -851,13 +852,23 @@ def test_conventions_payload_is_valid_json():
         engine.run_inference()
 
         rows = db.conn.execute(
-            "SELECT payload FROM conventions WHERE repo_id = ?",
+            "SELECT convention_type, payload FROM conventions WHERE repo_id = ?",
             [repo_id],
         ).fetchall()
 
-        for (payload,) in rows:
+        expected_keys = {
+            "naming": "pattern",
+            "references": "allowed_targets",
+            "required_columns": "columns",
+            "column_style": "style",
+        }
+        for conv_type, payload in rows:
             parsed = json.loads(payload)
             assert isinstance(parsed, dict)
+            assert len(parsed) > 0
+            # Verify required key per convention type
+            if conv_type in expected_keys:
+                assert expected_keys[conv_type] in parsed
     finally:
         db.close()
 

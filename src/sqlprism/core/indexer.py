@@ -702,7 +702,7 @@ class Indexer:
                 repo_id,
                 e,
             )
-            return {}
+            return {"layers_detected": 0, "conventions_stored": 0}
 
     def _insert_parse_result(
         self,
