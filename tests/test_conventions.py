@@ -886,3 +886,137 @@ def test_run_inference_empty_repo():
         assert result["conventions_stored"] == 0
     finally:
         db.close()
+
+
+# ── get_conventions (query_conventions) ──
+
+
+def _setup_repo_with_conventions(db: GraphDB) -> int:
+    """Set up a repo, run inference, return repo_id."""
+    repo_id, nodes = _setup_layered_repo_with_edges(db)
+    db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+    db.insert_edge(nodes["stg_payments"], nodes["raw_payments"], "references")
+
+    # Add columns for column style detection
+    nids = db._execute_read(
+        "SELECT node_id, name FROM nodes WHERE name LIKE 'stg_%'",
+    ).fetchall()
+    for nid, _name in nids:
+        db.conn.execute(
+            "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+            "VALUES (?, 'updated_at', 'TIMESTAMP', 1, 'definition')",
+            [nid],
+        )
+
+    engine = ConventionEngine(db, repo_id)
+    engine.run_inference()
+    return repo_id
+
+
+def test_get_conventions_single_layer():
+    """Get conventions for a specific layer."""
+    db = GraphDB()
+    try:
+        repo_id = _setup_repo_with_conventions(db)
+        repo_name = db._execute_read(
+            "SELECT name FROM repos WHERE repo_id = ?", [repo_id]
+        ).fetchone()[0]
+
+        result = db.query_conventions(layer="staging", repo=repo_name)
+
+        assert "error" not in result
+        assert result["layer"] == "staging"
+        assert "naming" in result
+        assert result["naming"]["confidence"] > 0
+        assert result["naming"]["source"] == "inferred"
+    finally:
+        db.close()
+
+
+def test_get_conventions_all_layers():
+    """Get conventions for all layers."""
+    db = GraphDB()
+    try:
+        repo_id = _setup_repo_with_conventions(db)
+        repo_name = db._execute_read(
+            "SELECT name FROM repos WHERE repo_id = ?", [repo_id]
+        ).fetchone()[0]
+
+        result = db.query_conventions(repo=repo_name)
+
+        assert "layers" in result
+        layer_names = {ly["layer"] for ly in result["layers"]}
+        assert "staging" in layer_names
+        assert "raw" in layer_names
+    finally:
+        db.close()
+
+
+def test_get_conventions_unknown_layer():
+    """Layer not found returns error with available layers."""
+    db = GraphDB()
+    try:
+        repo_id = _setup_repo_with_conventions(db)
+        repo_name = db._execute_read(
+            "SELECT name FROM repos WHERE repo_id = ?", [repo_id]
+        ).fetchone()[0]
+
+        result = db.query_conventions(layer="nonexistent", repo=repo_name)
+
+        assert "error" in result
+        assert "available_layers" in result
+        assert "staging" in result["available_layers"]
+    finally:
+        db.close()
+
+
+def test_get_conventions_empty():
+    """No conventions returns helpful error message."""
+    db = GraphDB()
+    try:
+        db.upsert_repo("empty", "/tmp/empty")
+
+        result = db.query_conventions(repo="empty")
+
+        assert "error" in result
+        assert "reindex" in result["error"].lower() or "refresh" in result["error"].lower()
+    finally:
+        db.close()
+
+
+def test_get_conventions_small_project():
+    """Small project includes advisory note."""
+    db = GraphDB()
+    try:
+        repo_id = _setup_repo_with_conventions(db)
+        repo_name = db._execute_read(
+            "SELECT name FROM repos WHERE repo_id = ?", [repo_id]
+        ).fetchone()[0]
+
+        # All layers in the fixture have < 10 models
+        result = db.query_conventions(layer="staging", repo=repo_name)
+
+        assert "note" in result
+        assert "small project" in result["note"].lower()
+    finally:
+        db.close()
+
+
+def test_get_conventions_exceptions():
+    """Response includes exception details from naming patterns."""
+    db = GraphDB()
+    try:
+        repo_id = _setup_repo_with_conventions(db)
+        repo_name = db._execute_read(
+            "SELECT name FROM repos WHERE repo_id = ?", [repo_id]
+        ).fetchone()[0]
+
+        result = db.query_conventions(layer="staging", repo=repo_name)
+
+        # Naming section should have pattern and exceptions
+        assert "naming" in result
+        assert "pattern" in result["naming"]
+        # exceptions may be empty but key should exist
+        assert "exceptions" in result["naming"]
+    finally:
+        db.close()
