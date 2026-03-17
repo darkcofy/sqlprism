@@ -44,6 +44,34 @@ class NamingPattern:
     exceptions: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ReferenceRule:
+    """Inferred reference rule: which layers a source layer references."""
+
+    source_layer: str
+    allowed_targets: list[str]
+    target_distribution: dict[str, float]
+    confidence: float
+
+
+@dataclass
+class RequiredColumn:
+    """A column that appears frequently in a layer."""
+
+    column_name: str
+    frequency: float
+    source: str  # 'definition' | 'usage' | 'both'
+    missing_in: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ColumnStyle:
+    """Dominant column naming convention for a layer."""
+
+    style: str  # 'snake_case' | 'camelCase' | 'PascalCase' | 'SCREAMING_SNAKE'
+    confidence: float
+
+
 class ConventionEngine:
     """Infers project conventions from the knowledge graph.
 
@@ -248,6 +276,310 @@ class ConventionEngine:
             matching_count=total - len(exceptions),
             total_count=total,
             exceptions=sorted(exceptions),
+        )
+
+    def infer_reference_rules(
+        self, layers: list[Layer]
+    ) -> list[ReferenceRule]:
+        """Infer layer-to-layer reference rules from edges.
+
+        For each source layer, computes what percentage of references
+        go to each target layer. High concentration → high confidence.
+        """
+        if not layers:
+            return []
+
+        # Build model → layer mapping
+        model_layer = {}
+        for layer in layers:
+            for model in layer.model_names:
+                model_layer[model] = layer.name
+
+        # Query edges between table/view nodes in this repo.
+        # Scope both source and target by repo_id (target may be a
+        # phantom node with file_id IS NULL — include those too).
+        rows = self.db._execute_read(
+            """
+            SELECT
+                sn.name AS source_name,
+                tn.name AS target_name
+            FROM edges e
+            JOIN nodes sn ON e.source_id = sn.node_id
+            JOIN nodes tn ON e.target_id = tn.node_id
+            JOIN files sf ON sn.file_id = sf.file_id
+            LEFT JOIN files tf ON tn.file_id = tf.file_id
+            WHERE sf.repo_id = ?
+              AND (tf.repo_id = ? OR tn.file_id IS NULL)
+              AND e.relationship IN ('references', 'cte_references')
+            """,
+            [self.repo_id, self.repo_id],
+        ).fetchall()
+
+        # Count edges per (source_layer, target_layer)
+        edge_counts: dict[str, Counter[str]] = {}
+        for src_name, tgt_name in rows:
+            src_layer = model_layer.get(src_name)
+            tgt_layer = model_layer.get(tgt_name)
+            if src_layer is None:
+                continue
+            if tgt_layer is None:
+                # Target not in any known layer — skip
+                continue
+            if src_layer == tgt_layer:
+                # Skip within-layer references (e.g. CTE self-refs)
+                continue
+            edge_counts.setdefault(src_layer, Counter())[tgt_layer] += 1
+
+        rules = []
+        for layer in layers:
+            counts = edge_counts.get(layer.name)
+            if not counts:
+                continue
+            total = sum(counts.values())
+            if total == 0:
+                continue
+
+            distribution = {
+                tgt: round(count / total, 2)
+                for tgt, count in counts.most_common()
+            }
+            # Dominant target = highest count
+            _top_target, top_count = counts.most_common(1)[0]
+            confidence = round(top_count / total, 2)
+
+            allowed = [
+                tgt for tgt, pct in distribution.items() if pct >= 0.1
+            ]
+
+            rules.append(
+                ReferenceRule(
+                    source_layer=layer.name,
+                    allowed_targets=allowed,
+                    target_distribution=distribution,
+                    confidence=confidence,
+                )
+            )
+
+        return rules
+
+    def infer_common_columns(
+        self,
+        layer: Layer,
+        threshold: float = 0.7,
+    ) -> list[RequiredColumn]:
+        """Detect columns appearing in >=threshold fraction of models.
+
+        Merges two sources: ``columns`` table (definitions, more
+        authoritative) and ``column_usage`` table (usage in SELECT).
+        """
+        if not layer.model_names:
+            return []
+        model_count = len(layer.model_names)
+        if model_count == 0:
+            return []
+
+        # Columns from definitions (columns table)
+        def_rows = self.db._execute_read(
+            """
+            SELECT
+                c.column_name,
+                COUNT(DISTINCT c.node_id) AS usage_count
+            FROM columns c
+            JOIN nodes n ON c.node_id = n.node_id
+            JOIN files f ON n.file_id = f.file_id
+            WHERE f.repo_id = ?
+              AND n.name IN ({placeholders})
+            GROUP BY c.column_name
+            """.format(
+                placeholders=",".join(["?"] * len(layer.model_names))
+            ),
+            [self.repo_id, *layer.model_names],
+        ).fetchall()
+
+        def_freq: dict[str, float] = {
+            col: count / model_count for col, count in def_rows
+        }
+
+        # Columns from usage (column_usage table, SELECT only)
+        usage_rows = self.db._execute_read(
+            """
+            SELECT
+                cu.column_name,
+                COUNT(DISTINCT cu.node_id) AS usage_count
+            FROM column_usage cu
+            JOIN nodes n ON cu.node_id = n.node_id
+            JOIN files f ON n.file_id = f.file_id
+            WHERE f.repo_id = ?
+              AND n.name IN ({placeholders})
+              AND cu.usage_type = 'select'
+            GROUP BY cu.column_name
+            """.format(
+                placeholders=",".join(["?"] * len(layer.model_names))
+            ),
+            [self.repo_id, *layer.model_names],
+        ).fetchall()
+
+        usage_freq: dict[str, float] = {
+            col: count / model_count for col, count in usage_rows
+        }
+
+        # Merge: definition is more authoritative
+        all_cols = set(def_freq) | set(usage_freq)
+        results = []
+        for col in sorted(all_cols):
+            d_freq = def_freq.get(col, 0.0)
+            u_freq = usage_freq.get(col, 0.0)
+            # Use the higher frequency, prefer definition source
+            freq = max(d_freq, u_freq)
+            if freq < threshold:
+                continue
+
+            if col in def_freq and col in usage_freq:
+                source = "both"
+            elif col in def_freq:
+                source = "definition"
+            else:
+                source = "usage"
+
+            # Find models missing this column
+            missing = self._find_models_missing_column(
+                layer.model_names, col
+            )
+
+            results.append(
+                RequiredColumn(
+                    column_name=col,
+                    frequency=round(freq, 2),
+                    source=source,
+                    missing_in=missing,
+                )
+            )
+
+        return results
+
+    def detect_column_style(
+        self, layer: Layer
+    ) -> ColumnStyle:
+        """Classify dominant column naming convention in a layer.
+
+        Checks: snake_case, camelCase, PascalCase, SCREAMING_SNAKE.
+        """
+        if not layer.model_names:
+            return ColumnStyle(style="snake_case", confidence=0.0)
+
+        # Get column names from models in this layer
+        rows = self.db._execute_read(
+            """
+            SELECT DISTINCT c.column_name
+            FROM columns c
+            JOIN nodes n ON c.node_id = n.node_id
+            JOIN files f ON n.file_id = f.file_id
+            WHERE f.repo_id = ?
+              AND n.name IN ({placeholders})
+            """.format(
+                placeholders=",".join(["?"] * len(layer.model_names))
+            ),
+            [self.repo_id, *layer.model_names],
+        ).fetchall()
+
+        column_names = [r[0] for r in rows]
+        if not column_names:
+            # Fall back to column_usage
+            usage_rows = self.db._execute_read(
+                """
+                SELECT DISTINCT cu.column_name
+                FROM column_usage cu
+                JOIN nodes n ON cu.node_id = n.node_id
+                JOIN files f ON n.file_id = f.file_id
+                WHERE f.repo_id = ?
+                  AND n.name IN ({placeholders})
+                """.format(
+                    placeholders=",".join(
+                        ["?"] * len(layer.model_names)
+                    )
+                ),
+                [self.repo_id, *layer.model_names],
+            ).fetchall()
+            column_names = [r[0] for r in usage_rows]
+
+        return self._classify_column_style(column_names)
+
+    def _find_models_missing_column(
+        self, model_names: list[str], column_name: str
+    ) -> list[str]:
+        """Find models in a layer that don't have a given column."""
+        if not model_names:
+            return []
+        placeholders = ",".join(["?"] * len(model_names))
+        rows = self.db._execute_read(
+            f"""
+            SELECT DISTINCT n.name
+            FROM columns c
+            JOIN nodes n ON c.node_id = n.node_id
+            JOIN files f ON n.file_id = f.file_id
+            WHERE f.repo_id = ?
+              AND n.name IN ({placeholders})
+              AND c.column_name = ?
+            UNION
+            SELECT DISTINCT n.name
+            FROM column_usage cu
+            JOIN nodes n ON cu.node_id = n.node_id
+            JOIN files f ON n.file_id = f.file_id
+            WHERE f.repo_id = ?
+              AND n.name IN ({placeholders})
+              AND cu.column_name = ?
+            """,
+            [
+                self.repo_id, *model_names, column_name,
+                self.repo_id, *model_names, column_name,
+            ],
+        ).fetchall()
+
+        models_with_col = {r[0] for r in rows}
+        return sorted(
+            name for name in model_names if name not in models_with_col
+        )
+
+    @staticmethod
+    def _classify_column_style(
+        column_names: list[str],
+    ) -> ColumnStyle:
+        """Classify column naming style from a list of column names."""
+        if not column_names:
+            return ColumnStyle(style="snake_case", confidence=0.0)
+
+        counts: dict[str, int] = {
+            "snake_case": 0,
+            "camelCase": 0,
+            "PascalCase": 0,
+            "SCREAMING_SNAKE": 0,
+        }
+        neutral = 0  # single-word lowercase — ambiguous style
+
+        for name in column_names:
+            if not name:
+                neutral += 1
+                continue
+            if name == name.upper() and "_" in name:
+                counts["SCREAMING_SNAKE"] += 1
+            elif name == name.lower() and "_" in name:
+                counts["snake_case"] += 1
+            elif name[0].islower() and any(c.isupper() for c in name):
+                counts["camelCase"] += 1
+            elif name[0].isupper() and any(c.islower() for c in name):
+                counts["PascalCase"] += 1
+            else:
+                # Single-word lowercase (e.g. "id", "name") — style-ambiguous
+                neutral += 1
+
+        classified = len(column_names) - neutral
+        if classified == 0:
+            return ColumnStyle(style="snake_case", confidence=0.0)
+
+        dominant = max(counts, key=lambda k: counts[k])
+        confidence = counts[dominant] / classified
+        return ColumnStyle(
+            style=dominant, confidence=round(confidence, 2)
         )
 
     # ── Private helpers ──
