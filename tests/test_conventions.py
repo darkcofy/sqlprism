@@ -463,8 +463,8 @@ def test_reference_rules_cross_layer_violation():
             (r for r in rules if r.source_layer == "staging"), None
         )
         assert staging_rule is not None
-        # 2/3 to raw, 1/3 to marts → confidence ~0.67
-        assert staging_rule.confidence < 1.0
+        # 2/3 to raw, 1/3 to marts → confidence = round(2/3, 2) = 0.67
+        assert 0.60 <= staging_rule.confidence <= 0.70
         assert "raw" in staging_rule.allowed_targets
         assert "marts" in staging_rule.allowed_targets
         assert staging_rule.target_distribution["raw"] > staging_rule.target_distribution["marts"]
@@ -538,8 +538,10 @@ def test_common_columns_above_threshold():
         col_map = {r.column_name: r for r in result}
         assert "updated_at" in col_map
         assert col_map["updated_at"].frequency == 1.0
+        assert col_map["updated_at"].source == "definition"
         assert "created_at" in col_map
         assert col_map["created_at"].frequency == 0.8
+        assert col_map["created_at"].source == "definition"
         assert "rare_col" not in col_map
     finally:
         db.close()
@@ -720,8 +722,40 @@ def test_column_style_mixed():
         engine = ConventionEngine(db, repo_id)
         result = engine.detect_column_style(layer)
 
-        # 2 snake + 2 camel = 50% each
+        # 4 distinct column names: 2 snake_case + 2 camelCase → confidence = 2/4 = 0.5
         assert result.style in ("snake_case", "camelCase")
         assert result.confidence == 0.5
+    finally:
+        db.close()
+
+
+def test_column_style_no_columns():
+    """No columns at all returns zero confidence."""
+    db = GraphDB()
+    try:
+        repo_id, layer = _setup_repo_with_columns(db)
+        # Don't insert any columns — both columns and column_usage empty
+
+        engine = ConventionEngine(db, repo_id)
+        result = engine.detect_column_style(layer)
+
+        assert result.style == "snake_case"
+        assert result.confidence == 0.0
+    finally:
+        db.close()
+
+
+def test_reference_rules_no_edges():
+    """Layers with no edges return empty rules."""
+    db = GraphDB()
+    try:
+        repo_id, _nodes = _setup_layered_repo_with_edges(db)
+        # Don't insert any edges
+
+        engine = ConventionEngine(db, repo_id)
+        layers = engine.detect_layers()
+        rules = engine.infer_reference_rules(layers)
+
+        assert rules == []
     finally:
         db.close()

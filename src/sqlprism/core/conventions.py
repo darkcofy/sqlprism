@@ -325,6 +325,9 @@ class ConventionEngine:
             if tgt_layer is None:
                 # Target not in any known layer — skip
                 continue
+            if src_layer == tgt_layer:
+                # Skip within-layer references (e.g. CTE self-refs)
+                continue
             edge_counts.setdefault(src_layer, Counter())[tgt_layer] += 1
 
         rules = []
@@ -371,7 +374,7 @@ class ConventionEngine:
         """
         if not layer.model_names:
             return []
-        model_count = layer.model_count
+        model_count = len(layer.model_names)
         if model_count == 0:
             return []
 
