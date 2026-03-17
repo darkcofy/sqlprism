@@ -179,7 +179,7 @@ class Indexer:
         commit, branch = self._get_git_info(path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
-        self._run_convention_inference(repo_id)
+        self._run_convention_inference(repo_id, project_path=path)
         self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
@@ -252,7 +252,7 @@ class Indexer:
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
-        self._run_convention_inference(repo_id)
+        self._run_convention_inference(repo_id, project_path=project_path)
         self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
@@ -325,7 +325,7 @@ class Indexer:
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
-        self._run_convention_inference(repo_id)
+        self._run_convention_inference(repo_id, project_path=project_path)
         self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
@@ -688,14 +688,20 @@ class Indexer:
             model_names.append(stem)
         return model_names
 
-    def _run_convention_inference(self, repo_id: int) -> dict:
+    def _run_convention_inference(
+        self, repo_id: int, project_path: str | Path | None = None
+    ) -> dict:
         """Run convention inference for a repo after reindex.
 
         Non-fatal: logs errors but does not block reindex completion.
+
+        Args:
+            repo_id: The repo to run inference for.
+            project_path: Project directory for override file discovery.
         """
         try:
             engine = ConventionEngine(self.graph, repo_id)
-            return engine.run_inference()
+            return engine.run_inference(project_path=project_path)
         except Exception as e:
             logger.warning(
                 "Convention inference failed for repo %d: %s",

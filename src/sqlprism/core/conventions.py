@@ -17,6 +17,9 @@ import json
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
 
 from sqlprism.core.graph import GraphDB
 
@@ -84,27 +87,44 @@ class ConventionEngine:
         self.db = db
         self.repo_id = repo_id
 
-    def run_inference(self) -> dict:
+    def run_inference(
+        self, project_path: str | Path | None = None
+    ) -> dict:
         """Run all convention inference steps and store results.
 
         Detects layers, infers naming patterns, reference rules,
         common columns, and column style for each layer. Upserts
-        results into the ``conventions`` table.
+        results into the ``conventions`` table. Then applies any
+        YAML overrides from the project directory.
+
+        Args:
+            project_path: Project directory for override file discovery.
+                If None, no overrides are applied.
 
         Returns:
-            Stats dict with layers_detected and conventions_stored counts.
+            Stats dict with layers_detected, conventions_stored, and
+            overrides_applied counts.
         """
         layers = self.detect_layers()
         if not layers:
             logger.debug("No layers detected for repo %d", self.repo_id)
-            return {"layers_detected": 0, "conventions_stored": 0}
+            return {
+                "layers_detected": 0,
+                "conventions_stored": 0,
+                "overrides_applied": 0,
+            }
 
         reference_rules = self.infer_reference_rules(layers)
         ref_rules_by_layer = {r.source_layer: r for r in reference_rules}
 
+        # Load overrides from YAML before acquiring the write lock
+        # (file I/O should not hold the DB lock).
+        overrides = self.load_overrides(project_path)
+
         stored = 0
-        # Wrap all upserts in a single transaction for atomicity —
-        # partial state on crash is avoided.
+        overrides_applied = 0
+        # Single transaction for both inference and overrides —
+        # concurrent readers never see partial state.
         with self.db.write_transaction():
             for layer in layers:
                 # Step 2: Naming pattern
@@ -172,14 +192,21 @@ class ConventionEngine:
                     )
                     stored += 1
 
+            # Apply YAML overrides within the same transaction
+            if overrides:
+                overrides_applied = self._apply_overrides_inner(overrides)
+
         logger.info(
-            "Convention inference: %d layers, %d conventions stored",
+            "Convention inference: %d layers, %d conventions stored, "
+            "%d overrides applied",
             len(layers),
             stored,
+            overrides_applied,
         )
         return {
             "layers_detected": len(layers),
             "conventions_stored": stored,
+            "overrides_applied": overrides_applied,
         }
 
     def _store_convention(
@@ -214,6 +241,153 @@ class ConventionEngine:
                 json.dumps(payload),
                 min(confidence, 1.0),
                 model_count,
+            ],
+        )
+
+    def load_overrides(
+        self, project_path: str | Path | None = None
+    ) -> dict | None:
+        """Load convention overrides from YAML file.
+
+        Discovery order:
+        1. ``sqlprism.conventions.yml`` in project_path
+        2. ``.sqlprism/sqlprism.conventions.yml`` in project_path
+
+        Returns parsed YAML dict, or None if no override file found.
+        """
+        if project_path is None:
+            return None
+
+        project_path = Path(project_path)
+        candidates = [
+            project_path / "sqlprism.conventions.yml",
+            project_path / ".sqlprism" / "sqlprism.conventions.yml",
+        ]
+
+        for path in candidates:
+            if path.is_file():
+                try:
+                    data = yaml.safe_load(path.read_text())
+                    if isinstance(data, dict):
+                        logger.info("Loaded convention overrides from %s", path)
+                        return data
+                except (yaml.YAMLError, OSError) as e:
+                    logger.warning("Failed to load overrides from %s: %s", path, e)
+
+        return None
+
+    def apply_overrides(self, overrides: dict) -> int:
+        """Apply explicit convention overrides to the conventions table.
+
+        Overrides replace inferred values entirely with ``confidence=1.0``
+        and ``source='override'``. Layers not in overrides keep their
+        inferred values. Layers in overrides but not in inference are
+        created.
+
+        Args:
+            overrides: Parsed YAML dict with ``conventions`` and/or
+                ``semantic_tags`` keys.
+
+        Returns:
+            Number of override conventions stored.
+        """
+        with self.db.write_transaction():
+            return self._apply_overrides_inner(overrides)
+
+    def _apply_overrides_inner(self, overrides: dict) -> int:
+        """Apply overrides. Must be called inside write_transaction()."""
+        conventions = overrides.get("conventions", {})
+        if not conventions:
+            return 0
+
+        stored = 0
+        for layer_name, layer_config in conventions.items():
+            if not isinstance(layer_config, dict):
+                continue
+
+            # Naming pattern override
+            naming = layer_config.get("naming")
+            if isinstance(naming, str):
+                self._store_override(
+                    layer_name,
+                    "naming",
+                    {"pattern": naming},
+                )
+                stored += 1
+
+            # Allowed references override
+            refs = layer_config.get("allowed_refs")
+            if isinstance(refs, list):
+                self._store_override(
+                    layer_name,
+                    "references",
+                    {
+                        "allowed_targets": refs,
+                        "target_distribution": {},
+                    },
+                )
+                stored += 1
+
+            # Required columns override
+            cols = layer_config.get("required_columns")
+            if isinstance(cols, list):
+                self._store_override(
+                    layer_name,
+                    "required_columns",
+                    {
+                        "columns": [
+                            {
+                                "name": c,
+                                "frequency": 1.0,
+                                "source": "override",
+                                "missing_in": [],
+                            }
+                            for c in cols
+                            if isinstance(c, str)
+                        ]
+                    },
+                )
+                stored += 1
+
+            # Column style override
+            style = layer_config.get("column_style")
+            if isinstance(style, str):
+                self._store_override(
+                    layer_name,
+                    "column_style",
+                    {"style": style},
+                )
+                stored += 1
+
+        return stored
+
+    def _store_override(
+        self,
+        layer: str,
+        convention_type: str,
+        payload: dict,
+    ) -> None:
+        """Store a convention override (confidence=1.0, source='override').
+
+        Replaces any existing value (inferred or override).
+        Must be called inside ``write_transaction()``.
+        """
+        self.db._execute_write(
+            "INSERT INTO conventions "
+            "(repo_id, layer, convention_type, payload, "
+            "confidence, source, model_count) "
+            "VALUES (?, ?, ?, ?, 1.0, 'override', 0) "
+            "ON CONFLICT (repo_id, layer, convention_type) "
+            "DO UPDATE SET "
+            "payload = EXCLUDED.payload, "
+            "confidence = 1.0, "
+            "source = 'override', "
+            "model_count = 0",
+            [
+                self.repo_id,
+                layer,
+                convention_type,
+                json.dumps(payload),
             ],
         )
 

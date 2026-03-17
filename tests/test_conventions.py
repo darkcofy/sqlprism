@@ -1036,3 +1036,233 @@ def test_get_conventions_exceptions():
         assert "exceptions" in result["naming"]
     finally:
         db.close()
+
+
+# ── YAML override loading ──
+
+
+def test_load_conventions_yaml(tmp_path):
+    """Load conventions overrides from YAML file."""
+    yaml_content = """
+conventions:
+  staging:
+    naming: "stg_{source}_{entity}"
+    allowed_refs:
+      - "raw.*"
+    required_columns:
+      - _loaded_at
+    column_style: snake_case
+"""
+    (tmp_path / "sqlprism.conventions.yml").write_text(yaml_content)
+
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", str(tmp_path))
+        engine = ConventionEngine(db, repo_id)
+
+        overrides = engine.load_overrides(tmp_path)
+        assert overrides is not None
+        assert "conventions" in overrides
+        assert "staging" in overrides["conventions"]
+        staging = overrides["conventions"]["staging"]
+        assert staging["naming"] == "stg_{source}_{entity}"
+        assert staging["allowed_refs"] == ["raw.*"]
+        assert staging["required_columns"] == ["_loaded_at"]
+        assert staging["column_style"] == "snake_case"
+    finally:
+        db.close()
+
+
+def test_override_replaces_inferred():
+    """Override replaces inferred value entirely with confidence 1.0."""
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+        engine.run_inference()
+
+        # Now apply override
+        overrides = {
+            "conventions": {
+                "staging": {
+                    "naming": "stg_{source}_{entity}",
+                }
+            }
+        }
+        engine.apply_overrides(overrides)
+
+        # Check the convention was overridden
+        row = db.conn.execute(
+            "SELECT confidence, source, payload FROM conventions "
+            "WHERE repo_id = ? AND layer = 'staging' AND convention_type = 'naming'",
+            [repo_id],
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 1.0  # confidence
+        assert row[1] == "override"  # source
+        parsed = json.loads(row[2])
+        assert parsed["pattern"] == "stg_{source}_{entity}"
+    finally:
+        db.close()
+
+
+def test_override_preserves_other_layers():
+    """Layers not in overrides keep inferred values."""
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+        engine.run_inference()
+
+        # Override only staging
+        overrides = {
+            "conventions": {
+                "staging": {"naming": "stg_{source}_{entity}"}
+            }
+        }
+        engine.apply_overrides(overrides)
+
+        # Raw layer should still be inferred
+        raw_row = db.conn.execute(
+            "SELECT source FROM conventions "
+            "WHERE repo_id = ? AND layer = 'raw' AND convention_type = 'naming'",
+            [repo_id],
+        ).fetchone()
+        assert raw_row is not None
+        assert raw_row[0] == "inferred"
+    finally:
+        db.close()
+
+
+def test_override_creates_new_layer():
+    """Override creates a layer not in inference."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test")
+
+        engine = ConventionEngine(db, repo_id)
+        overrides = {
+            "conventions": {
+                "snapshots": {
+                    "naming": "snap_{entity}",
+                    "column_style": "snake_case",
+                }
+            }
+        }
+        stored = engine.apply_overrides(overrides)
+        assert stored == 2  # naming + column_style
+
+        rows = db.conn.execute(
+            "SELECT convention_type, source FROM conventions "
+            "WHERE repo_id = ? AND layer = 'snapshots' ORDER BY convention_type",
+            [repo_id],
+        ).fetchall()
+        assert len(rows) == 2
+        assert all(r[1] == "override" for r in rows)
+    finally:
+        db.close()
+
+
+def test_config_discovery_paths(tmp_path):
+    """Discover config in .sqlprism/ directory."""
+    dotdir = tmp_path / ".sqlprism"
+    dotdir.mkdir()
+    yaml_content = """
+conventions:
+  staging:
+    naming: "stg_{entity}"
+"""
+    (dotdir / "sqlprism.conventions.yml").write_text(yaml_content)
+
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", str(tmp_path))
+        engine = ConventionEngine(db, repo_id)
+
+        overrides = engine.load_overrides(tmp_path)
+        assert overrides is not None
+        assert overrides["conventions"]["staging"]["naming"] == "stg_{entity}"
+    finally:
+        db.close()
+
+
+def test_no_override_file_graceful():
+    """No override file present — inference only, no errors."""
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+        result = engine.run_inference(project_path="/nonexistent/path")
+
+        assert result["overrides_applied"] == 0
+        assert result["conventions_stored"] > 0
+    finally:
+        db.close()
+
+
+def test_inference_preserves_overrides():
+    """Re-running inference does not clobber override rows."""
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+        engine.run_inference()
+
+        # Apply override
+        engine.apply_overrides({
+            "conventions": {
+                "staging": {"naming": "stg_{source}_{entity}"}
+            }
+        })
+
+        # Re-run inference — should NOT overwrite the override
+        engine.run_inference()
+
+        row = db.conn.execute(
+            "SELECT source, confidence FROM conventions "
+            "WHERE repo_id = ? AND layer = 'staging' AND convention_type = 'naming'",
+            [repo_id],
+        ).fetchone()
+        assert row[0] == "override"
+        assert row[1] == 1.0
+    finally:
+        db.close()
+
+
+def test_run_inference_with_overrides(tmp_path):
+    """run_inference with project_path applies overrides automatically."""
+    yaml_content = """
+conventions:
+  staging:
+    naming: "stg_{source}_{entity}"
+    column_style: snake_case
+"""
+    (tmp_path / "sqlprism.conventions.yml").write_text(yaml_content)
+
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+        result = engine.run_inference(project_path=tmp_path)
+
+        assert result["overrides_applied"] == 2  # naming + column_style
+
+        # Verify override was stored
+        row = db.conn.execute(
+            "SELECT source FROM conventions "
+            "WHERE repo_id = ? AND layer = 'staging' AND convention_type = 'naming'",
+            [repo_id],
+        ).fetchone()
+        assert row[0] == "override"
+    finally:
+        db.close()
