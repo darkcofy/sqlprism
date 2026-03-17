@@ -614,6 +614,138 @@ def status(config_path: str, db_path: str | None):
     click.echo(json.dumps(info, indent=2, default=str))
 
 
+@cli.group()
+def conventions():
+    """Manage convention inference and overrides."""
+    pass
+
+
+@conventions.command("init")
+@click.option("--config", "config_path", type=click.Path(), default=None)
+@click.option("--db", "db_path", type=click.Path(), default=None)
+@click.option("--force", is_flag=True, help="Overwrite existing conventions file")
+def conventions_init(config_path: str, db_path: str | None, force: bool):
+    """Generate a sqlprism.conventions.yml with inferred conventions.
+
+    Runs inference and writes a YAML file with confidence scores as comments.
+    Review and adjust the file, then re-run reindex to apply overrides.
+    """
+    from sqlprism.core.conventions import ConventionEngine
+    from sqlprism.core.graph import GraphDB
+
+    config = _cli_load_config(config_path)
+    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
+
+    if not Path(effective_db_path).exists():
+        click.echo("No index found. Run 'sqlprism reindex' first.")
+        sys.exit(1)
+
+    output_path = Path("sqlprism.conventions.yml")
+    if output_path.exists() and not force:
+        click.echo(
+            f"{output_path} already exists. Use --force to overwrite."
+        )
+        sys.exit(1)
+
+    graph = GraphDB(effective_db_path)
+    try:
+        # Find all repos and run inference for each
+        repos = graph._execute_read("SELECT repo_id FROM repos").fetchall()
+        if not repos:
+            click.echo("No repos indexed. Run 'sqlprism reindex' first.")
+            sys.exit(1)
+
+        # Use the first repo (most common case: single repo)
+        repo_id = repos[0][0]
+        engine = ConventionEngine(graph, repo_id)
+        engine.run_inference()
+
+        yaml_content = engine.generate_yaml()
+        output_path.write_text(yaml_content)
+        click.echo(f"Wrote {output_path}")
+    finally:
+        graph.close()
+
+
+@conventions.command("refresh")
+@click.option("--config", "config_path", type=click.Path(), default=None)
+@click.option("--db", "db_path", type=click.Path(), default=None)
+def conventions_refresh(config_path: str, db_path: str | None):
+    """Re-run convention inference without writing YAML.
+
+    Updates the conventions and semantic_tags tables in the database.
+    Useful after reindex to see how conventions changed.
+    """
+    from sqlprism.core.conventions import ConventionEngine
+    from sqlprism.core.graph import GraphDB
+
+    config = _cli_load_config(config_path)
+    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
+
+    if not Path(effective_db_path).exists():
+        click.echo("No index found. Run 'sqlprism reindex' first.")
+        sys.exit(1)
+
+    graph = GraphDB(effective_db_path)
+    try:
+        repos = graph._execute_read("SELECT repo_id FROM repos").fetchall()
+        if not repos:
+            click.echo("No repos indexed.")
+            sys.exit(1)
+
+        for (repo_id,) in repos:
+            engine = ConventionEngine(graph, repo_id)
+            result = engine.run_inference()
+            click.echo(
+                f"Repo {repo_id}: {result['layers_detected']} layers, "
+                f"{result['conventions_stored']} conventions stored"
+            )
+    finally:
+        graph.close()
+
+    click.echo("Done.")
+
+
+@conventions.command("diff")
+@click.option("--config", "config_path", type=click.Path(), default=None)
+@click.option("--db", "db_path", type=click.Path(), default=None)
+@click.option(
+    "--file",
+    "yaml_file",
+    type=click.Path(),
+    default="sqlprism.conventions.yml",
+    help="Conventions YAML file to compare against",
+)
+def conventions_diff(config_path: str, db_path: str | None, yaml_file: str):
+    """Show what changed since last --init.
+
+    Compares current conventions in the database against the YAML file.
+    """
+    from sqlprism.core.conventions import ConventionEngine
+    from sqlprism.core.graph import GraphDB
+
+    config = _cli_load_config(config_path)
+    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
+
+    if not Path(effective_db_path).exists():
+        click.echo("No index found. Run 'sqlprism reindex' first.")
+        sys.exit(1)
+
+    graph = GraphDB(effective_db_path)
+    try:
+        repos = graph._execute_read("SELECT repo_id FROM repos").fetchall()
+        if not repos:
+            click.echo("No repos indexed.")
+            sys.exit(1)
+
+        repo_id = repos[0][0]
+        engine = ConventionEngine(graph, repo_id)
+        diff_output = engine.get_diff(yaml_file)
+        click.echo(diff_output)
+    finally:
+        graph.close()
+
+
 @cli.command("init")
 @click.option(
     "--format",
