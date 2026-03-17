@@ -820,6 +820,44 @@ async def pr_impact(params: PrImpactInput) -> dict:
 # ── Index management tools ──
 
 
+class GetConventionsInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    layer: str | None = Field(
+        None,
+        description="Layer name (e.g. 'staging', 'marts'). Omit to get all layers.",
+    )
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to search all repos.",
+    )
+
+
+@mcp.tool(
+    name="get_conventions",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def get_conventions(params: GetConventionsInput) -> dict:
+    """Get naming conventions, reference rules, and required columns for a layer.
+
+    Returns inferred conventions with confidence scores. Agents should follow
+    high-confidence conventions (>0.9) and ask about low-confidence ones (<0.7).
+
+    Use this before writing new models to understand project patterns:
+    naming conventions, allowed layer references, required columns, and
+    column naming style.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_conventions,
+        layer=params.layer,
+        repo=params.repo,
+    )
+
+
 class ReindexInput(BaseModel):
     repo: str | None = Field(None, description="Specific repo to reindex. Omit for all repos.")
 

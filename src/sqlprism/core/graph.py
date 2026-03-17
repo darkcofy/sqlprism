@@ -2982,3 +2982,133 @@ class GraphDB:
             ],
             "schema_version": "1.0",
         }
+
+    def query_conventions(
+        self,
+        layer: str | None = None,
+        repo: str | None = None,
+    ) -> dict:
+        """Query stored conventions for a layer or all layers.
+
+        Args:
+            layer: Layer name (e.g. 'staging'). Omit for all layers.
+            repo: Repo name filter. Omit for all repos.
+
+        Returns:
+            Dict with ``layers`` list, each containing convention data.
+            Returns ``error`` key when no conventions found.
+        """
+        # Resolve repo_id
+        repo_id = None
+        if repo:
+            row = self._execute_read(
+                "SELECT repo_id FROM repos WHERE name = ?", [repo]
+            ).fetchone()
+            if not row:
+                return {"error": f"Repo '{repo}' not found"}
+            repo_id = row[0]
+
+        # Build query
+        if layer and repo_id:
+            rows = self._execute_read(
+                "SELECT layer, convention_type, payload, confidence, "
+                "source, model_count FROM conventions "
+                "WHERE repo_id = ? AND layer = ? "
+                "ORDER BY convention_type",
+                [repo_id, layer],
+            ).fetchall()
+        elif repo_id:
+            rows = self._execute_read(
+                "SELECT layer, convention_type, payload, confidence, "
+                "source, model_count FROM conventions "
+                "WHERE repo_id = ? ORDER BY layer, convention_type",
+                [repo_id],
+            ).fetchall()
+        elif layer:
+            rows = self._execute_read(
+                "SELECT layer, convention_type, payload, confidence, "
+                "source, model_count FROM conventions "
+                "WHERE layer = ? ORDER BY convention_type",
+                [layer],
+            ).fetchall()
+        else:
+            rows = self._execute_read(
+                "SELECT layer, convention_type, payload, confidence, "
+                "source, model_count FROM conventions "
+                "ORDER BY layer, convention_type",
+            ).fetchall()
+
+        if not rows:
+            if layer:
+                # Check what layers exist — scoped to repo if specified
+                if repo_id:
+                    available = self._execute_read(
+                        "SELECT DISTINCT layer FROM conventions "
+                        "WHERE repo_id = ?",
+                        [repo_id],
+                    ).fetchall()
+                else:
+                    available = self._execute_read(
+                        "SELECT DISTINCT layer FROM conventions"
+                    ).fetchall()
+                available_names = [r[0] for r in available]
+                if available_names:
+                    return {
+                        "error": f"No conventions for layer '{layer}'",
+                        "available_layers": available_names,
+                    }
+            return {
+                "error": "No conventions found. Run reindex or "
+                "`sqlprism conventions --refresh` first.",
+            }
+
+        # Group by layer
+        layers_data: dict[str, dict] = {}
+        for row_layer, conv_type, payload, conf, source, model_count in rows:
+            if row_layer not in layers_data:
+                layers_data[row_layer] = {
+                    "layer": row_layer,
+                    "model_count": model_count,
+                }
+            layer_data = layers_data[row_layer]
+
+            try:
+                parsed = json.loads(payload) if isinstance(payload, str) else payload
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Malformed convention payload for %s/%s",
+                    row_layer,
+                    conv_type,
+                )
+                parsed = {}
+
+            # Build convention sub-dict. Payload keys are spread first,
+            # then confidence/source are set explicitly to avoid shadowing.
+            conv_data = dict(parsed)
+            conv_data["confidence"] = conf
+            conv_data["source"] = source
+
+            if conv_type == "naming":
+                layer_data["naming"] = conv_data
+            elif conv_type == "references":
+                layer_data["allowed_references"] = conv_data
+            elif conv_type == "required_columns":
+                layer_data["required_columns"] = conv_data
+            elif conv_type == "column_style":
+                layer_data["column_style"] = conv_data
+
+        result_layers = list(layers_data.values())
+
+        # Small project advisory
+        for ld in result_layers:
+            if ld.get("model_count", 0) < 10:
+                ld["note"] = (
+                    "Small project — conventions may be unreliable. "
+                    "Consider explicit overrides via "
+                    "`sqlprism conventions --init`."
+                )
+
+        if layer:
+            return result_layers[0] if result_layers else {}
+
+        return {"layers": result_layers}
