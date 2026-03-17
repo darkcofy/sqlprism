@@ -108,14 +108,23 @@ class ConventionEngine:
         layers = self.detect_layers()
         if not layers:
             logger.debug("No layers detected for repo %d", self.repo_id)
-            return {"layers_detected": 0, "conventions_stored": 0}
+            return {
+                "layers_detected": 0,
+                "conventions_stored": 0,
+                "overrides_applied": 0,
+            }
 
         reference_rules = self.infer_reference_rules(layers)
         ref_rules_by_layer = {r.source_layer: r for r in reference_rules}
 
+        # Load overrides from YAML before acquiring the write lock
+        # (file I/O should not hold the DB lock).
+        overrides = self.load_overrides(project_path)
+
         stored = 0
-        # Wrap all upserts in a single transaction for atomicity —
-        # partial state on crash is avoided.
+        overrides_applied = 0
+        # Single transaction for both inference and overrides —
+        # concurrent readers never see partial state.
         with self.db.write_transaction():
             for layer in layers:
                 # Step 2: Naming pattern
@@ -183,11 +192,9 @@ class ConventionEngine:
                     )
                     stored += 1
 
-        # Apply YAML overrides if available
-        overrides_applied = 0
-        overrides = self.load_overrides(project_path)
-        if overrides:
-            overrides_applied = self.apply_overrides(overrides)
+            # Apply YAML overrides within the same transaction
+            if overrides:
+                overrides_applied = self._apply_overrides_inner(overrides)
 
         logger.info(
             "Convention inference: %d layers, %d conventions stored, "
@@ -284,57 +291,73 @@ class ConventionEngine:
         Returns:
             Number of override conventions stored.
         """
+        with self.db.write_transaction():
+            return self._apply_overrides_inner(overrides)
+
+    def _apply_overrides_inner(self, overrides: dict) -> int:
+        """Apply overrides. Must be called inside write_transaction()."""
         conventions = overrides.get("conventions", {})
         if not conventions:
             return 0
 
         stored = 0
-        with self.db.write_transaction():
-            for layer_name, layer_config in conventions.items():
-                if not isinstance(layer_config, dict):
-                    continue
+        for layer_name, layer_config in conventions.items():
+            if not isinstance(layer_config, dict):
+                continue
 
-                # Naming pattern override
-                if "naming" in layer_config:
-                    self._store_override(
-                        layer_name,
-                        "naming",
-                        {"pattern": layer_config["naming"]},
-                    )
-                    stored += 1
+            # Naming pattern override
+            naming = layer_config.get("naming")
+            if isinstance(naming, str):
+                self._store_override(
+                    layer_name,
+                    "naming",
+                    {"pattern": naming},
+                )
+                stored += 1
 
-                # Allowed references override
-                if "allowed_refs" in layer_config:
-                    self._store_override(
-                        layer_name,
-                        "references",
-                        {"allowed_targets": layer_config["allowed_refs"]},
-                    )
-                    stored += 1
+            # Allowed references override
+            refs = layer_config.get("allowed_refs")
+            if isinstance(refs, list):
+                self._store_override(
+                    layer_name,
+                    "references",
+                    {
+                        "allowed_targets": refs,
+                        "target_distribution": {},
+                    },
+                )
+                stored += 1
 
-                # Required columns override
-                if "required_columns" in layer_config:
-                    cols = layer_config["required_columns"]
-                    self._store_override(
-                        layer_name,
-                        "required_columns",
-                        {
-                            "columns": [
-                                {"name": c, "frequency": 1.0, "source": "override"}
-                                for c in cols
-                            ]
-                        },
-                    )
-                    stored += 1
+            # Required columns override
+            cols = layer_config.get("required_columns")
+            if isinstance(cols, list):
+                self._store_override(
+                    layer_name,
+                    "required_columns",
+                    {
+                        "columns": [
+                            {
+                                "name": c,
+                                "frequency": 1.0,
+                                "source": "override",
+                                "missing_in": [],
+                            }
+                            for c in cols
+                            if isinstance(c, str)
+                        ]
+                    },
+                )
+                stored += 1
 
-                # Column style override
-                if "column_style" in layer_config:
-                    self._store_override(
-                        layer_name,
-                        "column_style",
-                        {"style": layer_config["column_style"]},
-                    )
-                    stored += 1
+            # Column style override
+            style = layer_config.get("column_style")
+            if isinstance(style, str):
+                self._store_override(
+                    layer_name,
+                    "column_style",
+                    {"style": style},
+                )
+                stored += 1
 
         return stored
 
@@ -358,7 +381,8 @@ class ConventionEngine:
             "DO UPDATE SET "
             "payload = EXCLUDED.payload, "
             "confidence = 1.0, "
-            "source = 'override'",
+            "source = 'override', "
+            "model_count = 0",
             [
                 self.repo_id,
                 layer,

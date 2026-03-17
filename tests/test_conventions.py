@@ -1064,12 +1064,16 @@ conventions:
         assert overrides is not None
         assert "conventions" in overrides
         assert "staging" in overrides["conventions"]
-        assert overrides["conventions"]["staging"]["naming"] == "stg_{source}_{entity}"
+        staging = overrides["conventions"]["staging"]
+        assert staging["naming"] == "stg_{source}_{entity}"
+        assert staging["allowed_refs"] == ["raw.*"]
+        assert staging["required_columns"] == ["_loaded_at"]
+        assert staging["column_style"] == "snake_case"
     finally:
         db.close()
 
 
-def test_override_replaces_inferred(tmp_path):
+def test_override_replaces_inferred():
     """Override replaces inferred value entirely with confidence 1.0."""
     db = GraphDB()
     try:
@@ -1104,7 +1108,7 @@ def test_override_replaces_inferred(tmp_path):
         db.close()
 
 
-def test_override_preserves_other_layers(tmp_path):
+def test_override_preserves_other_layers():
     """Layers not in overrides keep inferred values."""
     db = GraphDB()
     try:
