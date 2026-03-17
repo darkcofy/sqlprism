@@ -17,6 +17,9 @@ import json
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
 
 from sqlprism.core.graph import GraphDB
 
@@ -84,15 +87,23 @@ class ConventionEngine:
         self.db = db
         self.repo_id = repo_id
 
-    def run_inference(self) -> dict:
+    def run_inference(
+        self, project_path: str | Path | None = None
+    ) -> dict:
         """Run all convention inference steps and store results.
 
         Detects layers, infers naming patterns, reference rules,
         common columns, and column style for each layer. Upserts
-        results into the ``conventions`` table.
+        results into the ``conventions`` table. Then applies any
+        YAML overrides from the project directory.
+
+        Args:
+            project_path: Project directory for override file discovery.
+                If None, no overrides are applied.
 
         Returns:
-            Stats dict with layers_detected and conventions_stored counts.
+            Stats dict with layers_detected, conventions_stored, and
+            overrides_applied counts.
         """
         layers = self.detect_layers()
         if not layers:
@@ -172,14 +183,23 @@ class ConventionEngine:
                     )
                     stored += 1
 
+        # Apply YAML overrides if available
+        overrides_applied = 0
+        overrides = self.load_overrides(project_path)
+        if overrides:
+            overrides_applied = self.apply_overrides(overrides)
+
         logger.info(
-            "Convention inference: %d layers, %d conventions stored",
+            "Convention inference: %d layers, %d conventions stored, "
+            "%d overrides applied",
             len(layers),
             stored,
+            overrides_applied,
         )
         return {
             "layers_detected": len(layers),
             "conventions_stored": stored,
+            "overrides_applied": overrides_applied,
         }
 
     def _store_convention(
@@ -214,6 +234,136 @@ class ConventionEngine:
                 json.dumps(payload),
                 min(confidence, 1.0),
                 model_count,
+            ],
+        )
+
+    def load_overrides(
+        self, project_path: str | Path | None = None
+    ) -> dict | None:
+        """Load convention overrides from YAML file.
+
+        Discovery order:
+        1. ``sqlprism.conventions.yml`` in project_path
+        2. ``.sqlprism/sqlprism.conventions.yml`` in project_path
+
+        Returns parsed YAML dict, or None if no override file found.
+        """
+        if project_path is None:
+            return None
+
+        project_path = Path(project_path)
+        candidates = [
+            project_path / "sqlprism.conventions.yml",
+            project_path / ".sqlprism" / "sqlprism.conventions.yml",
+        ]
+
+        for path in candidates:
+            if path.is_file():
+                try:
+                    data = yaml.safe_load(path.read_text())
+                    if isinstance(data, dict):
+                        logger.info("Loaded convention overrides from %s", path)
+                        return data
+                except (yaml.YAMLError, OSError) as e:
+                    logger.warning("Failed to load overrides from %s: %s", path, e)
+
+        return None
+
+    def apply_overrides(self, overrides: dict) -> int:
+        """Apply explicit convention overrides to the conventions table.
+
+        Overrides replace inferred values entirely with ``confidence=1.0``
+        and ``source='override'``. Layers not in overrides keep their
+        inferred values. Layers in overrides but not in inference are
+        created.
+
+        Args:
+            overrides: Parsed YAML dict with ``conventions`` and/or
+                ``semantic_tags`` keys.
+
+        Returns:
+            Number of override conventions stored.
+        """
+        conventions = overrides.get("conventions", {})
+        if not conventions:
+            return 0
+
+        stored = 0
+        with self.db.write_transaction():
+            for layer_name, layer_config in conventions.items():
+                if not isinstance(layer_config, dict):
+                    continue
+
+                # Naming pattern override
+                if "naming" in layer_config:
+                    self._store_override(
+                        layer_name,
+                        "naming",
+                        {"pattern": layer_config["naming"]},
+                    )
+                    stored += 1
+
+                # Allowed references override
+                if "allowed_refs" in layer_config:
+                    self._store_override(
+                        layer_name,
+                        "references",
+                        {"allowed_targets": layer_config["allowed_refs"]},
+                    )
+                    stored += 1
+
+                # Required columns override
+                if "required_columns" in layer_config:
+                    cols = layer_config["required_columns"]
+                    self._store_override(
+                        layer_name,
+                        "required_columns",
+                        {
+                            "columns": [
+                                {"name": c, "frequency": 1.0, "source": "override"}
+                                for c in cols
+                            ]
+                        },
+                    )
+                    stored += 1
+
+                # Column style override
+                if "column_style" in layer_config:
+                    self._store_override(
+                        layer_name,
+                        "column_style",
+                        {"style": layer_config["column_style"]},
+                    )
+                    stored += 1
+
+        return stored
+
+    def _store_override(
+        self,
+        layer: str,
+        convention_type: str,
+        payload: dict,
+    ) -> None:
+        """Store a convention override (confidence=1.0, source='override').
+
+        Replaces any existing value (inferred or override).
+        Must be called inside ``write_transaction()``.
+        """
+        self.db._execute_write(
+            "INSERT INTO conventions "
+            "(repo_id, layer, convention_type, payload, "
+            "confidence, source, model_count) "
+            "VALUES (?, ?, ?, ?, 1.0, 'override', 0) "
+            "ON CONFLICT (repo_id, layer, convention_type) "
+            "DO UPDATE SET "
+            "payload = EXCLUDED.payload, "
+            "confidence = 1.0, "
+            "source = 'override'",
+            [
+                self.repo_id,
+                layer,
+                convention_type,
+                json.dumps(payload),
             ],
         )
 
