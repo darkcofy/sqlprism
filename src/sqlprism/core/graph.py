@@ -60,6 +60,9 @@ CREATE SEQUENCE IF NOT EXISTS seq_node_id START 1;
 CREATE SEQUENCE IF NOT EXISTS seq_edge_id START 1;
 CREATE SEQUENCE IF NOT EXISTS seq_usage_id START 1;
 CREATE SEQUENCE IF NOT EXISTS seq_lineage_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_column_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_convention_id START 1;
+CREATE SEQUENCE IF NOT EXISTS seq_tag_id START 1;
 
 CREATE TABLE IF NOT EXISTS repos (
     repo_id     INTEGER PRIMARY KEY DEFAULT nextval('seq_repo_id'),
@@ -126,8 +129,6 @@ CREATE TABLE IF NOT EXISTS column_lineage (
     hop_expression  TEXT
 );
 
-CREATE SEQUENCE IF NOT EXISTS seq_column_id START 1;
-
 CREATE TABLE IF NOT EXISTS columns (
     column_id   INTEGER PRIMARY KEY DEFAULT nextval('seq_column_id'),
     node_id     INTEGER NOT NULL,
@@ -137,6 +138,29 @@ CREATE TABLE IF NOT EXISTS columns (
     source      TEXT NOT NULL,
     description TEXT,
     UNIQUE(node_id, column_name)
+);
+
+CREATE TABLE IF NOT EXISTS conventions (
+    convention_id INTEGER PRIMARY KEY DEFAULT nextval('seq_convention_id'),
+    repo_id       INTEGER NOT NULL,   -- logical FK to repos(repo_id)
+    layer         TEXT NOT NULL,
+    convention_type TEXT NOT NULL
+        CHECK (convention_type IN ('naming', 'references', 'required_columns', 'column_style')),
+    payload       JSON NOT NULL,
+    confidence    FLOAT NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    source        TEXT NOT NULL CHECK (source IN ('inferred', 'override')),
+    model_count   INTEGER NOT NULL,
+    UNIQUE(repo_id, layer, convention_type)
+);
+
+CREATE TABLE IF NOT EXISTS semantic_tags (
+    tag_id     INTEGER PRIMARY KEY DEFAULT nextval('seq_tag_id'),
+    repo_id    INTEGER NOT NULL,      -- logical FK to repos(repo_id)
+    tag_name   TEXT NOT NULL,
+    node_id    INTEGER NOT NULL,      -- logical FK to nodes(node_id)
+    confidence FLOAT NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    source     TEXT NOT NULL CHECK (source IN ('inferred', 'anchor', 'explicit')),
+    UNIQUE(tag_name, node_id)
 );
 
 """
@@ -159,6 +183,11 @@ CREATE INDEX IF NOT EXISTS idx_lineage_file ON column_lineage(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_schema ON nodes(schema);
 CREATE INDEX IF NOT EXISTS idx_columns_node ON columns(node_id);
 CREATE INDEX IF NOT EXISTS idx_columns_name ON columns(column_name);
+CREATE INDEX IF NOT EXISTS idx_conventions_repo ON conventions(repo_id);
+CREATE INDEX IF NOT EXISTS idx_conventions_type ON conventions(convention_type);
+CREATE INDEX IF NOT EXISTS idx_tags_name ON semantic_tags(tag_name);
+CREATE INDEX IF NOT EXISTS idx_tags_node ON semantic_tags(node_id);
+CREATE INDEX IF NOT EXISTS idx_tags_repo ON semantic_tags(repo_id);
 """
 
 
