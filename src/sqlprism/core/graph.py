@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS semantic_tags (
     node_id    INTEGER NOT NULL,      -- logical FK to nodes(node_id)
     confidence FLOAT NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
     source     TEXT NOT NULL CHECK (source IN ('inferred', 'anchor', 'explicit')),
-    UNIQUE(tag_name, node_id)
+    UNIQUE(repo_id, tag_name, node_id)
 );
 
 """
