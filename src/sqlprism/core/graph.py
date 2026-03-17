@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS semantic_tags (
     node_id    INTEGER NOT NULL,      -- logical FK to nodes(node_id)
     confidence FLOAT NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
     source     TEXT NOT NULL CHECK (source IN ('inferred', 'anchor', 'explicit')),
-    UNIQUE(tag_name, node_id)
+    UNIQUE(repo_id, tag_name, node_id)
 );
 
 """
@@ -242,6 +242,65 @@ class GraphDB:
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS "
             "repo_type TEXT DEFAULT 'sql'"
         )
+        # v1.2: ensure semantic_tags UNIQUE includes repo_id for cross-repo
+        # federation. DuckDB doesn't support ALTER CONSTRAINT, so we check
+        # the current constraint and recreate the table if needed.
+        try:
+            constraints = self._execute_write(
+                "SELECT constraint_column_names FROM "
+                "duckdb_constraints() "
+                "WHERE table_name = 'semantic_tags' "
+                "AND constraint_type = 'UNIQUE'"
+            ).fetchall()
+            needs_fix = False
+            for (cols,) in constraints:
+                col_list = list(cols) if not isinstance(cols, list) else cols
+                if "repo_id" not in col_list and "tag_name" in col_list:
+                    needs_fix = True
+                    break
+            if needs_fix:
+                # Manual BEGIN/COMMIT rather than write_transaction()
+                # because we're already inside _init_schema which holds
+                # _write_lock. DuckDB DDL is transactional.
+                self.conn.execute("BEGIN TRANSACTION")
+                try:
+                    self._execute_write(
+                        "CREATE TABLE semantic_tags_new AS "
+                        "SELECT * FROM semantic_tags"
+                    )
+                    self._execute_write("DROP TABLE semantic_tags")
+                    self._execute_write(
+                        "CREATE TABLE semantic_tags ("
+                        "  tag_id INTEGER PRIMARY KEY DEFAULT "
+                        "    nextval('seq_tag_id'),"
+                        "  repo_id INTEGER NOT NULL,"
+                        "  tag_name TEXT NOT NULL,"
+                        "  node_id INTEGER NOT NULL,"
+                        "  confidence FLOAT NOT NULL "
+                        "    CHECK (confidence >= 0.0 "
+                        "           AND confidence <= 1.0),"
+                        "  source TEXT NOT NULL "
+                        "    CHECK (source IN "
+                        "      ('inferred','anchor','explicit')),"
+                        "  UNIQUE(repo_id, tag_name, node_id))"
+                    )
+                    self._execute_write(
+                        "INSERT INTO semantic_tags "
+                        "(repo_id, tag_name, node_id, confidence, "
+                        "source) "
+                        "SELECT repo_id, tag_name, node_id, "
+                        "confidence, source "
+                        "FROM semantic_tags_new"
+                    )
+                    self._execute_write(
+                        "DROP TABLE semantic_tags_new"
+                    )
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+        except duckdb.CatalogException:
+            pass  # table doesn't exist yet — created by SCHEMA_SQL
 
     def _init_pgq(self) -> None:
         """Try to load DuckPGQ, installing if needed. Non-fatal if unavailable.
