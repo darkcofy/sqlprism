@@ -1,5 +1,7 @@
 """Tests for the convention inference engine."""
 
+import json
+
 from sqlprism.core.conventions import ConventionEngine, Layer
 from sqlprism.core.graph import GraphDB
 
@@ -757,5 +759,130 @@ def test_reference_rules_no_edges():
         rules = engine.infer_reference_rules(layers)
 
         assert rules == []
+    finally:
+        db.close()
+
+
+# ── Convention storage (run_inference) ──
+
+
+def test_conventions_computed_after_reindex():
+    """run_inference stores conventions in the conventions table."""
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+
+        # Add edges so reference rules are generated
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+        db.insert_edge(nodes["stg_payments"], nodes["raw_payments"], "references")
+
+        # Add columns so column style and common columns work
+        nids = db._execute_read(
+            "SELECT node_id, name FROM nodes WHERE name LIKE 'stg_%'",
+        ).fetchall()
+        for nid, _name in nids:
+            db.conn.execute(
+                "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+                "VALUES (?, 'updated_at', 'TIMESTAMP', 1, 'definition')",
+                [nid],
+            )
+
+        engine = ConventionEngine(db, repo_id)
+        result = engine.run_inference()
+
+        assert result["layers_detected"] == 3  # raw, staging, marts
+        assert result["conventions_stored"] >= 4  # at least naming per layer + refs + cols
+
+        # Verify conventions table has entries
+        rows = db.conn.execute(
+            "SELECT layer, convention_type, confidence, source "
+            "FROM conventions WHERE repo_id = ? ORDER BY layer, convention_type",
+            [repo_id],
+        ).fetchall()
+        assert len(rows) >= 4
+
+        # Check naming convention stored for staging
+        staging_naming = next(
+            (r for r in rows if r[0] == "staging" and r[1] == "naming"),
+            None,
+        )
+        assert staging_naming is not None
+        assert staging_naming[3] == "inferred"  # source
+        assert staging_naming[2] > 0  # confidence > 0
+    finally:
+        db.close()
+
+
+def test_conventions_upsert_on_rerun():
+    """Running inference twice upserts (not duplicates) conventions."""
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+
+        # First run
+        engine.run_inference()
+        count1 = db.conn.execute(
+            "SELECT COUNT(*) FROM conventions WHERE repo_id = ?",
+            [repo_id],
+        ).fetchone()[0]
+
+        # Second run — should upsert, not duplicate
+        engine.run_inference()
+        count2 = db.conn.execute(
+            "SELECT COUNT(*) FROM conventions WHERE repo_id = ?",
+            [repo_id],
+        ).fetchone()[0]
+
+        assert count2 == count1
+    finally:
+        db.close()
+
+
+def test_conventions_payload_is_valid_json():
+    """Convention payloads are stored as valid JSON."""
+    db = GraphDB()
+    try:
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+        engine.run_inference()
+
+        rows = db.conn.execute(
+            "SELECT convention_type, payload FROM conventions WHERE repo_id = ?",
+            [repo_id],
+        ).fetchall()
+
+        expected_keys = {
+            "naming": "pattern",
+            "references": "allowed_targets",
+            "required_columns": "columns",
+            "column_style": "style",
+        }
+        for conv_type, payload in rows:
+            parsed = json.loads(payload)
+            assert isinstance(parsed, dict)
+            assert len(parsed) > 0
+            # Verify required key per convention type
+            if conv_type in expected_keys:
+                assert expected_keys[conv_type] in parsed
+    finally:
+        db.close()
+
+
+def test_run_inference_empty_repo():
+    """run_inference on repo with no models returns zero counts."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("empty", "/tmp/empty")
+
+        engine = ConventionEngine(db, repo_id)
+        result = engine.run_inference()
+
+        assert result["layers_detected"] == 0
+        assert result["conventions_stored"] == 0
     finally:
         db.close()

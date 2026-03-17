@@ -16,6 +16,7 @@ import subprocess
 from collections import OrderedDict
 from pathlib import Path
 
+from sqlprism.core.conventions import ConventionEngine
 from sqlprism.core.graph import GraphDB
 from sqlprism.languages import SQL_EXTENSIONS, is_sql_file
 from sqlprism.languages.sql import SqlParser
@@ -178,6 +179,7 @@ class Indexer:
         commit, branch = self._get_git_info(path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
+        self._run_convention_inference(repo_id)
         self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
@@ -250,6 +252,7 @@ class Indexer:
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
+        self._run_convention_inference(repo_id)
         self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
@@ -322,6 +325,7 @@ class Indexer:
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
 
+        self._run_convention_inference(repo_id)
         self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
         return stats
@@ -683,6 +687,22 @@ class Indexer:
                     continue
             model_names.append(stem)
         return model_names
+
+    def _run_convention_inference(self, repo_id: int) -> dict:
+        """Run convention inference for a repo after reindex.
+
+        Non-fatal: logs errors but does not block reindex completion.
+        """
+        try:
+            engine = ConventionEngine(self.graph, repo_id)
+            return engine.run_inference()
+        except Exception as e:
+            logger.warning(
+                "Convention inference failed for repo %d: %s",
+                repo_id,
+                e,
+            )
+            return {"layers_detected": 0, "conventions_stored": 0}
 
     def _insert_parse_result(
         self,

@@ -13,6 +13,7 @@ Design principles:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
@@ -82,6 +83,139 @@ class ConventionEngine:
     def __init__(self, db: GraphDB, repo_id: int) -> None:
         self.db = db
         self.repo_id = repo_id
+
+    def run_inference(self) -> dict:
+        """Run all convention inference steps and store results.
+
+        Detects layers, infers naming patterns, reference rules,
+        common columns, and column style for each layer. Upserts
+        results into the ``conventions`` table.
+
+        Returns:
+            Stats dict with layers_detected and conventions_stored counts.
+        """
+        layers = self.detect_layers()
+        if not layers:
+            logger.debug("No layers detected for repo %d", self.repo_id)
+            return {"layers_detected": 0, "conventions_stored": 0}
+
+        reference_rules = self.infer_reference_rules(layers)
+        ref_rules_by_layer = {r.source_layer: r for r in reference_rules}
+
+        stored = 0
+        # Wrap all upserts in a single transaction for atomicity —
+        # partial state on crash is avoided.
+        with self.db.write_transaction():
+            for layer in layers:
+                # Step 2: Naming pattern
+                naming = self.infer_naming_pattern(layer.model_names)
+                self._store_convention(
+                    layer.name,
+                    "naming",
+                    {
+                        "pattern": naming.pattern,
+                        "matching_count": naming.matching_count,
+                        "total_count": naming.total_count,
+                        "exceptions": naming.exceptions,
+                    },
+                    naming.confidence,
+                    layer.model_count,
+                )
+                stored += 1
+
+                # Step 3: Reference rules
+                ref_rule = ref_rules_by_layer.get(layer.name)
+                if ref_rule:
+                    self._store_convention(
+                        layer.name,
+                        "references",
+                        {
+                            "allowed_targets": ref_rule.allowed_targets,
+                            "target_distribution": ref_rule.target_distribution,
+                        },
+                        ref_rule.confidence,
+                        layer.model_count,
+                    )
+                    stored += 1
+
+                # Step 4: Common columns
+                common_cols = self.infer_common_columns(layer)
+                if common_cols:
+                    self._store_convention(
+                        layer.name,
+                        "required_columns",
+                        {
+                            "columns": [
+                                {
+                                    "name": c.column_name,
+                                    "frequency": c.frequency,
+                                    "source": c.source,
+                                    "missing_in": c.missing_in,
+                                }
+                                for c in common_cols
+                            ]
+                        },
+                        min(max(c.frequency for c in common_cols), 1.0),
+                        layer.model_count,
+                    )
+                    stored += 1
+
+                # Step 5: Column style
+                style = self.detect_column_style(layer)
+                if style.confidence > 0.0:
+                    self._store_convention(
+                        layer.name,
+                        "column_style",
+                        {"style": style.style},
+                        min(style.confidence, 1.0),
+                        layer.model_count,
+                    )
+                    stored += 1
+
+        logger.info(
+            "Convention inference: %d layers, %d conventions stored",
+            len(layers),
+            stored,
+        )
+        return {
+            "layers_detected": len(layers),
+            "conventions_stored": stored,
+        }
+
+    def _store_convention(
+        self,
+        layer: str,
+        convention_type: str,
+        payload: dict,
+        confidence: float,
+        model_count: int,
+    ) -> None:
+        """Upsert a convention into the conventions table.
+
+        Skips rows with ``source='override'`` — explicit overrides
+        are preserved and not clobbered by inference.
+        Must be called inside ``write_transaction()``.
+        """
+        self.db._execute_write(
+            "INSERT INTO conventions "
+            "(repo_id, layer, convention_type, payload, "
+            "confidence, source, model_count) "
+            "VALUES (?, ?, ?, ?, ?, 'inferred', ?) "
+            "ON CONFLICT (repo_id, layer, convention_type) "
+            "DO UPDATE SET "
+            "payload = EXCLUDED.payload, "
+            "confidence = EXCLUDED.confidence, "
+            "model_count = EXCLUDED.model_count "
+            "WHERE conventions.source != 'override'",
+            [
+                self.repo_id,
+                layer,
+                convention_type,
+                json.dumps(payload),
+                min(confidence, 1.0),
+                model_count,
+            ],
+        )
 
     def detect_layers(self) -> list[Layer]:
         """Detect layers from directory structure.
@@ -397,7 +531,7 @@ class ConventionEngine:
         ).fetchall()
 
         def_freq: dict[str, float] = {
-            col: count / model_count for col, count in def_rows
+            col: min(count / model_count, 1.0) for col, count in def_rows
         }
 
         # Columns from usage (column_usage table, SELECT only)
@@ -420,7 +554,7 @@ class ConventionEngine:
         ).fetchall()
 
         usage_freq: dict[str, float] = {
-            col: count / model_count for col, count in usage_rows
+            col: min(count / model_count, 1.0) for col, count in usage_rows
         }
 
         # Merge: definition is more authoritative
