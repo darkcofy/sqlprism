@@ -1,8 +1,6 @@
 """Tests for the convention inference engine."""
 
-import pytest
-
-from sqlprism.core.conventions import ConventionEngine, Layer, NamingPattern
+from sqlprism.core.conventions import ConventionEngine
 from sqlprism.core.graph import GraphDB
 
 
@@ -40,15 +38,15 @@ def test_detect_layers_standard_dbt():
     engine = ConventionEngine(db, repo_id)
     layers = engine.detect_layers()
 
-    names = {l.name for l in layers}
+    names = {ly.name for ly in layers}
     assert "staging" in names
     assert "marts" in names
 
-    staging = next(l for l in layers if l.name == "staging")
+    staging = next(ly for ly in layers if ly.name == "staging")
     assert staging.model_count == 3
     assert "stg_orders" in staging.model_names
 
-    marts = next(l for l in layers if l.name == "marts")
+    marts = next(ly for ly in layers if ly.name == "marts")
     assert marts.model_count == 2
     db.close()
 
@@ -66,7 +64,7 @@ def test_detect_layers_flat_dirs():
     engine = ConventionEngine(db, repo_id)
     layers = engine.detect_layers()
 
-    names = {l.name for l in layers}
+    names = {ly.name for ly in layers}
     assert "staging" in names
     assert "marts" in names
     db.close()
@@ -87,10 +85,10 @@ def test_detect_layers_nested_domains():
     engine = ConventionEngine(db, repo_id)
     layers = engine.detect_layers()
 
-    names = {l.name for l in layers}
+    names = {ly.name for ly in layers}
     # Should collapse repeated sub-layers across domains
     assert "staging" in names
-    staging = next(l for l in layers if l.name == "staging")
+    staging = next(ly for ly in layers if ly.name == "staging")
     assert staging.model_count == 4
     db.close()
 
@@ -107,14 +105,14 @@ def test_detect_layers_skip_small():
     engine = ConventionEngine(db, repo_id)
     layers = engine.detect_layers()
 
-    names = {l.name for l in layers}
+    names = {ly.name for ly in layers}
     assert "staging" in names
     assert "archive" not in names
     db.close()
 
 
 def test_layer_confidence_scaling():
-    """Confidence scales with model count: >=10→0.9, >=5→0.8, <5→0.6."""
+    """Confidence scales with model count: >=10->0.9, >=5->0.8, <5->0.6."""
     db = GraphDB()
     models = [
         (f"models/staging/stg_{i}.sql", f"stg_{i}")
@@ -131,7 +129,7 @@ def test_layer_confidence_scaling():
     engine = ConventionEngine(db, repo_id)
     layers = engine.detect_layers()
 
-    layer_map = {l.name: l for l in layers}
+    layer_map = {ly.name: ly for ly in layers}
     assert layer_map["staging"].confidence == 0.9   # 12 models
     assert layer_map["intermediate"].confidence == 0.8  # 6 models
     assert layer_map["marts"].confidence == 0.6     # 3 models
@@ -178,7 +176,7 @@ def test_naming_pattern_mixed_styles():
 
 
 def test_naming_pattern_exceptions():
-    """Report exceptions — models that don't match the inferred pattern."""
+    """Report exceptions -- models that don't match the inferred pattern."""
     engine = ConventionEngine.__new__(ConventionEngine)
     names = [
         "stg_stripe_payments",
@@ -204,7 +202,7 @@ def test_naming_pattern_exceptions():
 
 
 def test_naming_pattern_small_layer():
-    """Single-model layer gets low confidence (capped at 0.6)."""
+    """Small layer gets low confidence (capped at 0.6)."""
     engine = ConventionEngine.__new__(ConventionEngine)
     names = ["stg_orders", "stg_payments"]
     result = engine.infer_naming_pattern(names)
