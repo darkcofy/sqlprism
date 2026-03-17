@@ -52,7 +52,6 @@ class ReferenceRule:
     allowed_targets: list[str]
     target_distribution: dict[str, float]
     confidence: float
-    violations: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -296,7 +295,9 @@ class ConventionEngine:
             for model in layer.model_names:
                 model_layer[model] = layer.name
 
-        # Query edges between table/view nodes in this repo
+        # Query edges between table/view nodes in this repo.
+        # Scope both source and target by repo_id (target may be a
+        # phantom node with file_id IS NULL — include those too).
         rows = self.db._execute_read(
             """
             SELECT
@@ -306,10 +307,12 @@ class ConventionEngine:
             JOIN nodes sn ON e.source_id = sn.node_id
             JOIN nodes tn ON e.target_id = tn.node_id
             JOIN files sf ON sn.file_id = sf.file_id
+            LEFT JOIN files tf ON tn.file_id = tf.file_id
             WHERE sf.repo_id = ?
+              AND (tf.repo_id = ? OR tn.file_id IS NULL)
               AND e.relationship IN ('references', 'cte_references')
             """,
-            [self.repo_id],
+            [self.repo_id, self.repo_id],
         ).fetchall()
 
         # Count edges per (source_layer, target_layer)
@@ -337,9 +340,9 @@ class ConventionEngine:
                 tgt: round(count / total, 2)
                 for tgt, count in counts.most_common()
             }
-            # Dominant target = highest percentage
-            top_target, top_pct = counts.most_common(1)[0]
-            confidence = round(top_pct / total, 2)
+            # Dominant target = highest count
+            _top_target, top_count = counts.most_common(1)[0]
+            confidence = round(top_count / total, 2)
 
             allowed = [
                 tgt for tgt, pct in distribution.items() if pct >= 0.1
@@ -361,11 +364,13 @@ class ConventionEngine:
         layer: Layer,
         threshold: float = 0.7,
     ) -> list[RequiredColumn]:
-        """Detect columns appearing in >threshold fraction of models.
+        """Detect columns appearing in >=threshold fraction of models.
 
         Merges two sources: ``columns`` table (definitions, more
         authoritative) and ``column_usage`` table (usage in SELECT).
         """
+        if not layer.model_names:
+            return []
         model_count = layer.model_count
         if model_count == 0:
             return []
@@ -456,6 +461,9 @@ class ConventionEngine:
 
         Checks: snake_case, camelCase, PascalCase, SCREAMING_SNAKE.
         """
+        if not layer.model_names:
+            return ColumnStyle(style="snake_case", confidence=0.0)
+
         # Get column names from models in this layer
         rows = self.db._execute_read(
             """
@@ -497,23 +505,31 @@ class ConventionEngine:
         self, model_names: list[str], column_name: str
     ) -> list[str]:
         """Find models in a layer that don't have a given column."""
+        if not model_names:
+            return []
+        placeholders = ",".join(["?"] * len(model_names))
         rows = self.db._execute_read(
-            """
+            f"""
             SELECT DISTINCT n.name
             FROM columns c
             JOIN nodes n ON c.node_id = n.node_id
-            WHERE n.name IN ({placeholders})
+            JOIN files f ON n.file_id = f.file_id
+            WHERE f.repo_id = ?
+              AND n.name IN ({placeholders})
               AND c.column_name = ?
             UNION
             SELECT DISTINCT n.name
             FROM column_usage cu
             JOIN nodes n ON cu.node_id = n.node_id
-            WHERE n.name IN ({placeholders})
+            JOIN files f ON n.file_id = f.file_id
+            WHERE f.repo_id = ?
+              AND n.name IN ({placeholders})
               AND cu.column_name = ?
-            """.format(
-                placeholders=",".join(["?"] * len(model_names))
-            ),
-            [*model_names, column_name, *model_names, column_name],
+            """,
+            [
+                self.repo_id, *model_names, column_name,
+                self.repo_id, *model_names, column_name,
+            ],
         ).fetchall()
 
         models_with_col = {r[0] for r in rows}
@@ -535,8 +551,12 @@ class ConventionEngine:
             "PascalCase": 0,
             "SCREAMING_SNAKE": 0,
         }
+        neutral = 0  # single-word lowercase — ambiguous style
 
         for name in column_names:
+            if not name:
+                neutral += 1
+                continue
             if name == name.upper() and "_" in name:
                 counts["SCREAMING_SNAKE"] += 1
             elif name == name.lower() and "_" in name:
@@ -546,11 +566,15 @@ class ConventionEngine:
             elif name[0].isupper() and any(c.islower() for c in name):
                 counts["PascalCase"] += 1
             else:
-                # Single word lowercase or other — count as snake_case
-                counts["snake_case"] += 1
+                # Single-word lowercase (e.g. "id", "name") — style-ambiguous
+                neutral += 1
+
+        classified = len(column_names) - neutral
+        if classified == 0:
+            return ColumnStyle(style="snake_case", confidence=0.0)
 
         dominant = max(counts, key=lambda k: counts[k])
-        confidence = counts[dominant] / len(column_names)
+        confidence = counts[dominant] / classified
         return ColumnStyle(
             style=dominant, confidence=round(confidence, 2)
         )

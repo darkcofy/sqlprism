@@ -444,15 +444,16 @@ def test_reference_rules_mixed_targets():
         db.close()
 
 
-def test_reference_rules_violations():
-    """Reference rules report violations when pattern is broken."""
+def test_reference_rules_cross_layer_violation():
+    """Cross-layer reference shows up in distribution with lower confidence."""
     db = GraphDB()
     try:
         repo_id, nodes = _setup_layered_repo_with_edges(db)
 
-        # staging references raw (2x) — clean pattern
+        # staging references raw (2x) + one staging→marts violation
         db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
         db.insert_edge(nodes["stg_payments"], nodes["raw_payments"], "references")
+        db.insert_edge(nodes["stg_customers"], nodes["revenue"], "references")
 
         engine = ConventionEngine(db, repo_id)
         layers = engine.detect_layers()
@@ -462,8 +463,11 @@ def test_reference_rules_violations():
             (r for r in rules if r.source_layer == "staging"), None
         )
         assert staging_rule is not None
-        assert staging_rule.confidence == 1.0
-        assert staging_rule.allowed_targets == ["raw"]
+        # 2/3 to raw, 1/3 to marts → confidence ~0.67
+        assert staging_rule.confidence < 1.0
+        assert "raw" in staging_rule.allowed_targets
+        assert "marts" in staging_rule.allowed_targets
+        assert staging_rule.target_distribution["raw"] > staging_rule.target_distribution["marts"]
     finally:
         db.close()
 
@@ -578,6 +582,8 @@ def test_common_columns_merge_sources():
         assert col is not None
         assert col.source == "both"
         assert col.frequency == 0.8
+        # stg_events is the 5th model, not in the first 4 → should be missing
+        assert "stg_events" in col.missing_in
     finally:
         db.close()
 
@@ -623,20 +629,25 @@ def test_column_style_snake_case():
         ).fetchall()
         nid_map = {name: nid for nid, name in nids}
 
-        # Insert snake_case columns
-        snake_cols = ["order_id", "customer_name", "total_amount", "created_at"]
-        for col in snake_cols:
-            db.conn.execute(
-                "INSERT INTO columns (node_id, column_name, data_type, position, source) "
-                "VALUES (?, ?, 'TEXT', 1, 'definition')",
-                [nid_map["stg_orders"], col],
-            )
+        # Distribute snake_case columns across multiple models
+        cols_by_model = {
+            "stg_orders": ["order_id", "customer_name"],
+            "stg_payments": ["payment_amount", "created_at"],
+            "stg_customers": ["first_name", "last_name"],
+        }
+        for model, cols in cols_by_model.items():
+            for col in cols:
+                db.conn.execute(
+                    "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+                    "VALUES (?, ?, 'TEXT', 1, 'definition')",
+                    [nid_map[model], col],
+                )
 
         engine = ConventionEngine(db, repo_id)
         result = engine.detect_column_style(layer)
 
         assert result.style == "snake_case"
-        assert result.confidence >= 0.9
+        assert result.confidence == 1.0
     finally:
         db.close()
 
@@ -652,19 +663,23 @@ def test_column_style_camel_case():
         ).fetchall()
         nid_map = {name: nid for nid, name in nids}
 
-        camel_cols = ["orderId", "customerName", "totalAmount", "createdAt"]
-        for col in camel_cols:
-            db.conn.execute(
-                "INSERT INTO columns (node_id, column_name, data_type, position, source) "
-                "VALUES (?, ?, 'TEXT', 1, 'definition')",
-                [nid_map["stg_orders"], col],
-            )
+        cols_by_model = {
+            "stg_orders": ["orderId", "customerName"],
+            "stg_payments": ["totalAmount", "createdAt"],
+        }
+        for model, cols in cols_by_model.items():
+            for col in cols:
+                db.conn.execute(
+                    "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+                    "VALUES (?, ?, 'TEXT', 1, 'definition')",
+                    [nid_map[model], col],
+                )
 
         engine = ConventionEngine(db, repo_id)
         result = engine.detect_column_style(layer)
 
         assert result.style == "camelCase"
-        assert result.confidence >= 0.8
+        assert result.confidence == 1.0
     finally:
         db.close()
 
@@ -680,22 +695,33 @@ def test_column_style_mixed():
         ).fetchall()
         nid_map = {name: nid for nid, name in nids}
 
-        # Mix of snake_case and camelCase
-        mixed_cols = [
-            "order_id", "customer_name",  # snake
-            "totalAmount", "createdAt",   # camel
-        ]
-        for col in mixed_cols:
-            db.conn.execute(
-                "INSERT INTO columns (node_id, column_name, data_type, position, source) "
-                "VALUES (?, ?, 'TEXT', 1, 'definition')",
-                [nid_map["stg_orders"], col],
-            )
+        # Mix of snake_case and camelCase across models
+        db.conn.execute(
+            "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+            "VALUES (?, 'order_id', 'TEXT', 1, 'definition')",
+            [nid_map["stg_orders"]],
+        )
+        db.conn.execute(
+            "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+            "VALUES (?, 'customer_name', 'TEXT', 2, 'definition')",
+            [nid_map["stg_orders"]],
+        )
+        db.conn.execute(
+            "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+            "VALUES (?, 'totalAmount', 'TEXT', 1, 'definition')",
+            [nid_map["stg_payments"]],
+        )
+        db.conn.execute(
+            "INSERT INTO columns (node_id, column_name, data_type, position, source) "
+            "VALUES (?, 'createdAt', 'TEXT', 2, 'definition')",
+            [nid_map["stg_payments"]],
+        )
 
         engine = ConventionEngine(db, repo_id)
         result = engine.detect_column_style(layer)
 
-        # Should be 50/50 — dominant is snake_case (or camelCase), low confidence
+        # 2 snake + 2 camel = 50% each
+        assert result.style in ("snake_case", "camelCase")
         assert result.confidence == 0.5
     finally:
         db.close()
