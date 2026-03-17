@@ -1889,3 +1889,119 @@ def test_column_def_null_data_type_returns_text():
     assert schema["inferred_table"]["unknown_col"] == "TEXT"
 
     db.close()
+
+
+# ── v1.2: conventions and semantic_tags schema ──
+
+
+def test_conventions_table_exists():
+    """conventions table is created on database init."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    rows = db.conn.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = 'conventions' ORDER BY ordinal_position"
+    ).fetchall()
+    col_map = {r[0]: r[1] for r in rows}
+    assert "convention_id" in col_map
+    assert "repo_id" in col_map
+    assert "layer" in col_map
+    assert "convention_type" in col_map
+    assert "payload" in col_map
+    assert "confidence" in col_map
+    assert "source" in col_map
+    assert "model_count" in col_map
+    db.close()
+
+
+def test_semantic_tags_table_exists():
+    """semantic_tags table is created on database init."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    rows = db.conn.execute(
+        "SELECT column_name, data_type FROM information_schema.columns "
+        "WHERE table_name = 'semantic_tags' ORDER BY ordinal_position"
+    ).fetchall()
+    col_map = {r[0]: r[1] for r in rows}
+    assert "tag_id" in col_map
+    assert "repo_id" in col_map
+    assert "tag_name" in col_map
+    assert "node_id" in col_map
+    assert "confidence" in col_map
+    assert "source" in col_map
+    db.close()
+
+
+def test_schema_migration_preserves_data():
+    """New tables created alongside existing schema without affecting data."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    # Insert data into existing tables
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "model.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql", 1, 10, schema="public")
+
+    # Verify existing data still accessible
+    result = db.conn.execute("SELECT name FROM nodes WHERE node_id = ?", [node_id]).fetchone()
+    assert result[0] == "orders"
+
+    # Verify new tables exist and are empty
+    conv_count = db.conn.execute("SELECT COUNT(*) FROM conventions").fetchone()[0]
+    tag_count = db.conn.execute("SELECT COUNT(*) FROM semantic_tags").fetchone()[0]
+    assert conv_count == 0
+    assert tag_count == 0
+    db.close()
+
+
+def test_convention_id_auto_increment():
+    """Sequences auto-increment IDs for conventions and semantic_tags."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    file_id = db.insert_file(repo_id, "model.sql", "sql", "abc123")
+    node_id = db.insert_node(file_id, "table", "orders", "sql", 1, 10, schema="public")
+
+    # Insert conventions
+    db.conn.execute(
+        "INSERT INTO conventions (repo_id, layer, convention_type, payload, confidence, source, model_count) "
+        "VALUES (?, 'staging', 'naming', '{\"pattern\": \"stg_{entity}\"}', 0.9, 'inferred', 10)",
+        [repo_id],
+    )
+    db.conn.execute(
+        "INSERT INTO conventions (repo_id, layer, convention_type, payload, confidence, source, model_count) "
+        "VALUES (?, 'marts', 'naming', '{\"pattern\": \"{entity}\"}', 0.8, 'inferred', 5)",
+        [repo_id],
+    )
+    ids = db.conn.execute("SELECT convention_id FROM conventions ORDER BY convention_id").fetchall()
+    assert ids[0][0] < ids[1][0]  # auto-incrementing
+
+    # Insert semantic tags
+    db.conn.execute(
+        "INSERT INTO semantic_tags (repo_id, tag_name, node_id, confidence, source) "
+        "VALUES (?, 'customer', ?, 0.85, 'inferred')",
+        [repo_id, node_id],
+    )
+    tag_id = db.conn.execute("SELECT tag_id FROM semantic_tags").fetchone()[0]
+    assert tag_id >= 1
+
+    # Verify unique constraint on conventions
+    with pytest.raises(Exception):
+        db.conn.execute(
+            "INSERT INTO conventions (repo_id, layer, convention_type, payload, confidence, source, model_count) "
+            "VALUES (?, 'staging', 'naming', '{}', 0.5, 'override', 10)",
+            [repo_id],
+        )
+
+    # Verify unique constraint on semantic_tags
+    with pytest.raises(Exception):
+        db.conn.execute(
+            "INSERT INTO semantic_tags (repo_id, tag_name, node_id, confidence, source) "
+            "VALUES (?, 'customer', ?, 0.9, 'explicit')",
+            [repo_id, node_id],
+        )
+
+    db.close()
