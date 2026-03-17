@@ -318,7 +318,7 @@ class ConventionEngine:
                 parsed = json.loads(payload) if isinstance(payload, str) else payload
                 style = parsed.get("style", "")
                 lines.append(
-                    f"    column_style: {style}"
+                    f'    column_style: "{style}"'
                     f"  # confidence: {conf:.2f}"
                 )
 
@@ -329,7 +329,8 @@ class ConventionEngine:
     def get_diff(self, yaml_path: str | Path) -> str:
         """Compare current conventions against a YAML file.
 
-        Returns a human-readable diff showing changes.
+        Reports only actual differences: new/removed layers,
+        changed naming patterns, changed references, etc.
         """
         yaml_path = Path(yaml_path)
         if not yaml_path.is_file():
@@ -345,8 +346,7 @@ class ConventionEngine:
         # Get current conventions from DB
         rows = self.db._execute_read(
             "SELECT layer, convention_type, payload, confidence "
-            "FROM conventions WHERE repo_id = ? "
-            "ORDER BY layer, convention_type",
+            "FROM conventions WHERE repo_id = ?",
             [self.repo_id],
         ).fetchall()
 
@@ -360,7 +360,7 @@ class ConventionEngine:
 
         changes: list[str] = []
 
-        # New layers
+        # New/removed layers
         current_layers = set(current)
         yaml_layers = set(existing_convs)
         for layer in sorted(current_layers - yaml_layers):
@@ -368,23 +368,44 @@ class ConventionEngine:
         for layer in sorted(yaml_layers - current_layers):
             changes.append(f"- Removed layer: {layer}")
 
-        # Changed conventions
+        # Changed conventions in shared layers
         for layer in sorted(current_layers & yaml_layers):
             curr = current.get(layer, {})
-            # Check naming changes
-            if "naming" in curr:
-                curr_pattern = curr["naming"]["payload"].get("pattern", "")
-                yaml_naming = existing_convs.get(layer, {}).get("naming", "")
-                if curr_pattern != yaml_naming:
-                    changes.append(
-                        f"  {layer}.naming: "
-                        f'"{yaml_naming}" -> "{curr_pattern}"'
-                    )
-            # Check confidence changes
-            for conv_type, data in curr.items():
-                conf = data["confidence"]
+            yaml_layer = existing_convs.get(layer, {})
+
+            # Naming: compare DB pattern vs YAML naming string
+            curr_naming = curr.get("naming", {}).get("payload", {}).get("pattern", "")
+            yaml_naming = yaml_layer.get("naming", "")
+            if curr_naming and not yaml_naming:
+                changes.append(f"+ {layer}.naming: \"{curr_naming}\"")
+            elif yaml_naming and not curr_naming:
+                changes.append(f"- {layer}.naming: \"{yaml_naming}\"")
+            elif curr_naming != yaml_naming:
                 changes.append(
-                    f"  {layer}.{conv_type}: confidence {conf:.2f}"
+                    f"  {layer}.naming: "
+                    f"\"{yaml_naming}\" -> \"{curr_naming}\""
+                )
+
+            # References: compare allowed_refs lists
+            curr_refs = curr.get("references", {}).get("payload", {}).get("allowed_targets", [])
+            yaml_refs = yaml_layer.get("allowed_refs", [])
+            if sorted(curr_refs) != sorted(yaml_refs):
+                if curr_refs and not yaml_refs:
+                    changes.append(f"+ {layer}.allowed_refs: {curr_refs}")
+                elif yaml_refs and not curr_refs:
+                    changes.append(f"- {layer}.allowed_refs: {yaml_refs}")
+                else:
+                    changes.append(
+                        f"  {layer}.allowed_refs: {yaml_refs} -> {curr_refs}"
+                    )
+
+            # Column style
+            curr_style = curr.get("column_style", {}).get("payload", {}).get("style", "")
+            yaml_style = yaml_layer.get("column_style", "")
+            if curr_style != yaml_style and (curr_style or yaml_style):
+                changes.append(
+                    f"  {layer}.column_style: "
+                    f"\"{yaml_style}\" -> \"{curr_style}\""
                 )
 
         if not changes:

@@ -633,7 +633,7 @@ def conventions_init(config_path: str, db_path: str | None, force: bool):
     from sqlprism.core.conventions import ConventionEngine
     from sqlprism.core.graph import GraphDB
 
-    config = _cli_load_config(config_path)
+    config = _try_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     if not Path(effective_db_path).exists():
@@ -655,8 +655,13 @@ def conventions_init(config_path: str, db_path: str | None, force: bool):
             click.echo("No repos indexed. Run 'sqlprism reindex' first.")
             sys.exit(1)
 
-        # Use the first repo (most common case: single repo)
         repo_id = repos[0][0]
+        if len(repos) > 1:
+            click.echo(
+                f"Warning: {len(repos)} repos found; using first repo. "
+                "Use 'conventions refresh' to process all repos.",
+                err=True,
+            )
         engine = ConventionEngine(graph, repo_id)
         engine.run_inference()
 
@@ -679,7 +684,7 @@ def conventions_refresh(config_path: str, db_path: str | None):
     from sqlprism.core.conventions import ConventionEngine
     from sqlprism.core.graph import GraphDB
 
-    config = _cli_load_config(config_path)
+    config = _try_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     if not Path(effective_db_path).exists():
@@ -724,7 +729,7 @@ def conventions_diff(config_path: str, db_path: str | None, yaml_file: str):
     from sqlprism.core.conventions import ConventionEngine
     from sqlprism.core.graph import GraphDB
 
-    config = _cli_load_config(config_path)
+    config = _try_load_config(config_path)
     effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
 
     if not Path(effective_db_path).exists():
@@ -739,6 +744,11 @@ def conventions_diff(config_path: str, db_path: str | None, yaml_file: str):
             sys.exit(1)
 
         repo_id = repos[0][0]
+        if len(repos) > 1:
+            click.echo(
+                f"Warning: {len(repos)} repos found; comparing first repo only.",
+                err=True,
+            )
         engine = ConventionEngine(graph, repo_id)
         diff_output = engine.get_diff(yaml_file)
         click.echo(diff_output)
@@ -835,6 +845,18 @@ def _build_repo_configs(config: dict) -> dict:
         else:
             result[name] = {"path": cfg, "repo_type": "sqlmesh"}
     return result
+
+
+def _try_load_config(path: str | None) -> dict:
+    """Try to load config, return empty dict if not found.
+
+    Unlike ``_cli_load_config``, does not raise on missing config.
+    Used by commands that work with just ``--db`` and no config.
+    """
+    try:
+        return load_config(path)
+    except FileNotFoundError:
+        return {}
 
 
 def _cli_load_config(path: str | None) -> dict:

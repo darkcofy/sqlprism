@@ -1272,8 +1272,38 @@ conventions:
 # ── Bootstrap CLI (generate_yaml, get_diff) ──
 
 
+def _create_test_db(tmp_path) -> Path:
+    """Create a temp DuckDB with a layered repo and conventions."""
+    db_path = tmp_path / "test.duckdb"
+    db = GraphDB(str(db_path))
+    try:
+        repo_id = db.upsert_repo("test", str(tmp_path))
+        models = [
+            ("models/raw/raw_orders.sql", "raw_orders"),
+            ("models/raw/raw_payments.sql", "raw_payments"),
+            ("models/staging/stg_orders.sql", "stg_orders"),
+            ("models/staging/stg_payments.sql", "stg_payments"),
+            ("models/staging/stg_customers.sql", "stg_customers"),
+            ("models/marts/revenue.sql", "revenue"),
+            ("models/marts/customers.sql", "customers"),
+        ]
+        nodes = {}
+        for i, (path, name) in enumerate(models):
+            fid = db.insert_file(repo_id, path, "sql", f"ck_{i}")
+            nid = db.insert_node(fid, "table", name, "sql", 1, 10)
+            nodes[name] = nid
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+        db.insert_edge(nodes["stg_payments"], nodes["raw_payments"], "references")
+
+        engine = ConventionEngine(db, repo_id)
+        engine.run_inference()
+    finally:
+        db.close()
+    return db_path
+
+
 def test_cli_conventions_init(tmp_path):
-    """conventions --init generates YAML with confidence comments."""
+    """conventions --init generates valid YAML with confidence comments."""
     db = GraphDB()
     try:
         repo_id, nodes = _setup_layered_repo_with_edges(db)
@@ -1304,44 +1334,59 @@ def test_cli_conventions_init_no_overwrite(tmp_path):
 
     from sqlprism.cli import cli
 
-    # Create a dummy conventions file
-    conventions_file = tmp_path / "sqlprism.conventions.yml"
-    conventions_file.write_text("# existing\n")
+    db_path = _create_test_db(tmp_path)
 
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path):
-        # Write the file in the isolated dir
         Path("sqlprism.conventions.yml").write_text("# existing\n")
-        result = runner.invoke(cli, ["conventions", "init"])
-        # Should fail because file exists and no --force
-        assert result.exit_code != 0 or "already exists" in result.output
+        result = runner.invoke(
+            cli, ["conventions", "init", "--db", str(db_path)]
+        )
+        assert result.exit_code == 1
+        assert "already exists" in result.output
 
 
-def test_cli_conventions_refresh():
-    """conventions --refresh updates tables without YAML."""
-    db = GraphDB()
-    try:
-        repo_id, nodes = _setup_layered_repo_with_edges(db)
-        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+def test_cli_conventions_init_with_force(tmp_path):
+    """conventions --init --force overwrites existing file."""
+    from click.testing import CliRunner
 
-        engine = ConventionEngine(db, repo_id)
-        result = engine.run_inference()
+    from sqlprism.cli import cli
 
-        assert result["layers_detected"] >= 2
-        assert result["conventions_stored"] > 0
+    db_path = _create_test_db(tmp_path)
 
-        # Verify conventions in DB
-        count = db.conn.execute(
-            "SELECT COUNT(*) FROM conventions WHERE repo_id = ?",
-            [repo_id],
-        ).fetchone()[0]
-        assert count > 0
-    finally:
-        db.close()
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        Path("sqlprism.conventions.yml").write_text("# old\n")
+        result = runner.invoke(
+            cli, ["conventions", "init", "--db", str(db_path), "--force"]
+        )
+        assert result.exit_code == 0
+        assert "Wrote" in result.output
+        content = Path("sqlprism.conventions.yml").read_text()
+        assert "conventions:" in content
+        assert "confidence:" in content
+
+
+def test_cli_conventions_refresh(tmp_path):
+    """conventions --refresh updates tables and prints stats."""
+    from click.testing import CliRunner
+
+    from sqlprism.cli import cli
+
+    db_path = _create_test_db(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["conventions", "refresh", "--db", str(db_path)]
+    )
+    assert result.exit_code == 0
+    assert "layers" in result.output
+    assert "conventions stored" in result.output
+    assert "Done." in result.output
 
 
 def test_cli_conventions_diff(tmp_path):
-    """conventions --diff shows changes since init."""
+    """conventions --diff reports no changes after fresh init."""
     db = GraphDB()
     try:
         repo_id, nodes = _setup_layered_repo_with_edges(db)
@@ -1350,26 +1395,57 @@ def test_cli_conventions_diff(tmp_path):
         engine = ConventionEngine(db, repo_id)
         engine.run_inference()
 
-        # Write initial YAML
+        # Write YAML and immediately diff — should be "No changes"
         yaml_content = engine.generate_yaml()
         yaml_path = tmp_path / "sqlprism.conventions.yml"
         yaml_path.write_text(yaml_content)
 
-        # Get diff — should show no changes (or just confidence info)
         diff = engine.get_diff(yaml_path)
-        assert isinstance(diff, str)
+        assert diff == "No changes detected."
     finally:
         db.close()
 
 
-def test_cli_conventions_init_empty():
-    """conventions --init on empty database shows helpful message."""
+def test_cli_conventions_diff_detects_changes(tmp_path):
+    """conventions --diff detects when naming pattern changes."""
     db = GraphDB()
     try:
-        repo_id = db.upsert_repo("empty", "/tmp/empty")
-        engine = ConventionEngine(db, repo_id)
+        repo_id, nodes = _setup_layered_repo_with_edges(db)
+        db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
 
-        yaml_content = engine.generate_yaml()
-        assert "No conventions found" in yaml_content
+        engine = ConventionEngine(db, repo_id)
+        engine.run_inference()
+
+        # Write YAML with a different naming pattern
+        yaml_path = tmp_path / "sqlprism.conventions.yml"
+        yaml_path.write_text(
+            'conventions:\n  staging:\n    naming: "old_pattern"\n'
+        )
+
+        diff = engine.get_diff(yaml_path)
+        assert "staging.naming" in diff
+        assert "old_pattern" in diff
     finally:
         db.close()
+
+
+def test_cli_conventions_init_empty(tmp_path):
+    """conventions --init on empty database shows helpful message."""
+    from click.testing import CliRunner
+
+    from sqlprism.cli import cli
+
+    # Create DB with a repo but no models
+    db_path = tmp_path / "empty.duckdb"
+    db = GraphDB(str(db_path))
+    db.upsert_repo("empty", str(tmp_path))
+    db.close()
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(
+            cli, ["conventions", "init", "--db", str(db_path)]
+        )
+        assert result.exit_code == 0
+        content = Path("sqlprism.conventions.yml").read_text()
+        assert "No conventions found" in content
