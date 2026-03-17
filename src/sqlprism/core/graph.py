@@ -242,6 +242,49 @@ class GraphDB:
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS "
             "repo_type TEXT DEFAULT 'sql'"
         )
+        # v1.2: ensure semantic_tags UNIQUE includes repo_id for cross-repo
+        # federation. DuckDB doesn't support ALTER CONSTRAINT, so we check
+        # the current constraint and recreate the table if needed.
+        try:
+            constraints = self._execute_write(
+                "SELECT constraint_column_names FROM "
+                "information_schema.table_constraints "
+                "WHERE table_name = 'semantic_tags' "
+                "AND constraint_type = 'UNIQUE'"
+            ).fetchall()
+            needs_fix = False
+            for (cols,) in constraints:
+                if "repo_id" not in str(cols) and "tag_name" in str(cols):
+                    needs_fix = True
+                    break
+            if needs_fix:
+                self._execute_write(
+                    "CREATE TABLE semantic_tags_new AS "
+                    "SELECT * FROM semantic_tags"
+                )
+                self._execute_write("DROP TABLE semantic_tags")
+                self._execute_write(
+                    "CREATE TABLE semantic_tags ("
+                    "  tag_id INTEGER PRIMARY KEY DEFAULT "
+                    "    nextval('seq_tag_id'),"
+                    "  repo_id INTEGER NOT NULL,"
+                    "  tag_name TEXT NOT NULL,"
+                    "  node_id INTEGER NOT NULL,"
+                    "  confidence FLOAT NOT NULL "
+                    "    CHECK (confidence >= 0.0 AND confidence <= 1.0),"
+                    "  source TEXT NOT NULL "
+                    "    CHECK (source IN ('inferred','anchor','explicit')),"
+                    "  UNIQUE(repo_id, tag_name, node_id))"
+                )
+                self._execute_write(
+                    "INSERT INTO semantic_tags "
+                    "(repo_id, tag_name, node_id, confidence, source) "
+                    "SELECT repo_id, tag_name, node_id, confidence, source "
+                    "FROM semantic_tags_new"
+                )
+                self._execute_write("DROP TABLE semantic_tags_new")
+        except Exception:
+            pass  # table doesn't exist yet — will be created by SCHEMA_SQL
 
     def _init_pgq(self) -> None:
         """Try to load DuckPGQ, installing if needed. Non-fatal if unavailable.

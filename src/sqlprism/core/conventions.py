@@ -62,9 +62,9 @@ class ConventionEngine:
         If all files share a common prefix dir, strips it and uses the
         next segment.
         """
-        rows = self.db.conn.execute(
+        rows = self.db._execute_read(
             """
-            SELECT
+            SELECT DISTINCT
                 f.path,
                 n.name
             FROM nodes n
@@ -93,29 +93,49 @@ class ConventionEngine:
 
         prefix_len = self._common_prefix_length(dir_segments)
 
-        # Group models by their layer directory (first segment after prefix)
+        # If prefix stripping would leave no layer segments for ALL models,
+        # back off one level so the last prefix segment becomes the layer.
+        all_at_prefix = all(
+            len(dirs) <= prefix_len for dirs, _ in path_models if dirs
+        )
+        if all_at_prefix and prefix_len > 0:
+            prefix_len -= 1
+
+        # First pass: detect domain-nested structure by checking if
+        # second-level dir names repeat across different first-level dirs.
+        # E.g. finance/staging + marketing/staging → domain-nested.
+        # But staging/by_source + staging/manual → NOT domain-nested.
+        second_level_by_first: dict[str, set[str]] = {}
+        for dirs, _ in path_models:
+            remaining = dirs[prefix_len:]
+            if len(remaining) >= 2:
+                first, second = remaining[0], remaining[1]
+                second_level_by_first.setdefault(first, set()).add(second)
+
+        # Domain-nested if same second-level name appears under 2+ first-level dirs
+        all_seconds: Counter[str] = Counter()
+        for seconds in second_level_by_first.values():
+            for s in seconds:
+                all_seconds[s] += 1
+        use_nested = any(count > 1 for count in all_seconds.values())
+
+        # Group models by their layer directory
         layer_groups: dict[str, list[str]] = {}
         for dirs, model_name in path_models:
             if len(dirs) <= prefix_len:
-                # Model is at or above the prefix level — use "root"
                 layer_key = ""
             else:
-                # Check if this is a domain-nested structure
-                # e.g. models/finance/staging/ → finance/staging
                 remaining = dirs[prefix_len:]
                 layer_key = remaining[0]
 
-                # Detect nested domain dirs: if second-level dirs repeat
-                # across different first-level dirs, use domain/layer
-                if len(remaining) > 1:
+                if use_nested and len(remaining) > 1:
                     layer_key = "/".join(remaining[:2])
 
             if layer_key:
                 layer_groups.setdefault(layer_key, []).append(model_name)
 
-        # Check for domain-nested structure: if layer keys look like
-        # "finance/staging", "marketing/staging", collapse to just the
-        # sub-layer names (staging, marts, etc.)
+        # Collapse domain-nested layers if sub-layer names repeat
+        # (e.g. finance/staging + marketing/staging → staging)
         layer_groups = self._collapse_domain_layers(layer_groups)
 
         # Build Layer objects, skip groups with < 2 models
