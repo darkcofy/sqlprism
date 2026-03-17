@@ -62,6 +62,11 @@ def test_detect_layers_flat_dirs():
         names = {ly.name for ly in layers}
         assert "staging" in names
         assert "marts" in names
+
+        staging = next(ly for ly in layers if ly.name == "staging")
+        assert staging.model_count == 2
+        marts = next(ly for ly in layers if ly.name == "marts")
+        assert marts.model_count == 2
     finally:
         db.close()
 
@@ -232,78 +237,108 @@ def test_detect_layers_subdirs_not_domain_nested():
 def test_naming_pattern_clear_prefix():
     """Infer naming pattern with clear prefix like stg_."""
     db = GraphDB()
-    engine = ConventionEngine(db, repo_id=1)
-    names = [
-        "stg_stripe_payments",
-        "stg_shopify_orders",
-        "stg_stripe_refunds",
-        "stg_postgres_users",
-        "stg_github_repos",
-        "stg_slack_messages",
-    ]
-    result = engine.infer_naming_pattern(names)
+    try:
+        # infer_naming_pattern is pure — repo_id unused, but use real setup
+        repo_id = db.upsert_repo("test", "/tmp/test")
+        engine = ConventionEngine(db, repo_id)
+        names = [
+            "stg_stripe_payments",
+            "stg_shopify_orders",
+            "stg_stripe_refunds",
+            "stg_postgres_users",
+            "stg_github_repos",
+            "stg_slack_messages",
+        ]
+        result = engine.infer_naming_pattern(names)
 
-    assert result.pattern.startswith("stg_")
-    assert result.confidence == 1.0
-    assert result.matching_count == 6
-    assert result.exceptions == []
-    db.close()
+        assert result.pattern.startswith("stg_")
+        # 6 names, all match prefix → 6/6 = 1.0 (above <5 cap)
+        assert result.confidence == 1.0
+        assert result.matching_count == 6
+        assert result.exceptions == []
+    finally:
+        db.close()
 
 
 def test_naming_pattern_mixed_styles():
     """Infer naming pattern with mixed styles (no clear prefix)."""
     db = GraphDB()
-    engine = ConventionEngine(db, repo_id=1)
-    names = [
-        "customer_ltv",
-        "customer_segments",
-        "order_summary",
-        "revenue_daily",
-        "churn_prediction",
-    ]
-    result = engine.infer_naming_pattern(names)
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test")
+        engine = ConventionEngine(db, repo_id)
+        names = [
+            "customer_ltv",
+            "customer_segments",
+            "order_summary",
+            "revenue_daily",
+            "churn_prediction",
+        ]
+        result = engine.infer_naming_pattern(names)
 
-    assert result.pattern != ""
-    assert result.confidence < 0.9
-    assert result.total_count == 5
-    assert result.matching_count > 0
-    db.close()
+        assert result.pattern != ""
+        assert 0.0 < result.confidence < 0.9
+        assert result.total_count == 5
+        assert result.matching_count > 0
+    finally:
+        db.close()
 
 
 def test_naming_pattern_exceptions():
     """Report exceptions -- models that don't match the inferred pattern."""
     db = GraphDB()
-    engine = ConventionEngine(db, repo_id=1)
-    names = [
-        "stg_stripe_payments",
-        "stg_shopify_orders",
-        "stg_stripe_refunds",
-        "stg_postgres_users",
-        "stg_github_repos",
-        "stg_slack_messages",
-        "stg_jira_issues",
-        "stg_aws_costs",
-        "stg_gcp_billing",
-        "stg_azure_resources",
-        "legacy_users",  # exception
-    ]
-    result = engine.infer_naming_pattern(names)
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test")
+        engine = ConventionEngine(db, repo_id)
+        names = [
+            "stg_stripe_payments",
+            "stg_shopify_orders",
+            "stg_stripe_refunds",
+            "stg_postgres_users",
+            "stg_github_repos",
+            "stg_slack_messages",
+            "stg_jira_issues",
+            "stg_aws_costs",
+            "stg_gcp_billing",
+            "stg_azure_resources",
+            "legacy_users",  # exception
+        ]
+        result = engine.infer_naming_pattern(names)
 
-    assert result.pattern.startswith("stg_")
-    assert "legacy_users" in result.exceptions
-    assert result.matching_count == 10
-    assert result.total_count == 11
-    # confidence ~ 10/11 = 0.91
-    assert result.confidence >= 0.85
-    db.close()
+        assert result.pattern.startswith("stg_")
+        assert "legacy_users" in result.exceptions
+        assert result.matching_count == 10
+        assert result.total_count == 11
+        # confidence ~ 10/11 = 0.91
+        assert result.confidence >= 0.85
+    finally:
+        db.close()
 
 
 def test_naming_pattern_small_layer():
     """Small layer gets low confidence (capped at 0.6)."""
     db = GraphDB()
-    engine = ConventionEngine(db, repo_id=1)
-    names = ["stg_orders", "stg_payments"]
-    result = engine.infer_naming_pattern(names)
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test")
+        engine = ConventionEngine(db, repo_id)
+        names = ["stg_orders", "stg_payments"]
+        result = engine.infer_naming_pattern(names)
 
-    assert result.confidence == 0.6
-    db.close()
+        assert result.confidence == 0.6
+    finally:
+        db.close()
+
+
+def test_naming_pattern_empty_input():
+    """Empty model list returns zero-confidence empty pattern."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test")
+        engine = ConventionEngine(db, repo_id)
+        result = engine.infer_naming_pattern([])
+
+        assert result.pattern == ""
+        assert result.confidence == 0.0
+        assert result.matching_count == 0
+        assert result.total_count == 0
+    finally:
+        db.close()
