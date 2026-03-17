@@ -128,6 +128,10 @@ class ConventionEngine:
                 remaining = dirs[prefix_len:]
                 layer_key = remaining[0]
 
+                # Use two-segment key only for domain-nested structures.
+                # Note: models at depth 1 (e.g. finance/stg_flat.sql) keep
+                # the flat key while depth 2+ get nested keys. This is
+                # acceptable — mixed-depth within a domain dir is rare.
                 if use_nested and len(remaining) > 1:
                     layer_key = "/".join(remaining[:2])
 

@@ -259,6 +259,9 @@ class GraphDB:
                     needs_fix = True
                     break
             if needs_fix:
+                # Manual BEGIN/COMMIT rather than write_transaction()
+                # because we're already inside _init_schema which holds
+                # _write_lock. DuckDB DDL is transactional.
                 self.conn.execute("BEGIN TRANSACTION")
                 try:
                     self._execute_write(

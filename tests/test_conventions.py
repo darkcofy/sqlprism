@@ -227,6 +227,9 @@ def test_detect_layers_subdirs_not_domain_nested():
         assert "marts" in names
         # Should NOT create domain-nested keys like staging/by_source
         assert all("/" not in ly.name for ly in layers)
+
+        staging = next(ly for ly in layers if ly.name == "staging")
+        assert staging.model_count == 3
     finally:
         db.close()
 
@@ -324,6 +327,25 @@ def test_naming_pattern_small_layer():
         result = engine.infer_naming_pattern(names)
 
         assert result.confidence == 0.6
+    finally:
+        db.close()
+
+
+def test_naming_pattern_confidence_cap_boundary():
+    """Confidence cap applies at <5, not at 5 — 5 names should be uncapped."""
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test")
+        engine = ConventionEngine(db, repo_id)
+        # Exactly 5 names, all matching prefix → uncapped at 1.0
+        names = ["stg_a", "stg_b", "stg_c", "stg_d", "stg_e"]
+        result = engine.infer_naming_pattern(names)
+        assert result.confidence == 1.0  # 5 names, not capped
+
+        # 4 names → capped at 0.6
+        names_small = ["stg_a", "stg_b", "stg_c", "stg_d"]
+        result_small = engine.infer_naming_pattern(names_small)
+        assert result_small.confidence == 0.6  # 4 < 5, capped
     finally:
         db.close()
 
