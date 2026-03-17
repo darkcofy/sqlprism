@@ -3040,10 +3040,17 @@ class GraphDB:
 
         if not rows:
             if layer:
-                # Check what layers exist
-                available = self._execute_read(
-                    "SELECT DISTINCT layer FROM conventions"
-                ).fetchall()
+                # Check what layers exist — scoped to repo if specified
+                if repo_id:
+                    available = self._execute_read(
+                        "SELECT DISTINCT layer FROM conventions "
+                        "WHERE repo_id = ?",
+                        [repo_id],
+                    ).fetchall()
+                else:
+                    available = self._execute_read(
+                        "SELECT DISTINCT layer FROM conventions"
+                    ).fetchall()
                 available_names = [r[0] for r in available]
                 if available_names:
                     return {
@@ -3065,32 +3072,30 @@ class GraphDB:
                 }
             layer_data = layers_data[row_layer]
 
-            parsed = json.loads(payload) if isinstance(payload, str) else payload
+            try:
+                parsed = json.loads(payload) if isinstance(payload, str) else payload
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Malformed convention payload for %s/%s",
+                    row_layer,
+                    conv_type,
+                )
+                parsed = {}
+
+            # Build convention sub-dict. Payload keys are spread first,
+            # then confidence/source are set explicitly to avoid shadowing.
+            conv_data = dict(parsed)
+            conv_data["confidence"] = conf
+            conv_data["source"] = source
 
             if conv_type == "naming":
-                layer_data["naming"] = {
-                    **parsed,
-                    "confidence": conf,
-                    "source": source,
-                }
+                layer_data["naming"] = conv_data
             elif conv_type == "references":
-                layer_data["allowed_references"] = {
-                    **parsed,
-                    "confidence": conf,
-                    "source": source,
-                }
+                layer_data["allowed_references"] = conv_data
             elif conv_type == "required_columns":
-                layer_data["required_columns"] = {
-                    **parsed,
-                    "confidence": conf,
-                    "source": source,
-                }
+                layer_data["required_columns"] = conv_data
             elif conv_type == "column_style":
-                layer_data["column_style"] = {
-                    **parsed,
-                    "confidence": conf,
-                    "source": source,
-                }
+                layer_data["column_style"] = conv_data
 
         result_layers = list(layers_data.values())
 

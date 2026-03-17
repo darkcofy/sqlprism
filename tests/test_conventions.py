@@ -993,11 +993,27 @@ def test_get_conventions_small_project():
             "SELECT name FROM repos WHERE repo_id = ?", [repo_id]
         ).fetchone()[0]
 
-        # All layers in the fixture have < 10 models
+        # All layers in the fixture have < 10 models (threshold is 10)
         result = db.query_conventions(layer="staging", repo=repo_name)
 
+        assert result.get("model_count", 0) < 10
         assert "note" in result
         assert "small project" in result["note"].lower()
+    finally:
+        db.close()
+
+
+def test_get_conventions_unknown_layer_no_repo():
+    """Unknown layer without repo filter returns available layers."""
+    db = GraphDB()
+    try:
+        _setup_repo_with_conventions(db)
+
+        result = db.query_conventions(layer="nonexistent")
+
+        assert "error" in result
+        assert "available_layers" in result
+        assert len(result["available_layers"]) > 0
     finally:
         db.close()
 
