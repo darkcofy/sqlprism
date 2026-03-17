@@ -139,6 +139,32 @@ CREATE TABLE IF NOT EXISTS columns (
     UNIQUE(node_id, column_name)
 );
 
+CREATE SEQUENCE IF NOT EXISTS seq_convention_id START 1;
+
+CREATE TABLE IF NOT EXISTS conventions (
+    convention_id INTEGER PRIMARY KEY DEFAULT nextval('seq_convention_id'),
+    repo_id       INTEGER NOT NULL,   -- logical FK to repos(repo_id)
+    layer         TEXT NOT NULL,
+    convention_type TEXT NOT NULL,     -- 'naming' | 'references' | 'required_columns' | 'column_style'
+    payload       JSON NOT NULL,
+    confidence    FLOAT NOT NULL,
+    source        TEXT NOT NULL,       -- 'inferred' | 'override'
+    model_count   INTEGER NOT NULL,
+    UNIQUE(repo_id, layer, convention_type)
+);
+
+CREATE SEQUENCE IF NOT EXISTS seq_tag_id START 1;
+
+CREATE TABLE IF NOT EXISTS semantic_tags (
+    tag_id     INTEGER PRIMARY KEY DEFAULT nextval('seq_tag_id'),
+    repo_id    INTEGER NOT NULL,      -- logical FK to repos(repo_id)
+    tag_name   TEXT NOT NULL,
+    node_id    INTEGER NOT NULL,      -- logical FK to nodes(node_id)
+    confidence FLOAT NOT NULL,
+    source     TEXT NOT NULL,         -- 'inferred' | 'anchor' | 'explicit'
+    UNIQUE(repo_id, tag_name, node_id)
+);
+
 """
 
 INDEX_SQL = """
@@ -159,6 +185,10 @@ CREATE INDEX IF NOT EXISTS idx_lineage_file ON column_lineage(file_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_schema ON nodes(schema);
 CREATE INDEX IF NOT EXISTS idx_columns_node ON columns(node_id);
 CREATE INDEX IF NOT EXISTS idx_columns_name ON columns(column_name);
+CREATE INDEX IF NOT EXISTS idx_conventions_repo ON conventions(repo_id);
+CREATE INDEX IF NOT EXISTS idx_tags_name ON semantic_tags(tag_name);
+CREATE INDEX IF NOT EXISTS idx_tags_node ON semantic_tags(node_id);
+CREATE INDEX IF NOT EXISTS idx_tags_repo ON semantic_tags(repo_id);
 """
 
 
