@@ -858,6 +858,76 @@ async def get_conventions(params: GetConventionsInput) -> dict:
     )
 
 
+class SearchByTagInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    tag: str = Field(
+        ...,
+        description="Tag name to search for (e.g. 'customer', 'order').",
+    )
+    min_confidence: float | None = Field(
+        None,
+        description="Minimum confidence threshold (0.0-1.0). Only return models above this confidence.",
+    )
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to search all repos.",
+    )
+
+
+@mcp.tool(
+    name="search_by_tag",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def search_by_tag(params: SearchByTagInput) -> dict:
+    """Find models tagged with a business domain concept, ranked by confidence.
+
+    Returns models whose semantic tags match the given tag name, ordered by
+    confidence score (highest first). Use list_tags first to discover the
+    available tags in the project's business domain vocabulary.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_search_by_tag,
+        tag=params.tag,
+        repo=params.repo,
+        min_confidence=params.min_confidence,
+    )
+
+
+class ListTagsInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to search all repos.",
+    )
+
+
+@mcp.tool(
+    name="list_tags",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def list_tags(params: ListTagsInput) -> dict:
+    """Return all semantic tags with model counts and average confidence.
+
+    Provides the project's business domain vocabulary — the set of conceptual
+    tags that have been assigned to models. Use this to discover available tags
+    before calling search_by_tag.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_list_tags,
+        repo=params.repo,
+    )
+
+
 class ReindexInput(BaseModel):
     repo: str | None = Field(None, description="Specific repo to reindex. Omit for all repos.")
 
