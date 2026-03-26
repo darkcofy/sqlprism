@@ -932,7 +932,6 @@ async def list_tags(params: ListTagsInput) -> dict:
 
 
 class FindSimilarModelsInput(BaseModel):
-    model_config = {"populate_by_name": True}
     references: list[str] | None = Field(
         None,
         description="Tables this model will reference (e.g. ['stg_orders', 'stg_payments']).",
@@ -943,6 +942,7 @@ class FindSimilarModelsInput(BaseModel):
     )
     model: str | None = Field(
         None,
+        min_length=1,
         description="Existing model name to find similar models to.",
     )
     limit: int = Field(

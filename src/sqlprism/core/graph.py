@@ -3404,6 +3404,7 @@ class GraphDB:
         target_model_node_id: int | None = None
         target_layer: str | None = None
 
+        model = model or None  # normalize empty string
         if model:
             # Look up model node
             model_sql = (
@@ -3448,6 +3449,19 @@ class GraphDB:
                 ).fetchall()
                 target_cols = {r[0] for r in col_rows}
 
+        # If target has no refs and no columns, similarity is meaningless
+        if not target_refs and not target_cols:
+            return {
+                "similar": [],
+                "count": 0,
+                "total_matches": 0,
+                "suggestion": (
+                    "Model has no references or columns to compare against."
+                    if model else
+                    "No similar models found for the given criteria."
+                ),
+            }
+
         # --- Batch queries for candidates ---
         # Get all candidate nodes
         cand_sql = (
@@ -3464,6 +3478,13 @@ class GraphDB:
             cand_params.append(target_model_node_id)
 
         candidates = self._execute_read(cand_sql, cand_params).fetchall()
+        if len(candidates) > 50_000:
+            return {
+                "error": (
+                    f"Too many candidate models ({len(candidates)})"
+                    " — specify repo to narrow the search"
+                )
+            }
         if not candidates:
             return {
                 "similar": [],
@@ -3501,12 +3522,17 @@ class GraphDB:
             for node_id, col_name in col_rows:
                 cols_by_node.setdefault(node_id, set()).add(col_name)
 
+        layer_by_node = {
+            node_id: self._extract_layer(file_path)
+            for node_id, _, file_path in candidates
+        }
+
         # --- Score candidates ---
-        scored: list[tuple[float, str, set[str], set[str], str]] = []
+        scored: list[tuple[float, str, list[str], list[str], str]] = []
         for node_id, name, file_path in candidates:
             cand_refs = refs_by_node.get(node_id, set())
             cand_cols = cols_by_node.get(node_id, set())
-            cand_layer = self._extract_layer(file_path)
+            cand_layer = layer_by_node[node_id]
 
             layer_bonus = (
                 0.1
@@ -3519,8 +3545,11 @@ class GraphDB:
                 + layer_bonus
             )
 
+            shared_refs = sorted(target_refs & cand_refs)
+            shared_cols = sorted(target_cols & cand_cols)
+
             if similarity >= 0.05:
-                scored.append((similarity, name, cand_refs, cand_cols, file_path))
+                scored.append((similarity, name, shared_refs, shared_cols, file_path))
 
         if not scored:
             return {
@@ -3531,18 +3560,18 @@ class GraphDB:
             }
 
         # Sort descending by similarity, apply limit
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored.sort(key=lambda x: (-x[0], x[1]))
         total_matches = len(scored)
         scored = scored[:limit]
 
         # --- Build result ---
         similar: list[dict] = []
-        for similarity, name, cand_refs, cand_cols, file_path in scored:
+        for similarity, name, shared_refs, shared_cols, file_path in scored:
             entry: dict = {
                 "name": name,
                 "similarity": round(similarity, 4),
-                "shared_refs": sorted(list(target_refs & cand_refs)),
-                "shared_columns": sorted(list(target_cols & cand_cols)),
+                "shared_refs": shared_refs,
+                "shared_columns": shared_cols,
                 "file": file_path,
             }
             if similarity >= _EXTEND_SUGGESTION_THRESHOLD:

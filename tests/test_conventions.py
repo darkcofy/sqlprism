@@ -2346,7 +2346,7 @@ def test_find_similar_by_refs():
         assert "int_order_payments" in names
 
         iop = next(m for m in result["similar"] if m["name"] == "int_order_payments")
-        assert iop["similarity"] >= 0.8
+        assert iop["similarity"] == 0.8
         assert "stg_orders" in iop["shared_refs"]
         assert "stg_payments" in iop["shared_refs"]
     finally:
@@ -2373,7 +2373,7 @@ def test_find_similar_by_columns():
         # Check shared_columns for customer_ltv
         cltv = next(m for m in result["similar"] if m["name"] == "customer_ltv")
         assert "customer_id" in cltv["shared_columns"]
-        assert 0 < cltv["similarity"] < 0.8
+        assert cltv["similarity"] == 0.1
     finally:
         db.close()
 
@@ -2519,6 +2519,25 @@ def test_find_similar_limit():
             references=["stg_orders"], limit=1
         )
         assert len(result["similar"]) == 1
+        assert result["total_matches"] > result["count"]
+    finally:
+        db.close()
+
+
+def test_find_similar_empty_lists():
+    """Empty list inputs produce empty results (distinct from None)."""
+    db = GraphDB()
+    try:
+        _setup_similar_models_repo(db)
+
+        # Empty lists are not None — they bypass model-lookup fallback
+        result = db.query_find_similar_models(
+            references=[], output_columns=[]
+        )
+
+        # Both target sets empty → early return with suggestion
+        assert result["similar"] == []
+        assert result["count"] == 0
     finally:
         db.close()
 
