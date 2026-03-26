@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +75,25 @@ class ColumnStyle:
 
     style: str  # 'snake_case' | 'camelCase' | 'PascalCase' | 'SCREAMING_SNAKE'
     confidence: float
+
+
+@dataclass
+class TagAssignment:
+    """A semantic tag assigned to a model via structural clustering."""
+
+    tag_name: str
+    node_id: int
+    model_name: str
+    confidence: float
+    source: str  # 'inferred'
+
+
+@dataclass
+class Cluster:
+    """A group of models with similar upstream references."""
+
+    members: list[tuple[int, str]]  # (node_id, model_name)
+    ref_sets: dict[int, set[int]]  # node_id -> set of upstream node_ids
 
 
 class ConventionEngine:
@@ -1184,3 +1204,359 @@ class ConventionEngine:
                 labels.append("domain" if i == 0 else "description")
 
         return labels if labels else ["description"]
+
+    # ── Semantic tag clustering ──
+
+    # Prefixes and dot-delimited segments to strip before tokenizing
+    # model names for label extraction.
+    _LAYER_PREFIXES = re.compile(
+        r"^(stg|int|fct|dim|raw|src|base|snap|rpt|agg)_"
+    )
+    _LAYER_DOT_PREFIXES = re.compile(
+        r"^(marts|staging|intermediate|raw|sources)\."
+    )
+
+    def infer_semantic_tags(
+        self,
+        threshold: float = 0.5,
+        existing_tags: list[TagAssignment] | None = None,
+    ) -> list[TagAssignment]:
+        """Cluster models by shared upstream references and auto-label.
+
+        Pipeline:
+        1. Query upstream refs per model.
+        2. Agglomerative clustering by Jaccard similarity.
+        3. Auto-label each cluster from most frequent name token.
+        4. Score per-model confidence.
+
+        Args:
+            threshold: Jaccard similarity threshold for merging clusters.
+            existing_tags: Previously assigned tags for stability check.
+
+        Returns:
+            List of ``TagAssignment`` objects, one per model in a cluster.
+        """
+        ref_sets = self._get_model_references()
+        if len(ref_sets) < 5:
+            logger.debug(
+                "Skipping semantic tags: repo %d has < 5 models with refs",
+                self.repo_id,
+            )
+            return []
+
+        clusters = self._agglomerative_cluster(ref_sets, threshold)
+
+        # Build existing tag lookup for stability
+        existing_by_node: dict[int, TagAssignment] = {}
+        if existing_tags:
+            for tag in existing_tags:
+                existing_by_node[tag.node_id] = tag
+
+        assignments: list[TagAssignment] = []
+        for cluster in clusters:
+            tag_name, label_confidence = self._label_cluster(cluster)
+            if not tag_name:
+                continue
+
+            for node_id, model_name in cluster.members:
+                confidence = self._compute_member_confidence(
+                    node_id, model_name, tag_name, cluster, label_confidence,
+                )
+
+                # Stability: keep existing tag if still above threshold
+                prev = existing_by_node.get(node_id)
+                if prev and prev.tag_name != tag_name:
+                    # Check if the model still fits the old cluster
+                    old_still_valid = self._check_tag_stability(
+                        node_id, prev.tag_name, clusters, ref_sets, threshold,
+                    )
+                    if old_still_valid:
+                        assignments.append(prev)
+                        continue
+
+                assignments.append(
+                    TagAssignment(
+                        tag_name=tag_name,
+                        node_id=node_id,
+                        model_name=model_name,
+                        confidence=round(min(confidence, 1.0), 2),
+                        source="inferred",
+                    )
+                )
+
+        return assignments
+
+    def _get_model_references(self) -> dict[int, set[int]]:
+        """Query upstream references for each model in the repo.
+
+        Returns:
+            Dict mapping node_id to set of upstream (target) node_ids.
+        """
+        rows = self.db._execute_read(
+            """
+            SELECT
+                e.source_id,
+                e.target_id
+            FROM edges e
+            JOIN nodes sn ON e.source_id = sn.node_id
+            JOIN files sf ON sn.file_id = sf.file_id
+            WHERE sf.repo_id = ?
+              AND e.relationship IN ('references', 'cte_references')
+              AND sn.kind IN ('table', 'view')
+            """,
+            [self.repo_id],
+        ).fetchall()
+
+        ref_sets: dict[int, set[int]] = {}
+        for source_id, target_id in rows:
+            ref_sets.setdefault(source_id, set()).add(target_id)
+
+        return ref_sets
+
+    @staticmethod
+    def _jaccard(a: set, b: set) -> float:
+        """Compute Jaccard similarity between two sets."""
+        if not a and not b:
+            return 0.0
+        union = a | b
+        if not union:
+            return 0.0
+        return len(a & b) / len(union)
+
+    def _agglomerative_cluster(
+        self,
+        ref_sets: dict[int, set[int]],
+        threshold: float = 0.5,
+    ) -> list[Cluster]:
+        """Agglomerative clustering of models by Jaccard similarity.
+
+        Starts with each model as its own cluster and iteratively
+        merges the most similar pair until no pair exceeds the
+        threshold.
+
+        Args:
+            ref_sets: Mapping of node_id to upstream reference set.
+            threshold: Minimum Jaccard similarity to merge.
+
+        Returns:
+            List of ``Cluster`` objects.
+        """
+        # Get model names for cluster members
+        node_ids = list(ref_sets)
+        if not node_ids:
+            return []
+
+        placeholders = ",".join(["?"] * len(node_ids))
+        rows = self.db._execute_read(
+            f"""
+            SELECT node_id, name
+            FROM nodes
+            WHERE node_id IN ({placeholders})
+            """,
+            node_ids,
+        ).fetchall()
+        name_map = {nid: name for nid, name in rows}
+
+        # Initialize: each node is its own cluster
+        # Use list index as cluster id
+        clusters: list[list[int]] = [[nid] for nid in node_ids]
+        # Precompute merged ref sets per cluster (union of member refs)
+        cluster_refs: list[set[int]] = [
+            ref_sets[nid].copy() for nid in node_ids
+        ]
+
+        while True:
+            best_sim = -1.0
+            best_i = -1
+            best_j = -1
+
+            for i in range(len(clusters)):
+                if not clusters[i]:
+                    continue
+                for j in range(i + 1, len(clusters)):
+                    if not clusters[j]:
+                        continue
+                    sim = self._jaccard(cluster_refs[i], cluster_refs[j])
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_i = i
+                        best_j = j
+
+            if best_sim < threshold:
+                break
+
+            # Merge j into i
+            clusters[best_i].extend(clusters[best_j])
+            cluster_refs[best_i] = cluster_refs[best_i] | cluster_refs[best_j]
+            clusters[best_j] = []
+            cluster_refs[best_j] = set()
+
+        # Build Cluster objects, skip singletons
+        result: list[Cluster] = []
+        for members_list in clusters:
+            if len(members_list) < 2:
+                continue
+            members = [
+                (nid, name_map.get(nid, f"node_{nid}"))
+                for nid in members_list
+            ]
+            c_ref_sets = {
+                nid: ref_sets[nid] for nid in members_list
+            }
+            result.append(Cluster(members=members, ref_sets=c_ref_sets))
+
+        return result
+
+    def _label_cluster(
+        self, cluster: Cluster
+    ) -> tuple[str, float]:
+        """Auto-label a cluster from most frequent name token.
+
+        Strips layer prefixes, tokenizes by ``_``, and picks the
+        most common non-trivial token as the tag name.
+
+        Returns:
+            Tuple of (tag_name, label_confidence). Empty tag_name
+            if no suitable label found.
+        """
+        token_counter: Counter[str] = Counter()
+        trivial = {"id", "at", "by", "to", "is", "on", "in", "of", "no"}
+
+        for _node_id, model_name in cluster.members:
+            stripped = self._strip_layer_prefix(model_name)
+            tokens = stripped.split("_")
+            # Deduplicate tokens within a single model name
+            seen: set[str] = set()
+            for tok in tokens:
+                tok_lower = tok.lower()
+                if tok_lower and tok_lower not in trivial and tok_lower not in seen:
+                    seen.add(tok_lower)
+                    token_counter[tok_lower] += 1
+
+        if not token_counter:
+            return ("", 0.0)
+
+        tag_name, count = token_counter.most_common(1)[0]
+        label_confidence = count / len(cluster.members)
+        return (tag_name, round(label_confidence, 2))
+
+    def _strip_layer_prefix(self, model_name: str) -> str:
+        """Strip known layer prefixes from a model name.
+
+        Handles both underscore prefixes (``stg_``, ``fct_``) and
+        dot-delimited prefixes (``marts.``, ``staging.``).
+        """
+        # Strip dot-delimited prefix first
+        name = self._LAYER_DOT_PREFIXES.sub("", model_name)
+        # Then strip underscore prefix
+        name = self._LAYER_PREFIXES.sub("", name)
+        return name
+
+    def _compute_member_confidence(
+        self,
+        node_id: int,
+        model_name: str,
+        tag_name: str,
+        cluster: Cluster,
+        label_confidence: float,
+    ) -> float:
+        """Compute per-model confidence within a tagged cluster.
+
+        Confidence is based on:
+        - Position in cluster (core vs edge member): 0.60 - 0.85 base
+        - Name token match: +0.10
+        - Description match: +0.10
+        """
+        # Compute average Jaccard similarity to other cluster members
+        own_refs = cluster.ref_sets.get(node_id, set())
+        other_sims = []
+        for other_id, _name in cluster.members:
+            if other_id == node_id:
+                continue
+            other_refs = cluster.ref_sets.get(other_id, set())
+            other_sims.append(self._jaccard(own_refs, other_refs))
+
+        if other_sims:
+            avg_sim = sum(other_sims) / len(other_sims)
+        else:
+            avg_sim = 0.0
+
+        # Linear interpolation between edge (0.60) and core (0.85)
+        # based on avg similarity. Threshold 0.5 maps to ~0.60,
+        # similarity 1.0 maps to ~0.85.
+        base = 0.60 + (avg_sim - 0.5) * (0.85 - 0.60) / 0.5
+        base = max(0.60, min(0.85, base))
+
+        # Name token match bonus
+        stripped = self._strip_layer_prefix(model_name)
+        if tag_name.lower() in stripped.lower():
+            base += 0.10
+
+        # Description match bonus (check if model has a description
+        # containing the tag name)
+        base += self._description_bonus(node_id, tag_name)
+
+        return min(base, 1.0)
+
+    def _description_bonus(
+        self, node_id: int, tag_name: str
+    ) -> float:
+        """Check if a model's description mentions the tag name.
+
+        Returns 0.10 if it does, 0.0 otherwise. Queries the nodes
+        table for a description field (dbt models may have one).
+        """
+        try:
+            rows = self.db._execute_read(
+                """
+                SELECT description
+                FROM nodes
+                WHERE node_id = ?
+                  AND description IS NOT NULL
+                  AND description != ''
+                """,
+                [node_id],
+            ).fetchall()
+        except Exception:
+            # description column may not exist in all schemas
+            return 0.0
+
+        if not rows:
+            return 0.0
+
+        desc = rows[0][0]
+        if isinstance(desc, str) and tag_name.lower() in desc.lower():
+            return 0.10
+        return 0.0
+
+    def _check_tag_stability(
+        self,
+        node_id: int,
+        old_tag: str,
+        clusters: list[Cluster],
+        ref_sets: dict[int, set[int]],
+        threshold: float,
+    ) -> bool:
+        """Check if a model still fits its old tag cluster.
+
+        For stability, an existing tag is preserved if the model
+        has Jaccard similarity >= threshold with at least one member
+        of a cluster labeled with the old tag.
+        """
+        own_refs = ref_sets.get(node_id, set())
+        if not own_refs:
+            return False
+
+        for cluster in clusters:
+            tag_name, _ = self._label_cluster(cluster)
+            if tag_name != old_tag:
+                continue
+            # Check if node has sufficient similarity to any member
+            for member_id, _ in cluster.members:
+                if member_id == node_id:
+                    continue
+                member_refs = cluster.ref_sets.get(member_id, set())
+                if self._jaccard(own_refs, member_refs) >= threshold:
+                    return True
+
+        return False
