@@ -2706,7 +2706,7 @@ def test_suggest_placement_name_validation():
         assert result["recommended_layer"] == "intermediate"
         feedback = result["name_feedback"]
         assert feedback["matches_convention"] is False
-        assert "int_" in feedback["suggested_name"]
+        assert feedback["suggested_name"] == "int_orders_joined"
     finally:
         db.close()
 
@@ -2723,6 +2723,7 @@ def test_suggest_placement_name_matches():
         )
 
         assert "error" not in result
+        assert result["recommended_layer"] == "intermediate"
         feedback = result["name_feedback"]
         assert feedback["matches_convention"] is True
     finally:
@@ -2744,6 +2745,8 @@ def test_suggest_placement_ambiguous():
         assert result.get("ambiguous") is True
         assert result["recommended_layer"] in ("intermediate", "marts")
         assert "Mixed" in result["reason"] or "most likely" in result["reason"]
+        assert "coverage" in result
+        assert 0.0 < result["coverage"] <= 1.0
     finally:
         db.close()
 
@@ -2763,6 +2766,8 @@ def test_suggest_placement_similar():
         assert isinstance(result["similar_models"], list)
         # int_order_payments references the same stg_orders + stg_payments
         assert "int_order_payments" in result["similar_models"]
+        # Unrelated models should not appear
+        assert "revenue" not in result["similar_models"]
     finally:
         db.close()
 
@@ -2780,5 +2785,63 @@ def test_suggest_placement_no_conventions():
 
         assert "error" in result
         assert "conventions" in result["error"].lower() or "refresh" in result["error"].lower()
+    finally:
+        db.close()
+
+
+def test_suggest_placement_unknown_reference():
+    """Error when none of the referenced models exist in the index."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        result = db.query_suggest_placement(
+            references=["nonexistent_model", "also_missing"]
+        )
+
+        assert "error" in result
+        assert "not found" in result["error"].lower() or "None" in result["error"]
+    finally:
+        db.close()
+
+
+def test_suggest_placement_empty_references():
+    """Error when references list is empty."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        result = db.query_suggest_placement(references=[])
+
+        assert "error" in result
+    finally:
+        db.close()
+
+
+def test_suggest_placement_repo_filter():
+    """Placement is scoped to the specified repo."""
+    db = GraphDB()
+    try:
+        # Set up first repo with conventions
+        _setup_placement_repo(db)
+
+        # Set up second repo with different conventions
+        repo2_id = db.upsert_repo("other", "/tmp/other")
+        fid = db.insert_file(repo2_id, "models/staging/stg_events.sql", "sql", "ck_r2_0")
+        db.insert_node(fid, "table", "stg_events", "sql", 1, 10)
+
+        # Query scoped to "test" repo — stg_events is in "other" repo
+        result = db.query_suggest_placement(
+            references=["stg_orders"], repo="test"
+        )
+        assert "error" not in result
+        assert result["recommended_layer"] == "intermediate"
+
+        # Query scoped to nonexistent repo
+        result2 = db.query_suggest_placement(
+            references=["stg_orders"], repo="nonexistent"
+        )
+        assert "error" in result2
+        assert "not found" in result2["error"]
     finally:
         db.close()

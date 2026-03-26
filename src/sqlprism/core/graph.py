@@ -3665,18 +3665,23 @@ class GraphDB:
                     "confidence": confidence,
                 }
 
-        # --- Determine layers of referenced models ---
+        # --- Determine layers of referenced models (batched) ---
         ref_layers: dict[str, str] = {}  # ref_name -> layer
-        for ref_name in references:
-            row = self._execute_read(
-                "SELECT f.path FROM nodes n "
-                "JOIN files f ON n.file_id = f.file_id "
-                "WHERE n.name = ? AND n.kind IN ('table', 'view')"
-                + (" AND f.repo_id = ?" if repo_id is not None else ""),
-                [ref_name] + ([repo_id] if repo_id is not None else []),
-            ).fetchone()
-            if row:
-                ref_layers[ref_name] = self._extract_layer(row[0])
+        placeholders = ",".join("?" * len(references))
+        ref_params: list = list(references)
+        ref_sql = (
+            "SELECT n.name, f.path FROM nodes n "
+            "JOIN files f ON n.file_id = f.file_id "
+            f"WHERE n.name IN ({placeholders}) "
+            "AND n.kind IN ('table', 'view')"
+        )
+        if repo_id is not None:
+            ref_sql += " AND f.repo_id = ?"
+            ref_params.append(repo_id)
+        for ref_name, fpath in self._execute_read(ref_sql, ref_params).fetchall():
+            layer = self._extract_layer(fpath)
+            if layer:  # skip models with no identifiable layer
+                ref_layers[ref_name] = layer
 
         if not ref_layers:
             return {
@@ -3708,13 +3713,13 @@ class GraphDB:
 
         # --- Build recommendation ---
         if candidates:
-            # Pick highest confidence among full matches
-            candidates.sort(key=lambda x: -x[1])
+            # Pick highest confidence, break ties alphabetically
+            candidates.sort(key=lambda x: (-x[1], x[0]))
             rec_layer, rec_confidence = candidates[0]
             ambiguous = False
         elif partial_candidates:
-            # Pick highest coverage, then confidence
-            partial_candidates.sort(key=lambda x: (-x[2], -x[1]))
+            # Pick highest coverage, then confidence, then alphabetical
+            partial_candidates.sort(key=lambda x: (-x[2], -x[1], x[0]))
             rec_layer, rec_confidence, coverage = partial_candidates[0]
             ambiguous = True
         else:
@@ -3729,29 +3734,34 @@ class GraphDB:
         naming_pattern = naming.get("pattern", "")
 
         # --- Recommended path ---
-        # Derive path from existing models in that layer
-        path_row = self._execute_read(
+        # Derive path from existing models in that layer (cursor iteration)
+        path_cursor = self._execute_read(
             "SELECT f.path FROM nodes n "
             "JOIN files f ON n.file_id = f.file_id "
             "WHERE n.kind IN ('table', 'view')"
             + (" AND f.repo_id = ?" if repo_id is not None else ""),
             [repo_id] if repo_id is not None else [],
-        ).fetchall()
+        )
 
         rec_path = ""
-        for (fpath,) in path_row:
+        while True:
+            path_row = path_cursor.fetchone()
+            if path_row is None:
+                break
+            fpath = path_row[0]
             layer_name = self._extract_layer(fpath)
             if layer_name == rec_layer:
-                # Take directory portion
                 parts = fpath.replace("\\", "/").split("/")
-                rec_path = "/".join(parts[:-1]) + "/"
+                if len(parts) > 1:
+                    rec_path = "/".join(parts[:-1]) + "/"
                 break
 
         # --- Name validation ---
         name_feedback: dict | None = None
         if name and naming_pattern:
-            # Check if name matches the pattern prefix
-            prefix = naming_pattern.split("_")[0] + "_" if "_" in naming_pattern else ""
+            # Extract prefix: everything before the first placeholder {
+            brace_idx = naming_pattern.find("{")
+            prefix = naming_pattern[:brace_idx] if brace_idx > 0 else ""
             if prefix and not name.startswith(prefix):
                 suggested_name = prefix + name
                 name_feedback = {
@@ -3800,5 +3810,6 @@ class GraphDB:
             result["name_feedback"] = name_feedback
         if ambiguous:
             result["ambiguous"] = True
+            result["coverage"] = round(coverage, 2)
 
         return result
