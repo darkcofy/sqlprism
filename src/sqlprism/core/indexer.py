@@ -699,16 +699,48 @@ class Indexer:
             repo_id: The repo to run inference for.
             project_path: Project directory for override file discovery.
         """
+        engine = ConventionEngine(self.graph, repo_id)
+
         try:
-            engine = ConventionEngine(self.graph, repo_id)
-            return engine.run_inference(project_path=project_path)
+            result = engine.run_inference(project_path=project_path)
         except Exception as e:
             logger.warning(
                 "Convention inference failed for repo %d: %s",
                 repo_id,
                 e,
             )
-            return {"layers_detected": 0, "conventions_stored": 0}
+            result = {"layers_detected": 0, "conventions_stored": 0}
+
+        # ── Semantic tag inference ──
+        try:
+            tags = engine.infer_semantic_tags()
+            self.graph.delete_repo_tags(repo_id)
+            if tags:
+                tag_dicts = [
+                    {
+                        "tag_name": t.tag_name,
+                        "node_id": t.node_id,
+                        "confidence": t.confidence,
+                        "source": t.source,
+                    }
+                    for t in tags
+                ]
+                self.graph.upsert_tags(repo_id, tag_dicts)
+            logger.info(
+                "Semantic tags: %d assigned for repo %d",
+                len(tags),
+                repo_id,
+            )
+            result["tags_assigned"] = len(tags)
+        except Exception as e:
+            logger.warning(
+                "Semantic tag inference failed for repo %d: %s",
+                repo_id,
+                e,
+            )
+            result["tags_assigned"] = 0
+
+        return result
 
     def _insert_parse_result(
         self,
