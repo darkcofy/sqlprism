@@ -2014,3 +2014,246 @@ def test_tags_computed_after_reindex():
         assert all(t["source"] == "inferred" for t in tags)
     finally:
         db.close()
+
+
+# ── Tag query methods ──
+
+
+def _setup_tagged_repo(db, repo_name, repo_path, models, tags):
+    """Helper: create a repo with models and semantic tags.
+
+    Args:
+        db: GraphDB instance.
+        repo_name: Name for the repo.
+        repo_path: Path for the repo.
+        models: List of (file_path, model_name) tuples.
+        tags: List of (model_name, tag_name, confidence) tuples.
+
+    Returns:
+        (repo_id, name_to_node_id mapping).
+    """
+    repo_id = db.upsert_repo(repo_name, repo_path)
+    name_to_id = {}
+    for i, (path, name) in enumerate(models):
+        file_id = db.insert_file(repo_id, path, "sql", f"ck_{repo_name}_{i}")
+        node_id = db.insert_node(file_id, "table", name, "sql", 1, 10)
+        name_to_id[name] = node_id
+
+    tag_rows = [
+        {
+            "tag_name": tag_name,
+            "node_id": name_to_id[model_name],
+            "confidence": confidence,
+            "source": "inferred",
+        }
+        for model_name, tag_name, confidence in tags
+    ]
+    db.upsert_tags(repo_id, tag_rows)
+    return repo_id, name_to_id
+
+
+def test_search_by_tag_ranked():
+    """query_search_by_tag returns models in descending confidence order."""
+    db = GraphDB()
+    try:
+        models = [
+            ("marts/customer_ltv.sql", "customer_ltv"),
+            ("marts/customer_segments.sql", "customer_segments"),
+            ("marts/customer_churn.sql", "customer_churn"),
+            ("marts/customer_health.sql", "customer_health"),
+        ]
+        tags = [
+            ("customer_ltv", "customer", 0.90),
+            ("customer_segments", "customer", 0.85),
+            ("customer_churn", "customer", 0.70),
+            ("customer_health", "customer", 0.65),
+        ]
+        _setup_tagged_repo(db, "test", "/tmp/test", models, tags)
+
+        result = db.query_search_by_tag(tag="customer")
+
+        assert result["tag"] == "customer"
+        assert result["total"] == 4
+        assert len(result["models"]) == 4
+
+        confidences = [m["confidence"] for m in result["models"]]
+        expected = [0.90, 0.85, 0.70, 0.65]
+        assert len(confidences) == len(expected)
+        for actual, exp in zip(confidences, expected):
+            assert abs(actual - exp) < 0.01, f"Expected ~{exp}, got {actual}"
+
+        for m in result["models"]:
+            assert "node_name" in m
+            assert "confidence" in m
+            assert "source" in m
+    finally:
+        db.close()
+
+
+def test_search_by_tag_min_confidence():
+    """query_search_by_tag with min_confidence filters out low-confidence models."""
+    db = GraphDB()
+    try:
+        models = [
+            ("marts/customer_ltv.sql", "customer_ltv"),
+            ("marts/customer_segments.sql", "customer_segments"),
+            ("marts/customer_churn.sql", "customer_churn"),
+            ("marts/customer_health.sql", "customer_health"),
+        ]
+        tags = [
+            ("customer_ltv", "customer", 0.90),
+            ("customer_segments", "customer", 0.85),
+            ("customer_churn", "customer", 0.70),
+            ("customer_health", "customer", 0.45),
+        ]
+        _setup_tagged_repo(db, "test", "/tmp/test", models, tags)
+
+        result = db.query_search_by_tag(tag="customer", min_confidence=0.5)
+
+        assert result["total"] == 3
+        assert len(result["models"]) == 3
+        assert all(m["confidence"] >= 0.5 for m in result["models"])
+        assert not any(m["node_name"] == "customer_health" for m in result["models"])
+    finally:
+        db.close()
+
+
+def test_search_by_tag_unknown():
+    """query_search_by_tag for nonexistent tag returns empty with suggestion."""
+    db = GraphDB()
+    try:
+        models = [("marts/revenue.sql", "revenue")]
+        tags = [("revenue", "finance", 0.80)]
+        _setup_tagged_repo(db, "test", "/tmp/test", models, tags)
+
+        result = db.query_search_by_tag(tag="nonexistent")
+
+        assert result["total"] == 0
+        assert result["models"] == []
+        assert "suggestion" in result
+        assert isinstance(result["suggestion"], str)
+    finally:
+        db.close()
+
+
+def test_list_tags_all():
+    """query_list_tags returns all tags with model_count and avg_confidence."""
+    db = GraphDB()
+    try:
+        models = [
+            ("marts/customer_ltv.sql", "customer_ltv"),
+            ("marts/customer_segments.sql", "customer_segments"),
+            ("marts/customer_churn.sql", "customer_churn"),
+            ("marts/customer_health.sql", "customer_health"),
+            ("marts/order_summary.sql", "order_summary"),
+            ("marts/order_daily.sql", "order_daily"),
+            ("marts/order_weekly.sql", "order_weekly"),
+        ]
+        tags = [
+            ("customer_ltv", "customer", 0.90),
+            ("customer_segments", "customer", 0.85),
+            ("customer_churn", "customer", 0.70),
+            ("customer_health", "customer", 0.65),
+            ("order_summary", "order", 0.88),
+            ("order_daily", "order", 0.80),
+            ("order_weekly", "order", 0.72),
+        ]
+        _setup_tagged_repo(db, "test", "/tmp/test", models, tags)
+
+        result = db.query_list_tags()
+
+        assert "tags" in result
+        assert len(result["tags"]) == 2
+
+        tag_map = {t["tag_name"]: t for t in result["tags"]}
+        assert "customer" in tag_map
+        assert "order" in tag_map
+
+        assert tag_map["customer"]["model_count"] == 4
+        assert tag_map["order"]["model_count"] == 3
+
+        assert abs(tag_map["customer"]["avg_confidence"] - 0.775) < 0.01
+        assert abs(tag_map["order"]["avg_confidence"] - 0.80) < 0.01
+    finally:
+        db.close()
+
+
+def test_list_tags_empty():
+    """query_list_tags on repo with no tags returns empty with suggestion."""
+    db = GraphDB()
+    try:
+        db.upsert_repo("test", "/tmp/test")
+
+        result = db.query_list_tags()
+
+        assert result["tags"] == []
+        assert "suggestion" in result
+        assert isinstance(result["suggestion"], str)
+    finally:
+        db.close()
+
+
+def test_tags_repo_filter():
+    """Tag queries filter by repo when repo parameter is provided."""
+    db = GraphDB()
+    try:
+        # Set up project_a
+        models_a = [
+            ("marts/customer_ltv.sql", "customer_ltv"),
+            ("marts/customer_segments.sql", "customer_segments"),
+        ]
+        tags_a = [
+            ("customer_ltv", "customer", 0.90),
+            ("customer_segments", "customer", 0.85),
+        ]
+        _setup_tagged_repo(db, "project_a", "/tmp/project_a", models_a, tags_a)
+
+        # Set up project_b
+        models_b = [
+            ("marts/order_summary.sql", "order_summary"),
+            ("marts/order_daily.sql", "order_daily"),
+        ]
+        tags_b = [
+            ("order_summary", "order", 0.88),
+            ("order_daily", "order", 0.80),
+        ]
+        _setup_tagged_repo(db, "project_b", "/tmp/project_b", models_b, tags_b)
+
+        # list_tags filtered to project_a
+        result_tags = db.query_list_tags(repo="project_a")
+        tag_names = {t["tag_name"] for t in result_tags["tags"]}
+        assert "customer" in tag_names
+        assert "order" not in tag_names
+
+        # search_by_tag filtered to project_a
+        result_search = db.query_search_by_tag(tag="customer", repo="project_a")
+        assert result_search["total"] == 2
+        assert all(m["node_name"].startswith("customer_") for m in result_search["models"])
+
+        # search_by_tag for tag that only exists in project_b, filtered to project_a
+        result_empty = db.query_search_by_tag(tag="order", repo="project_a")
+        assert result_empty["total"] == 0
+    finally:
+        db.close()
+
+
+def test_search_by_tag_repo_not_found():
+    """query_search_by_tag returns error when repo name doesn't exist."""
+    db = GraphDB()
+    try:
+        result = db.query_search_by_tag(tag="customer", repo="nonexistent")
+        assert "error" in result
+        assert "nonexistent" in result["error"]
+    finally:
+        db.close()
+
+
+def test_list_tags_repo_not_found():
+    """query_list_tags returns error when repo name doesn't exist."""
+    db = GraphDB()
+    try:
+        result = db.query_list_tags(repo="nonexistent")
+        assert "error" in result
+        assert "nonexistent" in result["error"]
+    finally:
+        db.close()
