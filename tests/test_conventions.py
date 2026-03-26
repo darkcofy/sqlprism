@@ -2578,3 +2578,207 @@ def test_find_similar_repo_not_found():
         assert "not found" in result["error"]
     finally:
         db.close()
+
+
+# ── Suggest placement ──
+
+
+def _setup_placement_repo(db: GraphDB) -> tuple[int, dict[str, int]]:
+    """Set up a repo with layers, edges, and conventions for placement tests.
+
+    Creates: raw (2), staging (3), intermediate (2), marts (2).
+    Inserts naming and references conventions for each layer.
+    Returns (repo_id, {model_name: node_id}).
+    """
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    nodes = {}
+    models = [
+        ("models/raw/raw_orders.sql", "raw_orders"),
+        ("models/raw/raw_payments.sql", "raw_payments"),
+        ("models/staging/stg_orders.sql", "stg_orders"),
+        ("models/staging/stg_payments.sql", "stg_payments"),
+        ("models/staging/stg_customers.sql", "stg_customers"),
+        ("models/intermediate/int_order_payments.sql", "int_order_payments"),
+        ("models/intermediate/int_customer_orders.sql", "int_customer_orders"),
+        ("models/marts/revenue.sql", "revenue"),
+        ("models/marts/customer_ltv.sql", "customer_ltv"),
+    ]
+    for i, (path, name) in enumerate(models):
+        fid = db.insert_file(repo_id, path, "sql", f"ck_{i}")
+        nid = db.insert_node(fid, "table", name, "sql", 1, 10)
+        nodes[name] = nid
+
+    # Edges: staging -> raw
+    db.insert_edge(nodes["stg_orders"], nodes["raw_orders"], "references")
+    db.insert_edge(nodes["stg_payments"], nodes["raw_payments"], "references")
+    db.insert_edge(nodes["stg_customers"], nodes["raw_orders"], "references")
+
+    # Edges: intermediate -> staging
+    db.insert_edge(nodes["int_order_payments"], nodes["stg_orders"], "references")
+    db.insert_edge(nodes["int_order_payments"], nodes["stg_payments"], "references")
+    db.insert_edge(nodes["int_customer_orders"], nodes["stg_orders"], "references")
+    db.insert_edge(nodes["int_customer_orders"], nodes["stg_customers"], "references")
+
+    # Edges: marts -> intermediate
+    db.insert_edge(nodes["revenue"], nodes["int_order_payments"], "references")
+    db.insert_edge(nodes["customer_ltv"], nodes["int_customer_orders"], "references")
+
+    # Insert conventions
+    def _insert_conv(layer, conv_type, payload, confidence, model_count):
+        db._execute_write(
+            "INSERT INTO conventions "
+            "(repo_id, layer, convention_type, payload, confidence, source, model_count) "
+            "VALUES (?, ?, ?, ?, ?, 'inferred', ?)",
+            [repo_id, layer, conv_type, json.dumps(payload), confidence, model_count],
+        )
+
+    # Naming conventions
+    _insert_conv("staging", "naming", {"pattern": "stg_{source}_{entity}"}, 0.9, 3)
+    _insert_conv("intermediate", "naming", {"pattern": "int_{domain}_{description}"}, 0.85, 2)
+    _insert_conv("marts", "naming", {"pattern": "{entity}"}, 0.8, 2)
+
+    # Reference rules
+    _insert_conv("staging", "references", {
+        "allowed_targets": ["raw"],
+        "target_distribution": {"raw": 1.0},
+    }, 1.0, 3)
+    _insert_conv("intermediate", "references", {
+        "allowed_targets": ["staging"],
+        "target_distribution": {"staging": 1.0},
+    }, 0.9, 2)
+    _insert_conv("marts", "references", {
+        "allowed_targets": ["intermediate"],
+        "target_distribution": {"intermediate": 1.0},
+    }, 0.85, 2)
+
+    return repo_id, nodes
+
+
+def test_suggest_placement_intermediate():
+    """Suggest intermediate layer for staging references."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        result = db.query_suggest_placement(
+            references=["stg_orders", "stg_payments"]
+        )
+
+        assert "error" not in result
+        assert result["recommended_layer"] == "intermediate"
+        assert "intermediate" in result["recommended_path"]
+        assert result["naming_pattern"] == "int_{domain}_{description}"
+        assert "staging" in result["reason"]
+        assert "confidence" in result["reason"]
+    finally:
+        db.close()
+
+
+def test_suggest_placement_marts():
+    """Suggest marts layer for intermediate references."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        result = db.query_suggest_placement(
+            references=["int_order_payments", "int_customer_orders"]
+        )
+
+        assert "error" not in result
+        assert result["recommended_layer"] == "marts"
+        assert "marts" in result["recommended_path"]
+    finally:
+        db.close()
+
+
+def test_suggest_placement_name_validation():
+    """Validate proposed name against layer naming convention."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        result = db.query_suggest_placement(
+            references=["stg_orders", "stg_payments"],
+            name="orders_joined",
+        )
+
+        assert "error" not in result
+        assert result["recommended_layer"] == "intermediate"
+        feedback = result["name_feedback"]
+        assert feedback["matches_convention"] is False
+        assert "int_" in feedback["suggested_name"]
+    finally:
+        db.close()
+
+
+def test_suggest_placement_name_matches():
+    """Name already matches the layer naming convention."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        result = db.query_suggest_placement(
+            references=["stg_orders", "stg_payments"],
+            name="int_orders_joined",
+        )
+
+        assert "error" not in result
+        feedback = result["name_feedback"]
+        assert feedback["matches_convention"] is True
+    finally:
+        db.close()
+
+
+def test_suggest_placement_ambiguous():
+    """Mixed-layer references produce an ambiguous recommendation."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        # References from both staging and intermediate — no single rule matches all
+        result = db.query_suggest_placement(
+            references=["stg_orders", "int_customer_orders"]
+        )
+
+        assert "error" not in result
+        assert result.get("ambiguous") is True
+        assert result["recommended_layer"] in ("intermediate", "marts")
+        assert "Mixed" in result["reason"] or "most likely" in result["reason"]
+    finally:
+        db.close()
+
+
+def test_suggest_placement_similar():
+    """Similar models included in response."""
+    db = GraphDB()
+    try:
+        _setup_placement_repo(db)
+
+        result = db.query_suggest_placement(
+            references=["stg_orders", "stg_payments"]
+        )
+
+        assert "error" not in result
+        assert "similar_models" in result
+        assert isinstance(result["similar_models"], list)
+        # int_order_payments references the same stg_orders + stg_payments
+        assert "int_order_payments" in result["similar_models"]
+    finally:
+        db.close()
+
+
+def test_suggest_placement_no_conventions():
+    """Helpful message when conventions have not been inferred yet."""
+    db = GraphDB()
+    try:
+        # Set up models but no conventions
+        repo_id = db.upsert_repo("test", "/tmp/test")
+        fid = db.insert_file(repo_id, "models/staging/stg_orders.sql", "sql", "ck_0")
+        db.insert_node(fid, "table", "stg_orders", "sql", 1, 10)
+
+        result = db.query_suggest_placement(references=["stg_orders"])
+
+        assert "error" in result
+        assert "conventions" in result["error"].lower() or "refresh" in result["error"].lower()
+    finally:
+        db.close()
