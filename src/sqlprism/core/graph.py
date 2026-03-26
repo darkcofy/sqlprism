@@ -3585,3 +3585,231 @@ class GraphDB:
             "count": len(similar),
             "total_matches": total_matches,
         }
+
+    # ── Suggest placement ──
+
+    def query_suggest_placement(
+        self,
+        references: list[str],
+        name: str | None = None,
+        repo: str | None = None,
+    ) -> dict:
+        """Suggest where to place a new model based on its references.
+
+        Determines which layers the referenced models belong to, finds the
+        convention rule that allows those layers as inputs, and recommends
+        placement in that layer with its naming pattern.
+
+        Args:
+            references: Tables this new model will reference.
+            name: Proposed model name (for naming validation).
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``recommended_layer``, ``recommended_path``,
+            ``naming_pattern``, ``reason``, ``similar_models``, and
+            optionally ``name_feedback``.
+        """
+        if not references:
+            return {"error": "Provide at least one reference table."}
+
+        # --- Repo resolution ---
+        repo_id = None
+        if repo:
+            row = self._execute_read(
+                "SELECT repo_id FROM repos WHERE name = ?", [repo]
+            ).fetchone()
+            if not row:
+                return {"error": f"Repo '{repo}' not found"}
+            repo_id = row[0]
+
+        # --- Check conventions exist ---
+        conv_sql = (
+            "SELECT layer, convention_type, payload, confidence "
+            "FROM conventions"
+        )
+        conv_params: list = []
+        if repo_id is not None:
+            conv_sql += " WHERE repo_id = ?"
+            conv_params.append(repo_id)
+        conv_rows = self._execute_read(conv_sql, conv_params).fetchall()
+
+        if not conv_rows:
+            return {
+                "error": "No conventions found. Run reindex or "
+                "`sqlprism conventions --refresh` first."
+            }
+
+        # --- Parse conventions into lookup structures ---
+        # naming: layer -> {pattern, confidence}
+        # references: layer -> {allowed_targets: [...], confidence}
+        # path_patterns: layer -> path_pattern
+        naming_by_layer: dict[str, dict] = {}
+        refs_by_layer: dict[str, dict] = {}
+
+        for layer, conv_type, payload, confidence in conv_rows:
+            try:
+                parsed = json.loads(payload) if isinstance(payload, str) else payload
+            except (json.JSONDecodeError, TypeError):
+                parsed = {}
+
+            if conv_type == "naming":
+                naming_by_layer[layer] = {
+                    "pattern": parsed.get("pattern", ""),
+                    "confidence": confidence,
+                }
+            elif conv_type == "references":
+                refs_by_layer[layer] = {
+                    "allowed_targets": parsed.get("allowed_targets", []),
+                    "distribution": parsed.get("target_distribution", {}),
+                    "confidence": confidence,
+                }
+
+        # --- Determine layers of referenced models (batched) ---
+        ref_layers: dict[str, str] = {}  # ref_name -> layer
+        placeholders = ",".join("?" * len(references))
+        ref_params: list = list(references)
+        ref_sql = (
+            "SELECT n.name, f.path FROM nodes n "
+            "JOIN files f ON n.file_id = f.file_id "
+            f"WHERE n.name IN ({placeholders}) "
+            "AND n.kind IN ('table', 'view')"
+        )
+        if repo_id is not None:
+            ref_sql += " AND f.repo_id = ?"
+            ref_params.append(repo_id)
+        for ref_name, fpath in self._execute_read(ref_sql, ref_params).fetchall():
+            layer = self._extract_layer(fpath)
+            if layer:  # skip models with no identifiable layer
+                ref_layers[ref_name] = layer
+
+        if not ref_layers:
+            return {
+                "error": "None of the referenced models were found in the index.",
+                "references": references,
+            }
+
+        ref_layer_set = set(ref_layers.values())
+
+        # --- Find the layer whose reference rule allows these ref layers ---
+        # A candidate layer is one whose allowed_targets include ALL ref layers
+        candidates: list[tuple[str, float]] = []  # (layer, confidence)
+        for layer, rule in refs_by_layer.items():
+            allowed = set(rule["allowed_targets"])
+            if ref_layer_set <= allowed:
+                candidates.append((layer, rule["confidence"]))
+
+        # Also consider layers that partially match (for ambiguous case)
+        partial_candidates: list[tuple[str, float, float]] = []
+        if not candidates:
+            for layer, rule in refs_by_layer.items():
+                allowed = set(rule["allowed_targets"])
+                overlap = ref_layer_set & allowed
+                if overlap:
+                    coverage = len(overlap) / len(ref_layer_set)
+                    partial_candidates.append(
+                        (layer, rule["confidence"], coverage)
+                    )
+
+        # --- Build recommendation ---
+        if candidates:
+            # Pick highest confidence, break ties alphabetically
+            candidates.sort(key=lambda x: (-x[1], x[0]))
+            rec_layer, rec_confidence = candidates[0]
+            ambiguous = False
+        elif partial_candidates:
+            # Pick highest coverage, then confidence, then alphabetical
+            partial_candidates.sort(key=lambda x: (-x[2], -x[1], x[0]))
+            rec_layer, rec_confidence, coverage = partial_candidates[0]
+            ambiguous = True
+        else:
+            return {
+                "error": "Could not determine placement — no convention "
+                "rules match the referenced layers.",
+                "ref_layers": sorted(ref_layer_set),
+            }
+
+        # --- Naming pattern ---
+        naming = naming_by_layer.get(rec_layer, {})
+        naming_pattern = naming.get("pattern", "")
+
+        # --- Recommended path ---
+        # Derive path from existing models in that layer (cursor iteration)
+        path_cursor = self._execute_read(
+            "SELECT f.path FROM nodes n "
+            "JOIN files f ON n.file_id = f.file_id "
+            "WHERE n.kind IN ('table', 'view')"
+            + (" AND f.repo_id = ?" if repo_id is not None else ""),
+            [repo_id] if repo_id is not None else [],
+        )
+
+        rec_path = ""
+        while True:
+            path_row = path_cursor.fetchone()
+            if path_row is None:
+                break
+            fpath = path_row[0]
+            layer_name = self._extract_layer(fpath)
+            if layer_name == rec_layer:
+                parts = fpath.replace("\\", "/").split("/")
+                if len(parts) > 1:
+                    rec_path = "/".join(parts[:-1]) + "/"
+                break
+
+        # --- Name validation ---
+        name_feedback: dict | None = None
+        if name and naming_pattern:
+            # Extract prefix: everything before the first placeholder {
+            brace_idx = naming_pattern.find("{")
+            prefix = naming_pattern[:brace_idx] if brace_idx > 0 else ""
+            if prefix and not name.startswith(prefix):
+                suggested_name = prefix + name
+                name_feedback = {
+                    "matches_convention": False,
+                    "suggested_name": suggested_name,
+                    "reason": f"Convention for {rec_layer} is "
+                    f"'{naming_pattern}' — name should start "
+                    f"with '{prefix}'",
+                }
+            else:
+                name_feedback = {
+                    "matches_convention": True,
+                    "reason": f"Name matches the {rec_layer} naming "
+                    f"convention '{naming_pattern}'",
+                }
+
+        # --- Similar models ---
+        similar_result = self.query_find_similar_models(
+            references=references, limit=3, repo=repo,
+        )
+        similar_models = [
+            m["name"] for m in similar_result.get("similar", [])
+        ]
+
+        # --- Build reason ---
+        ref_layer_str = ", ".join(sorted(ref_layer_set))
+        reason = (
+            f"References {ref_layer_str} models → {rec_layer} layer "
+            f"per project conventions (confidence: {rec_confidence:.2f})"
+        )
+        if ambiguous:
+            reason = (
+                f"Mixed references from {ref_layer_str} — "
+                f"most likely {rec_layer} layer based on partial "
+                f"convention match (confidence: {rec_confidence:.2f})"
+            )
+
+        result: dict = {
+            "recommended_layer": rec_layer,
+            "recommended_path": rec_path,
+            "naming_pattern": naming_pattern,
+            "reason": reason,
+            "similar_models": similar_models,
+        }
+        if name_feedback:
+            result["name_feedback"] = name_feedback
+        if ambiguous:
+            result["ambiguous"] = True
+            result["coverage"] = round(coverage, 2)
+
+        return result

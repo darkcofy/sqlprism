@@ -983,6 +983,46 @@ async def find_similar_models(params: FindSimilarModelsInput) -> dict:
     )
 
 
+class SuggestPlacementInput(BaseModel):
+    references: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Tables this new model will reference (e.g. ['stg_orders', 'stg_payments']).",
+    )
+    name: str | None = Field(
+        None,
+        description="Proposed model name — will be validated against layer naming conventions.",
+    )
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to search all repos.",
+    )
+
+
+@mcp.tool(
+    name="suggest_placement",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def suggest_placement(params: SuggestPlacementInput) -> dict:
+    """Suggest where to place a new model based on its references.
+
+    Uses inferred layer flow rules and naming conventions to recommend the
+    right layer, directory, and model name. Returns similar existing models
+    to help avoid duplicate work.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_suggest_placement,
+        references=params.references,
+        name=params.name,
+        repo=params.repo,
+    )
+
+
 class ReindexInput(BaseModel):
     repo: str | None = Field(None, description="Specific repo to reindex. Omit for all repos.")
 
