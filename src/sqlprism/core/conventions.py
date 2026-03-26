@@ -1260,7 +1260,7 @@ class ConventionEngine:
 
             for node_id, model_name in cluster.members:
                 confidence = self._compute_member_confidence(
-                    node_id, model_name, tag_name, cluster, label_confidence,
+                    node_id, model_name, tag_name, cluster,
                 )
 
                 # Stability: keep existing tag if still above threshold
@@ -1287,16 +1287,21 @@ class ConventionEngine:
         return assignments
 
     def _get_model_references(self) -> dict[int, set[int]]:
-        """Query upstream references for each model in the repo.
+        """Query upstream references for each table/view in the repo.
+
+        For directly-inserted edges (test helpers, dbt/sqlmesh), tables
+        have ``references`` edges directly.  For parsed SQL, a ``query``
+        node holds the ``references`` edge and a separate ``defines``
+        edge points to the table.  This query handles both patterns by
+        unioning direct table refs with query-mediated refs.
 
         Returns:
-            Dict mapping node_id to set of upstream (target) node_ids.
+            Dict mapping table/view node_id to set of upstream node_ids.
         """
-        rows = self.db._execute_read(
+        # 1) Direct: table/view → references → target
+        rows_direct = self.db._execute_read(
             """
-            SELECT
-                e.source_id,
-                e.target_id
+            SELECT e.source_id, e.target_id
             FROM edges e
             JOIN nodes sn ON e.source_id = sn.node_id
             JOIN files sf ON sn.file_id = sf.file_id
@@ -1307,9 +1312,30 @@ class ConventionEngine:
             [self.repo_id],
         ).fetchall()
 
+        # 2) Query-mediated: query → defines → table, query → references → target
+        #    Map each table to the refs of the query that defines it.
+        rows_query = self.db._execute_read(
+            """
+            SELECT def_e.target_id AS table_id, ref_e.target_id AS ref_id
+            FROM edges def_e
+            JOIN edges ref_e ON def_e.source_id = ref_e.source_id
+            JOIN nodes qn ON def_e.source_id = qn.node_id
+            JOIN nodes tn ON def_e.target_id = tn.node_id
+            JOIN files tf ON tn.file_id = tf.file_id
+            WHERE tf.repo_id = ?
+              AND def_e.relationship = 'defines'
+              AND ref_e.relationship IN ('references', 'cte_references')
+              AND qn.kind = 'query'
+              AND tn.kind IN ('table', 'view')
+            """,
+            [self.repo_id],
+        ).fetchall()
+
         ref_sets: dict[int, set[int]] = {}
-        for source_id, target_id in rows:
+        for source_id, target_id in rows_direct:
             ref_sets.setdefault(source_id, set()).add(target_id)
+        for table_id, ref_id in rows_query:
+            ref_sets.setdefault(table_id, set()).add(ref_id)
 
         return ref_sets
 
@@ -1318,10 +1344,7 @@ class ConventionEngine:
         """Compute Jaccard similarity between two sets."""
         if not a and not b:
             return 0.0
-        union = a | b
-        if not union:
-            return 0.0
-        return len(a & b) / len(union)
+        return len(a & b) / len(a | b)
 
     def _agglomerative_cluster(
         self,
@@ -1344,6 +1367,14 @@ class ConventionEngine:
         # Get model names for cluster members
         node_ids = list(ref_sets)
         if not node_ids:
+            return []
+
+        if len(node_ids) > 500:
+            logger.warning(
+                "Skipping clustering: %d models exceeds 500-model limit "
+                "(O(n³) cost). Consider filtering by layer.",
+                len(node_ids),
+            )
             return []
 
         placeholders = ",".join(["?"] * len(node_ids))
@@ -1458,7 +1489,6 @@ class ConventionEngine:
         model_name: str,
         tag_name: str,
         cluster: Cluster,
-        label_confidence: float,
     ) -> float:
         """Compute per-model confidence within a tagged cluster.
 
@@ -1501,32 +1531,30 @@ class ConventionEngine:
     def _description_bonus(
         self, node_id: int, tag_name: str
     ) -> float:
-        """Check if a model's description mentions the tag name.
+        """Check if a model's column descriptions mention the tag name.
 
-        Returns 0.10 if it does, 0.0 otherwise. Queries the nodes
-        table for a description field (dbt models may have one).
+        Returns 0.10 if any column description contains the tag name,
+        0.0 otherwise.  Queries the ``columns`` table which carries
+        ``description`` from dbt/sqlmesh schema YAML.
         """
-        try:
-            rows = self.db._execute_read(
-                """
-                SELECT description
-                FROM nodes
-                WHERE node_id = ?
-                  AND description IS NOT NULL
-                  AND description != ''
-                """,
-                [node_id],
-            ).fetchall()
-        except Exception:
-            # description column may not exist in all schemas
-            return 0.0
+        rows = self.db._execute_read(
+            """
+            SELECT description
+            FROM columns
+            WHERE node_id = ?
+              AND description IS NOT NULL
+              AND description != ''
+            """,
+            [node_id],
+        ).fetchall()
 
         if not rows:
             return 0.0
 
-        desc = rows[0][0]
-        if isinstance(desc, str) and tag_name.lower() in desc.lower():
-            return 0.10
+        tag_lower = tag_name.lower()
+        for (desc,) in rows:
+            if isinstance(desc, str) and tag_lower in desc.lower():
+                return 0.10
         return 0.0
 
     def _check_tag_stability(

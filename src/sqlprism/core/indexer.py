@@ -16,7 +16,7 @@ import subprocess
 from collections import OrderedDict
 from pathlib import Path
 
-from sqlprism.core.conventions import ConventionEngine
+from sqlprism.core.conventions import ConventionEngine, TagAssignment
 from sqlprism.core.graph import GraphDB
 from sqlprism.languages import SQL_EXTENSIONS, is_sql_file
 from sqlprism.languages.sql import SqlParser
@@ -713,7 +713,22 @@ class Indexer:
 
         # ── Semantic tag inference ──
         try:
-            tags = engine.infer_semantic_tags()
+            # Fetch existing tags for stability (anti-flap) logic
+            existing_rows = self.graph.get_tags(repo_id)
+            existing_tags = [
+                TagAssignment(
+                    tag_name=r["tag_name"],
+                    node_id=r["node_id"],
+                    model_name=r["node_name"],
+                    confidence=r["confidence"],
+                    source=r["source"],
+                )
+                for r in existing_rows
+            ]
+
+            tags = engine.infer_semantic_tags(
+                existing_tags=existing_tags or None,
+            )
             self.graph.delete_repo_tags(repo_id)
             if tags:
                 tag_dicts = [

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from sqlprism.core.conventions import ConventionEngine, Layer
 from sqlprism.core.graph import GraphDB
+from sqlprism.core.indexer import Indexer
 
 
 def _setup_repo(db: GraphDB, file_paths: list[tuple[str, str]]) -> int:
@@ -1522,26 +1523,54 @@ def test_clustering_shared_refs():
 
 
 def test_clustering_no_overlap():
-    """With < 5 models and no shared refs, clustering is skipped."""
+    """Models with no shared references end up in separate clusters."""
     db = GraphDB()
     try:
+        # Two disjoint groups of 3 models each, sharing refs only within
+        # their group.  6 models with refs total (>= 5 threshold).
         models = [
-            ("models/marts/revenue.sql", "marts.revenue"),
-            ("models/marts/customers.sql", "marts.customers"),
+            # Group A: revenue models → all ref stg_payments
+            ("models/marts/revenue_daily.sql", "revenue_daily"),
+            ("models/marts/revenue_monthly.sql", "revenue_monthly"),
+            ("models/marts/revenue_summary.sql", "revenue_summary"),
             ("models/staging/stg_payments.sql", "stg_payments"),
+            # Group B: customer models → all ref stg_users
+            ("models/marts/customer_ltv.sql", "customer_ltv"),
+            ("models/marts/customer_segments.sql", "customer_segments"),
+            ("models/marts/customer_churn.sql", "customer_churn"),
             ("models/staging/stg_users.sql", "stg_users"),
         ]
         edges = [
-            ("marts.revenue", "stg_payments"),
-            ("marts.customers", "stg_users"),
+            ("revenue_daily", "stg_payments"),
+            ("revenue_monthly", "stg_payments"),
+            ("revenue_summary", "stg_payments"),
+            ("customer_ltv", "stg_users"),
+            ("customer_segments", "stg_users"),
+            ("customer_churn", "stg_users"),
         ]
 
-        repo_id, _name_to_id = _setup_models_with_edges(db, models, edges)
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
         engine = ConventionEngine(db, repo_id)
-        tags = engine.infer_semantic_tags()
+        tags = engine.infer_semantic_tags(threshold=0.5)
 
-        # Only 2 models have refs, which is < 5 → clustering skipped
-        assert tags == []
+        # Should produce two distinct tag names — one per group
+        revenue_ids = {
+            name_to_id["revenue_daily"],
+            name_to_id["revenue_monthly"],
+            name_to_id["revenue_summary"],
+        }
+        customer_ids = {
+            name_to_id["customer_ltv"],
+            name_to_id["customer_segments"],
+            name_to_id["customer_churn"],
+        }
+        revenue_tags = {t.tag_name for t in tags if t.node_id in revenue_ids}
+        customer_tags = {t.tag_name for t in tags if t.node_id in customer_ids}
+        assert len(revenue_tags) == 1, f"Expected one tag for revenue group, got {revenue_tags}"
+        assert len(customer_tags) == 1, f"Expected one tag for customer group, got {customer_tags}"
+        assert revenue_tags != customer_tags, (
+            f"Groups should have different tags: revenue={revenue_tags}, customer={customer_tags}"
+        )
     finally:
         db.close()
 
@@ -1588,12 +1617,9 @@ def test_auto_label_token_frequency():
 
 
 def test_description_signal_boost():
-    """Description containing the tag name boosts confidence by +0.1."""
+    """Column description containing the tag name boosts confidence by +0.1."""
     db = GraphDB()
     try:
-        # Add description column to nodes table (not in default schema)
-        db.conn.execute("ALTER TABLE nodes ADD COLUMN description TEXT")
-
         # Use a model whose name does NOT contain "customer" so the name
         # bonus is absent, leaving room for the description boost to be
         # observable (confidence is capped at 1.0).
@@ -1615,7 +1641,7 @@ def test_description_signal_boost():
 
         repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
 
-        # First run: no descriptions → baseline confidence
+        # First run: no column descriptions → baseline confidence
         engine = ConventionEngine(db, repo_id)
         tags_no_desc = engine.infer_semantic_tags(threshold=0.5)
 
@@ -1627,13 +1653,15 @@ def test_description_signal_boost():
         )
         assert baseline is not None, "Expected a tag for marts.loyalty_score"
 
-        # Add description mentioning the cluster's tag name ("customer")
+        # Add a column with description mentioning the tag name ("customer")
+        # via the columns table (where dbt schema.yml descriptions land).
         db.conn.execute(
-            "UPDATE nodes SET description = ? WHERE node_id = ?",
-            ["Customer loyalty and retention score", target_id],
+            "INSERT INTO columns (node_id, column_name, data_type, position, source, description) "
+            "VALUES (?, 'score', 'FLOAT', 1, 'definition', ?)",
+            [target_id, "Customer loyalty and retention score"],
         )
 
-        # Second run: with description → boosted confidence
+        # Second run: with column description → boosted confidence
         tags_with_desc = engine.infer_semantic_tags(threshold=0.5)
         boosted = next(
             (t.confidence for t in tags_with_desc if t.node_id == target_id), None
@@ -1772,9 +1800,16 @@ def test_tag_confidence_edge_member():
             (t for t in tags if t.node_id == name_to_id["loyalty_score"]), None
         )
         assert edge_tag is not None, "Expected tag for loyalty_score"
-        # Should be close to 0.60-0.62 (edge member, no name bonus)
-        assert 0.58 <= edge_tag.confidence <= 0.65, (
-            f"Expected ~0.60 confidence for edge member, got {edge_tag.confidence}"
+        # Edge member: lower than core members, but above threshold
+        core_tag = next(
+            (t for t in tags if t.node_id == name_to_id["customer_ltv"]), None
+        )
+        assert core_tag is not None, "Expected tag for customer_ltv (core member)"
+        assert edge_tag.confidence < core_tag.confidence, (
+            f"Edge ({edge_tag.confidence}) should be < core ({core_tag.confidence})"
+        )
+        assert edge_tag.confidence >= 0.55, (
+            f"Edge member should have confidence >= 0.55, got {edge_tag.confidence}"
         )
     finally:
         db.close()
@@ -1835,6 +1870,17 @@ def test_tag_storage_upsert():
         stored_set = {(r["tag_name"], r["node_id"]) for r in stored}
         expected_set = {(t.tag_name, t.node_id) for t in tags}
         assert stored_set == expected_set
+
+        # Test UPDATE path: modify confidence and upsert again
+        for td in tag_dicts:
+            td["confidence"] = 0.50
+        db.upsert_tags(repo_id, tag_dicts)
+        updated = db.get_tags(repo_id)
+        assert len(updated) == len(tags), "Row count should not change on update"
+        for row in updated:
+            assert row["confidence"] == 0.50, (
+                f"Expected updated confidence 0.50, got {row['confidence']}"
+            )
     finally:
         db.close()
 
@@ -1926,5 +1972,45 @@ def test_clustering_skip_small_repo():
 
         # Only 3 models have refs, which is < 5 → clustering skipped
         assert tags == []
+    finally:
+        db.close()
+
+
+def test_tags_computed_after_reindex():
+    """Semantic tags are computed and stored after reindex alongside conventions.
+
+    Uses direct graph setup + _run_convention_inference to test the
+    integration path, since the SQL parser creates separate phantom
+    nodes per file (no shared target node_ids for Jaccard).
+    """
+    db = GraphDB()
+    try:
+        indexer = Indexer(db)
+
+        # Set up a repo with 5+ models sharing a common ref (same as unit tests)
+        models = [
+            ("models/marts/customer_ltv.sql", "customer_ltv"),
+            ("models/marts/customer_segments.sql", "customer_segments"),
+            ("models/marts/customer_activity.sql", "customer_activity"),
+            ("models/marts/customer_churn.sql", "customer_churn"),
+            ("models/marts/customer_health.sql", "customer_health"),
+            ("models/staging/stg_users.sql", "stg_users"),
+        ]
+        repo_id, _name_to_id = _setup_models_with_edges(db, models, [
+            ("customer_ltv", "stg_users"),
+            ("customer_segments", "stg_users"),
+            ("customer_activity", "stg_users"),
+            ("customer_churn", "stg_users"),
+            ("customer_health", "stg_users"),
+        ])
+
+        # Call the reindex integration path that runs both conventions + tags
+        indexer._run_convention_inference(repo_id, project_path="/tmp/test")
+
+        # Tags should have been computed and stored
+        tags = db.get_tags(repo_id)
+        assert len(tags) > 0, "Expected semantic tags to be stored after reindex"
+        assert all(t["confidence"] > 0.0 for t in tags)
+        assert all(t["source"] == "inferred" for t in tags)
     finally:
         db.close()
