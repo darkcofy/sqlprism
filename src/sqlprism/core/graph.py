@@ -3218,3 +3218,118 @@ class GraphDB:
             self._execute_write(
                 "DELETE FROM semantic_tags WHERE repo_id = ?", [repo_id],
             )
+
+    def query_search_by_tag(
+        self,
+        tag: str,
+        repo: str | None = None,
+        min_confidence: float | None = None,
+    ) -> dict:
+        """Search for models matching a semantic tag.
+
+        Args:
+            tag: Tag name to search for.
+            repo: Optional repo name filter.
+            min_confidence: Optional minimum confidence threshold (0.0-1.0).
+
+        Returns:
+            Dict with ``tag``, ``total``, and ``models`` list sorted by
+            confidence descending. Returns ``suggestion`` when no matches.
+        """
+        repo_id = None
+        if repo:
+            row = self._execute_read(
+                "SELECT repo_id FROM repos WHERE name = ?", [repo]
+            ).fetchone()
+            if not row:
+                return {"error": f"Repo '{repo}' not found"}
+            repo_id = row[0]
+
+        sql = (
+            "SELECT t.tag_name, t.node_id, n.name AS node_name, "
+            "t.confidence, t.source "
+            "FROM semantic_tags t "
+            "JOIN nodes n ON t.node_id = n.node_id "
+            "WHERE t.tag_name = ?"
+        )
+        params: list = [tag]
+
+        if repo_id is not None:
+            sql += " AND t.repo_id = ?"
+            params.append(repo_id)
+        if min_confidence is not None:
+            sql += " AND t.confidence >= ?"
+            params.append(min_confidence)
+
+        sql += " ORDER BY t.confidence DESC"
+        rows = self._execute_read(sql, params).fetchall()
+
+        if not rows:
+            return {
+                "tag": tag,
+                "total": 0,
+                "models": [],
+                "suggestion": "Run list_tags to see available tags.",
+            }
+
+        models = [
+            {
+                "name": r[2],
+                "node_id": r[1],
+                "confidence": r[3],
+                "source": r[4],
+            }
+            for r in rows
+        ]
+        return {"tag": tag, "total": len(models), "models": models}
+
+    def query_list_tags(self, repo: str | None = None) -> dict:
+        """List all semantic tags with model counts and average confidence.
+
+        Args:
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``tags`` list. Returns ``suggestion`` when empty.
+        """
+        repo_id = None
+        if repo:
+            row = self._execute_read(
+                "SELECT repo_id FROM repos WHERE name = ?", [repo]
+            ).fetchone()
+            if not row:
+                return {"error": f"Repo '{repo}' not found"}
+            repo_id = row[0]
+
+        sql = (
+            "SELECT tag_name, COUNT(*) AS model_count, "
+            "AVG(confidence) AS avg_confidence "
+            "FROM semantic_tags"
+        )
+        params: list = []
+        if repo_id is not None:
+            sql += " WHERE repo_id = ?"
+            params.append(repo_id)
+        sql += " GROUP BY tag_name ORDER BY tag_name"
+
+        rows = self._execute_read(sql, params).fetchall()
+
+        if not rows:
+            return {
+                "tags": [],
+                "suggestion": (
+                    "No semantic tags found. Run reindex or "
+                    "`sqlprism conventions --refresh` first."
+                ),
+            }
+
+        return {
+            "tags": [
+                {
+                    "tag_name": r[0],
+                    "model_count": r[1],
+                    "avg_confidence": r[2],
+                }
+                for r in rows
+            ],
+        }
