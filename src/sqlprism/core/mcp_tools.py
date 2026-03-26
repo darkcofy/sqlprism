@@ -930,6 +930,58 @@ async def list_tags(params: ListTagsInput) -> dict:
     )
 
 
+class FindSimilarModelsInput(BaseModel):
+    model_config = {"populate_by_name": True}
+    references: list[str] | None = Field(
+        None,
+        description="Tables this model will reference (e.g. ['stg_orders', 'stg_payments']).",
+    )
+    output_columns: list[str] | None = Field(
+        None,
+        description="Columns this model will output (e.g. ['customer_id', 'total_revenue']).",
+    )
+    model: str | None = Field(
+        None,
+        description="Existing model name to find similar models to.",
+    )
+    limit: int = Field(
+        5,
+        ge=1,
+        le=50,
+        description="Maximum number of similar models to return (default 5).",
+    )
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to search all repos.",
+    )
+
+
+@mcp.tool(
+    name="find_similar_models",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def find_similar_models(params: FindSimilarModelsInput) -> dict:
+    """Find existing models similar to what you're building.
+
+    Compares reference overlap, column overlap, and layer placement to find
+    models that already do something similar. Helps avoid duplicate work and
+    suggests models to extend rather than recreate.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_find_similar_models,
+        references=params.references,
+        output_columns=params.output_columns,
+        model=params.model,
+        limit=params.limit,
+        repo=params.repo,
+    )
+
+
 class ReindexInput(BaseModel):
     repo: str | None = Field(None, description="Specific repo to reindex. Omit for all repos.")
 
