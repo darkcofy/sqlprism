@@ -34,7 +34,7 @@ sqlprism status [--config PATH] [--db PATH]
 
 ### `sqlprism serve`
 
-Starts the MCP server, exposing all 19 tools to any MCP client.
+Starts the MCP server, exposing all 24 tools to any MCP client.
 
 ```bash
 sqlprism serve [--config PATH] [--db PATH] [--transport stdio|streamable-http] [--port 8000]
@@ -129,6 +129,36 @@ sqlprism reindex-dbt \
 | `--target` | No | dbt target name (e.g. `dev`, `prod`). Maps to the target in `profiles.yml`. |
 | `--profiles-dir` | No | Path to directory containing `profiles.yml`. Defaults to the project directory. |
 | `--dbt-command` | No | Base command to invoke dbt. `compile` is appended automatically. Default: `uv run dbt`. Use `dbt` if globally installed, or `uvx --with dbt-starrocks dbt` for ephemeral install. |
+
+## Convention Commands
+
+### `sqlprism conventions init`
+
+Generate a `sqlprism.conventions.yml` file from inferred conventions. Includes confidence scores as comments.
+
+```bash
+sqlprism conventions init [--config PATH] [--db PATH] [--force]
+```
+
+| Parameter | Description |
+|---|---|
+| `--force` | Overwrite existing conventions file. Without this flag, init refuses to overwrite. |
+
+### `sqlprism conventions refresh`
+
+Re-run convention inference after reindex. Preserves explicit overrides (source: 'override').
+
+```bash
+sqlprism conventions refresh [--config PATH] [--db PATH]
+```
+
+### `sqlprism conventions diff`
+
+Show what conventions changed since the last `init`. Compares the YAML file against current inferred conventions.
+
+```bash
+sqlprism conventions diff [--config PATH] [--db PATH]
+```
 
 ## Query Commands
 
