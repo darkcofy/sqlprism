@@ -1449,3 +1449,198 @@ def test_cli_conventions_init_empty(tmp_path):
         assert result.exit_code == 0
         content = Path("sqlprism.conventions.yml").read_text()
         assert "No conventions found" in content
+
+
+# ── Semantic tag inference ──
+
+
+def _setup_models_with_edges(db, models, edges):
+    """Helper: create a repo with models and edges for clustering tests.
+
+    Args:
+        db: GraphDB instance.
+        models: List of (file_path, model_name) tuples.
+        edges: List of (source_name, target_name) tuples representing references.
+
+    Returns:
+        (repo_id, name_to_node_id mapping).
+    """
+    repo_id = db.upsert_repo("test", "/tmp/test")
+    name_to_id = {}
+    for i, (path, name) in enumerate(models):
+        file_id = db.insert_file(repo_id, path, "sql", f"checksum_{i}")
+        node_id = db.insert_node(file_id, "table", name, "sql", 1, 10)
+        name_to_id[name] = node_id
+
+    for src_name, tgt_name in edges:
+        db.insert_edge(name_to_id[src_name], name_to_id[tgt_name], "references")
+
+    return repo_id, name_to_id
+
+
+def test_clustering_shared_refs():
+    """Models sharing upstream refs are grouped into the same cluster."""
+    db = GraphDB()
+    try:
+        # Need >= 5 models with refs for clustering.
+        # 3 customer models + 2 filler models all reference stg_users.
+        models = [
+            ("models/marts/customer_ltv.sql", "marts.customer_ltv"),
+            ("models/marts/customer_segments.sql", "marts.customer_segments"),
+            ("models/intermediate/int_customer_orders.sql", "int_customer_orders"),
+            ("models/marts/customer_activity.sql", "marts.customer_activity"),
+            ("models/marts/customer_churn.sql", "marts.customer_churn"),
+            ("models/staging/stg_users.sql", "stg_users"),
+        ]
+        edges = [
+            ("marts.customer_ltv", "stg_users"),
+            ("marts.customer_segments", "stg_users"),
+            ("int_customer_orders", "stg_users"),
+            ("marts.customer_activity", "stg_users"),
+            ("marts.customer_churn", "stg_users"),
+        ]
+
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags = engine.infer_semantic_tags(threshold=0.5)
+
+        # All 5 models that reference stg_users should be in the same cluster
+        customer_ids = {
+            name_to_id["marts.customer_ltv"],
+            name_to_id["marts.customer_segments"],
+            name_to_id["int_customer_orders"],
+            name_to_id["marts.customer_activity"],
+            name_to_id["marts.customer_churn"],
+        }
+        # All customer models should have the same tag
+        customer_tags = {t.tag_name for t in tags if t.node_id in customer_ids}
+        assert len(customer_tags) == 1, (
+            f"Expected all customer models in one cluster, got tags: {customer_tags}"
+        )
+    finally:
+        db.close()
+
+
+def test_clustering_no_overlap():
+    """With < 5 models and no shared refs, clustering is skipped."""
+    db = GraphDB()
+    try:
+        models = [
+            ("models/marts/revenue.sql", "marts.revenue"),
+            ("models/marts/customers.sql", "marts.customers"),
+            ("models/staging/stg_payments.sql", "stg_payments"),
+            ("models/staging/stg_users.sql", "stg_users"),
+        ]
+        edges = [
+            ("marts.revenue", "stg_payments"),
+            ("marts.customers", "stg_users"),
+        ]
+
+        repo_id, _name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags = engine.infer_semantic_tags()
+
+        # Only 2 models have refs, which is < 5 → clustering skipped
+        assert tags == []
+    finally:
+        db.close()
+
+
+def test_auto_label_token_frequency():
+    """Auto-labeling picks the most frequent token after stripping prefixes."""
+    db = GraphDB()
+    try:
+        # All models have "customer" in the name after prefix stripping.
+        models = [
+            ("models/marts/customer_ltv.sql", "marts.customer_ltv"),
+            ("models/marts/customer_segments.sql", "marts.customer_segments"),
+            ("models/intermediate/int_customer_orders.sql", "int_customer_orders"),
+            ("models/staging/stg_customer_events.sql", "stg_customer_events"),
+            ("models/marts/customer_churn.sql", "marts.customer_churn"),
+            ("models/staging/stg_users.sql", "stg_users"),
+        ]
+        edges = [
+            ("marts.customer_ltv", "stg_users"),
+            ("marts.customer_segments", "stg_users"),
+            ("int_customer_orders", "stg_users"),
+            ("stg_customer_events", "stg_users"),
+            ("marts.customer_churn", "stg_users"),
+        ]
+
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags = engine.infer_semantic_tags(threshold=0.5)
+
+        # The cluster containing the customer models should be labeled "customer"
+        customer_ids = {
+            name_to_id["marts.customer_ltv"],
+            name_to_id["marts.customer_segments"],
+            name_to_id["int_customer_orders"],
+            name_to_id["stg_customer_events"],
+            name_to_id["marts.customer_churn"],
+        }
+        tag_names = {t.tag_name for t in tags if t.node_id in customer_ids}
+        assert "customer" in tag_names, (
+            f"Expected 'customer' tag, got: {tag_names}"
+        )
+    finally:
+        db.close()
+
+
+def test_description_signal_boost():
+    """Description containing the tag name boosts confidence by +0.1."""
+    db = GraphDB()
+    try:
+        # Add description column to nodes table (not in default schema)
+        db.conn.execute("ALTER TABLE nodes ADD COLUMN description TEXT")
+
+        # Use a model whose name does NOT contain "customer" so the name
+        # bonus is absent, leaving room for the description boost to be
+        # observable (confidence is capped at 1.0).
+        models = [
+            ("models/marts/customer_ltv.sql", "marts.customer_ltv"),
+            ("models/marts/customer_segments.sql", "marts.customer_segments"),
+            ("models/intermediate/int_customer_orders.sql", "int_customer_orders"),
+            ("models/staging/stg_customer_events.sql", "stg_customer_events"),
+            ("models/marts/loyalty_score.sql", "marts.loyalty_score"),
+            ("models/staging/stg_users.sql", "stg_users"),
+        ]
+        edges = [
+            ("marts.customer_ltv", "stg_users"),
+            ("marts.customer_segments", "stg_users"),
+            ("int_customer_orders", "stg_users"),
+            ("stg_customer_events", "stg_users"),
+            ("marts.loyalty_score", "stg_users"),
+        ]
+
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+
+        # First run: no descriptions → baseline confidence
+        engine = ConventionEngine(db, repo_id)
+        tags_no_desc = engine.infer_semantic_tags(threshold=0.5)
+
+        # Pick a model whose name does NOT contain the tag token, so name
+        # bonus is 0 and baseline is lower.
+        target_id = name_to_id["marts.loyalty_score"]
+        baseline = next(
+            (t.confidence for t in tags_no_desc if t.node_id == target_id), None
+        )
+        assert baseline is not None, "Expected a tag for marts.loyalty_score"
+
+        # Add description mentioning the cluster's tag name ("customer")
+        db.conn.execute(
+            "UPDATE nodes SET description = ? WHERE node_id = ?",
+            ["Customer loyalty and retention score", target_id],
+        )
+
+        # Second run: with description → boosted confidence
+        tags_with_desc = engine.infer_semantic_tags(threshold=0.5)
+        boosted = next(
+            (t.confidence for t in tags_with_desc if t.node_id == target_id), None
+        )
+        assert boosted is not None, "Expected a tag for marts.loyalty_score after boost"
+        assert boosted >= baseline + 0.1 - 0.01, (
+            f"Expected confidence boost of +0.1: baseline={baseline}, boosted={boosted}"
+        )
+    finally:
+        db.close()
