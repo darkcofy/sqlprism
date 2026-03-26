@@ -3112,3 +3112,109 @@ class GraphDB:
             return result_layers[0] if result_layers else {}
 
         return {"layers": result_layers}
+
+    # ── Semantic tags ──
+
+    def upsert_tags(self, repo_id: int, tags: list[dict]) -> int:
+        """Bulk upsert semantic tag assignments.
+
+        Args:
+            repo_id: ID of the repo these tags belong to.
+            tags: List of dicts, each with keys ``tag_name``, ``node_id``,
+                ``confidence``, ``source``.
+
+        Returns:
+            Number of rows processed (inserts + updates).
+        """
+        if not tags:
+            return 0
+        rows = [
+            (repo_id, t["tag_name"], t["node_id"], t["confidence"], t["source"])
+            for t in tags
+        ]
+        with self._write_lock:
+            self.conn.executemany(
+                "INSERT INTO semantic_tags "
+                "(repo_id, tag_name, node_id, confidence, source) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (repo_id, tag_name, node_id) DO UPDATE SET "
+                "confidence = EXCLUDED.confidence, "
+                "source = EXCLUDED.source",
+                rows,
+            )
+        return len(rows)
+
+    def get_tags(
+        self, repo_id: int, tag_name: str | None = None,
+    ) -> list[dict]:
+        """Retrieve tags for a repo, optionally filtered by tag name.
+
+        Args:
+            repo_id: ID of the repo.
+            tag_name: Optional tag name filter.
+
+        Returns:
+            List of dicts with ``tag_name``, ``node_id``, ``node_name``,
+            ``confidence``, ``source``.
+        """
+        sql = (
+            "SELECT t.tag_name, t.node_id, n.name AS node_name, "
+            "t.confidence, t.source "
+            "FROM semantic_tags t "
+            "JOIN nodes n ON t.node_id = n.node_id "
+            "WHERE t.repo_id = ?"
+        )
+        params: list = [repo_id]
+        if tag_name is not None:
+            sql += " AND t.tag_name = ?"
+            params.append(tag_name)
+        sql += " ORDER BY t.tag_name, n.name"
+        rows = self._execute_read(sql, params).fetchall()
+        return [
+            {
+                "tag_name": r[0],
+                "node_id": r[1],
+                "node_name": r[2],
+                "confidence": r[3],
+                "source": r[4],
+            }
+            for r in rows
+        ]
+
+    def list_tag_names(self, repo_id: int) -> list[dict]:
+        """Return distinct tag names with model count and average confidence.
+
+        Args:
+            repo_id: ID of the repo.
+
+        Returns:
+            List of dicts with ``tag_name``, ``model_count``, ``avg_confidence``.
+        """
+        rows = self._execute_read(
+            "SELECT tag_name, COUNT(*) AS model_count, "
+            "AVG(confidence) AS avg_confidence "
+            "FROM semantic_tags "
+            "WHERE repo_id = ? "
+            "GROUP BY tag_name "
+            "ORDER BY tag_name",
+            [repo_id],
+        ).fetchall()
+        return [
+            {
+                "tag_name": r[0],
+                "model_count": r[1],
+                "avg_confidence": r[2],
+            }
+            for r in rows
+        ]
+
+    def delete_repo_tags(self, repo_id: int) -> None:
+        """Delete all semantic tags for a repo (used before re-inference).
+
+        Args:
+            repo_id: ID of the repo whose tags should be removed.
+        """
+        with self._write_lock:
+            self._execute_write(
+                "DELETE FROM semantic_tags WHERE repo_id = ?", [repo_id],
+            )
