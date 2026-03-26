@@ -2,7 +2,7 @@
 
 The index is stored in a single DuckDB file (default: `~/.sqlprism/graph.duckdb`). Current schema version: **1.0**.
 
-## Tables (6)
+## Tables (9)
 
 ### `repos`
 
@@ -99,6 +99,51 @@ End-to-end column lineage chains.
 
 A lineage chain traces one output column back to its source. Multiple chains (different `chain_index` values) exist when a column has multiple source paths (e.g. COALESCE of two columns).
 
+### `columns`
+
+Column definitions extracted from DDL or schema files.
+
+| Column | Type | Description |
+|---|---|---|
+| `column_id` | INTEGER PK | Auto-increment ID. |
+| `node_id` | INTEGER | FK to `nodes`. |
+| `column_name` | TEXT | Column name. |
+| `data_type` | TEXT or NULL | Column data type (e.g. `INTEGER`, `TEXT`). |
+| `position` | INTEGER | Column ordinal position in the table. |
+| `source` | TEXT | How the column was discovered: `definition`, `usage`, `lineage`. |
+
+### `conventions`
+
+Inferred or overridden project conventions per layer.
+
+| Column | Type | Description |
+|---|---|---|
+| `convention_id` | INTEGER PK | Auto-increment ID. |
+| `repo_id` | INTEGER | FK to `repos`. |
+| `layer` | TEXT | Layer name (e.g. `staging`, `marts`). |
+| `convention_type` | TEXT | `naming`, `references`, `required_columns`, or `column_style`. |
+| `payload` | JSON | Convention data (pattern, allowed_targets, etc.). |
+| `confidence` | FLOAT | Confidence score (0.0-1.0). |
+| `source` | TEXT | `inferred` or `override`. |
+| `model_count` | INTEGER | Number of models in this layer when inferred. |
+
+Unique constraint: `(repo_id, layer, convention_type)`.
+
+### `semantic_tags`
+
+Semantic tags assigned to models by clustering or explicit override.
+
+| Column | Type | Description |
+|---|---|---|
+| `tag_id` | INTEGER PK | Auto-increment ID. |
+| `repo_id` | INTEGER | FK to `repos`. |
+| `tag_name` | TEXT | Tag name (e.g. `customer`, `order`, `revenue`). |
+| `node_id` | INTEGER | FK to `nodes`. |
+| `confidence` | FLOAT | Confidence score (0.0-1.0). |
+| `source` | TEXT | `inferred`, `anchor`, or `explicit`. |
+
+Unique constraint: `(repo_id, tag_name, node_id)`.
+
 ## Indexes
 
 ```sql
@@ -117,6 +162,11 @@ CREATE INDEX idx_col_usage_type ON column_usage(usage_type);
 CREATE INDEX idx_lineage_output ON column_lineage(output_node, output_column);
 CREATE INDEX idx_lineage_hop ON column_lineage(hop_table, hop_column);
 CREATE INDEX idx_lineage_file ON column_lineage(file_id);
+CREATE INDEX idx_conventions_repo ON conventions(repo_id);
+CREATE INDEX idx_conventions_type ON conventions(convention_type);
+CREATE INDEX idx_tags_name ON semantic_tags(tag_name);
+CREATE INDEX idx_tags_node ON semantic_tags(node_id);
+CREATE INDEX idx_tags_repo ON semantic_tags(repo_id);
 ```
 
 ## Entity Relationship
@@ -130,4 +180,7 @@ repos 1──* files 1──* nodes
 
 files 1──* column_usage *──1 nodes
 files 1──* column_lineage
+nodes 1──* columns
+repos 1──* conventions
+repos 1──* semantic_tags *──1 nodes
 ```

@@ -59,6 +59,7 @@ nav:
   - User Guide:
     - CLI Reference: guide/cli.md
     - MCP Tools: guide/mcp-tools.md
+    - Conventions: guide/conventions.md
     - SQLMesh Integration: guide/sqlmesh.md
     - dbt Integration: guide/dbt.md
   - Architecture:
@@ -69,6 +70,7 @@ nav:
     - GraphDB (Storage): api/graph.md
     - Indexer (Orchestrator): api/indexer.md
     - SQL Parser: api/sql-parser.md
+    - Convention Engine: api/conventions.md
     - SQLMesh Renderer: api/sqlmesh.md
     - dbt Renderer: api/dbt.md
     - MCP Server: api/mcp-tools.md

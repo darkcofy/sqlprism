@@ -1,6 +1,6 @@
 # MCP Tools
 
-When running as an MCP server (`sqlprism serve`), 19 tools are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
+When running as an MCP server (`sqlprism serve`), 24 tools are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
 
 ## Query Tools
 
@@ -235,6 +235,57 @@ Analyze the downstream impact of proposed column changes BEFORE modifying code.
 |---|---|---|---|---|
 | `model` | string | Yes | | Model or table name to check impact for. |
 | `changes` | list | Yes | | List of column changes (remove_column, rename_column, add_column). |
+| `repo` | string | No | | Filter by repo name. |
+
+## Convention Tools
+
+### `get_conventions`
+
+Get naming conventions, reference rules, and required columns for a layer. Returns inferred conventions with confidence scores.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `layer` | string | No | | Layer name (e.g. 'staging', 'marts'). Omit for all layers. |
+| `repo` | string | No | | Filter by repo name. |
+
+### `search_by_tag`
+
+Find models tagged with a business domain concept. Returns models ranked by confidence.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `tag` | string | Yes | | Tag name to search for (e.g. 'customer', 'order'). |
+| `min_confidence` | float | No | | Minimum confidence threshold (0.0-1.0). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `list_tags`
+
+List all semantic tags with model counts and average confidence. Provides the project's business domain vocabulary.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `repo` | string | No | | Filter by repo name. |
+
+### `find_similar_models`
+
+Find existing models similar to what you're building. Compares reference overlap, column overlap, and layer placement.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `references` | list[string] | No | | Tables this model will reference. |
+| `output_columns` | list[string] | No | | Columns this model will output. |
+| `model` | string | No | | Existing model name to find similar models to. |
+| `limit` | int | No | 5 | Max results (1-50). |
+| `repo` | string | No | | Filter by repo name. |
+
+### `suggest_placement`
+
+Recommend where to place a new model based on its references. Uses inferred layer flow rules and naming conventions.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `references` | list[string] | Yes | | Tables this new model will reference. |
+| `name` | string | No | | Proposed model name (for naming validation). |
 | `repo` | string | No | | Filter by repo name. |
 
 ## DuckPGQ Tools

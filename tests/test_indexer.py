@@ -1,5 +1,7 @@
 """Tests for the indexer orchestrator."""
 
+import importlib.metadata
+
 import pytest
 
 from sqlprism.core.indexer import _resolve_dialect
@@ -12,6 +14,12 @@ from sqlprism.types import (
     NodeResult,
     ParseResult,
 )
+
+
+def test_version_string():
+    """Verify package version is 1.2.0."""
+    version = importlib.metadata.version("sqlprism")
+    assert version == "1.2.0"
 
 
 def test_resolve_dialect_no_overrides():

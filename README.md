@@ -197,6 +197,9 @@ Full reference: [CLI guide](https://darkcofy.github.io/sqlprism/guide/cli/)
 | `sqlprism reindex-dbt` | Compile and index a [dbt](https://www.getdbt.com/) project. |
 | `sqlprism reindex-sqlmesh` | Render and index a [SQLMesh](https://sqlmesh.com/) project. |
 | `sqlprism serve` | Start the MCP server (stdio or HTTP). |
+| `sqlprism conventions init` | Generate `sqlprism.conventions.yml` from inferred conventions. |
+| `sqlprism conventions refresh` | Re-run convention inference after reindex. |
+| `sqlprism conventions diff` | Show what changed since last `--init`. |
 | `sqlprism status` | Show index status. |
 | `sqlprism query search` | Find entities by name pattern. |
 | `sqlprism query references` | Find inbound/outbound dependencies. |
@@ -208,7 +211,7 @@ Full reference: [CLI guide](https://darkcofy.github.io/sqlprism/guide/cli/)
 
 Full reference: [MCP tools guide](https://darkcofy.github.io/sqlprism/guide/mcp-tools/)
 
-When running as an MCP server (`sqlprism serve`), 19 tools are exposed:
+When running as an MCP server (`sqlprism serve`), 24 tools are exposed:
 
 | Tool | Description |
 |---|---|
@@ -230,6 +233,11 @@ When running as an MCP server (`sqlprism serve`), 19 tools are exposed:
 | `reindex_files` | Fast on-save reindex with per-repo debounce. |
 | `reindex_dbt` | Background dbt compile + index. |
 | `reindex_sqlmesh` | Background SQLMesh render + index. |
+| `get_conventions` | Inferred project conventions — naming, references, columns. |
+| `find_similar_models` | Find existing models similar to what you're building. |
+| `suggest_placement` | Recommend where to place a new model based on references. |
+| `search_by_tag` | Find models by semantic tag (business domain concept). |
+| `list_tags` | List all semantic tags with model counts and confidence. |
 | `index_status` | Index stats, cross-repo edges, and name collisions. |
 
 ## Architecture
@@ -246,8 +254,9 @@ src/sqlprism/
   core/
     graph.py            <- DuckDB storage layer (MVCC), queries, snippets, repo_type tracking
     indexer.py          <- Orchestrator: scan -> checksum -> parse -> store; file-level reindex with repo-type dispatch
-    mcp_tools.py        <- FastMCP tool definitions (19 tools, non-blocking reindex, per-repo debounce)
-  cli.py                <- Click CLI: serve, reindex, reindex-file, reindex-sqlmesh, reindex-dbt, status, init
+    mcp_tools.py        <- FastMCP tool definitions (24 tools, non-blocking reindex, per-repo debounce)
+    conventions.py      <- Convention inference engine: layers, naming, references, tags, overrides
+  cli.py                <- Click CLI: serve, reindex, reindex-file, reindex-sqlmesh, reindex-dbt, conventions, status, init
 ```
 
 The SQL parser extracts:
@@ -266,7 +275,7 @@ SQLPrism optionally integrates with [DuckPGQ](https://github.com/cwida/duckpgq) 
 
 ```bash
 uv sync
-uv run pytest                          # run tests (416+ tests)
+uv run pytest                          # run tests (510+ tests)
 uv run pytest --cov=sqlprism           # run with coverage report
 uv run pytest --cov=sqlprism --cov-report=html:coverage_html  # HTML report
 ```
