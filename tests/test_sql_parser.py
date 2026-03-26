@@ -1,7 +1,15 @@
 """Tests for the SQL parser and core types."""
 
+import sqlglot
+
 from sqlprism.languages.sql import SqlParser
 from sqlprism.types import ParseResult
+
+
+def test_sqlglot_version():
+    """Verify sqlglot >= 30 is installed."""
+    major = int(sqlglot.__version__.split(".")[0])
+    assert major >= 30, f"Expected sqlglot >= 30, got {sqlglot.__version__}"
 
 
 def test_parse_result_is_returned():
