@@ -241,7 +241,7 @@ def reindex_file(paths, config_path, db_path):
         for name, cfg in repo_configs.items():
             graph.upsert_repo(name, cfg["path"], repo_type=cfg["repo_type"])
 
-        resolved_paths = [str(Path(p).resolve()) for p in paths]
+        resolved_paths: list[str | Path] = [str(Path(p).resolve()) for p in paths]
         stats = indexer.reindex_files(paths=resolved_paths, repo_configs=repo_configs)
 
     # Print summary

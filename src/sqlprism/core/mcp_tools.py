@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 from pydantic import model_validator as pydantic_model_validator
 
@@ -142,12 +143,12 @@ class SearchInput(BaseModel):
 
 @mcp.tool(
     name="search",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def search(params: SearchInput) -> dict:
     """Search for SQL entities by name across the codebase graph.
@@ -191,12 +192,12 @@ class FindReferencesInput(BaseModel):
 
 @mcp.tool(
     name="find_references",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def find_references(params: FindReferencesInput) -> dict:
     """Find everything connected to a named SQL entity.
@@ -231,12 +232,12 @@ class FindColumnUsageInput(BaseModel):
 
 @mcp.tool(
     name="find_column_usage",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def find_column_usage(params: FindColumnUsageInput) -> dict:
     """Find where and how columns are used across SQL models.
@@ -284,12 +285,12 @@ class TraceDependenciesInput(BaseModel):
 
 @mcp.tool(
     name="trace_dependencies",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def trace_dependencies(params: TraceDependenciesInput) -> dict:
     """Trace multi-hop dependency chains through the SQL graph.
@@ -329,12 +330,12 @@ class TraceColumnLineageInput(BaseModel):
 
 @mcp.tool(
     name="trace_column_lineage",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def trace_column_lineage(params: TraceColumnLineageInput) -> dict:
     """Trace end-to-end column lineage through CTEs and subqueries.
@@ -371,12 +372,12 @@ class GetSchemaInput(BaseModel):
 
 @mcp.tool(
     name="get_schema",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def get_schema(params: GetSchemaInput) -> dict:
     """Get the schema of a table or model — columns, types, descriptions, and dependencies.
@@ -401,12 +402,12 @@ class GetContextInput(BaseModel):
 
 @mcp.tool(
     name="get_context",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def get_context(params: GetContextInput) -> dict:
     """Get comprehensive context for a model — the first tool to call when working with a model.
@@ -435,12 +436,12 @@ class FindPathInput(BaseModel):
 
 @mcp.tool(
     name="find_path",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def find_path(params: FindPathInput) -> dict:
     """Find the shortest dependency path between two models.
@@ -467,12 +468,12 @@ class FindCriticalModelsInput(BaseModel):
 
 @mcp.tool(
     name="find_critical_models",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def find_critical_models(params: FindCriticalModelsInput) -> dict:
     """Find the most critical models by importance (PageRank) and downstream impact.
@@ -503,12 +504,12 @@ class DetectCyclesInput(BaseModel):
 
 @mcp.tool(
     name="detect_cycles",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def detect_cycles(params: DetectCyclesInput) -> dict:
     """Detect circular dependencies in the SQL dependency graph.
@@ -530,12 +531,12 @@ class FindSubgraphsInput(BaseModel):
 
 @mcp.tool(
     name="find_subgraphs",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def find_subgraphs(params: FindSubgraphsInput) -> dict:
     """Identify weakly connected components (subgraphs) in the dependency graph.
@@ -562,12 +563,12 @@ class FindBottlenecksInput(BaseModel):
 
 @mcp.tool(
     name="find_bottlenecks",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def find_bottlenecks(params: FindBottlenecksInput) -> dict:
     """Find bottleneck models with high fan-in/out that are single points of failure.
@@ -614,12 +615,12 @@ class CheckImpactInput(BaseModel):
 
 @mcp.tool(
     name="check_impact",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def check_impact(params: CheckImpactInput) -> dict:
     """Check the downstream impact of proposed column changes BEFORE modifying code.
@@ -665,12 +666,12 @@ class PrImpactInput(BaseModel):
 
 @mcp.tool(
     name="pr_impact",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
 )
 async def pr_impact(params: PrImpactInput) -> dict:
     """Analyse the structural impact of SQL changes since a base commit.
@@ -834,12 +835,12 @@ class GetConventionsInput(BaseModel):
 
 @mcp.tool(
     name="get_conventions",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def get_conventions(params: GetConventionsInput) -> dict:
     """Get naming conventions, reference rules, and required columns for a layer.
@@ -878,12 +879,12 @@ class SearchByTagInput(BaseModel):
 
 @mcp.tool(
     name="search_by_tag",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def search_by_tag(params: SearchByTagInput) -> dict:
     """Find models tagged with a business domain concept, ranked by confidence.
@@ -910,12 +911,12 @@ class ListTagsInput(BaseModel):
 
 @mcp.tool(
     name="list_tags",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def list_tags(params: ListTagsInput) -> dict:
     """Return all semantic tags with model counts and average confidence.
@@ -930,18 +931,70 @@ async def list_tags(params: ListTagsInput) -> dict:
     )
 
 
+class FindSimilarModelsInput(BaseModel):
+    references: list[str] | None = Field(
+        None,
+        description="Tables this model will reference (e.g. ['stg_orders', 'stg_payments']).",
+    )
+    output_columns: list[str] | None = Field(
+        None,
+        description="Columns this model will output (e.g. ['customer_id', 'total_revenue']).",
+    )
+    model: str | None = Field(
+        None,
+        min_length=1,
+        description="Existing model name to find similar models to.",
+    )
+    limit: int = Field(
+        5,
+        ge=1,
+        le=50,
+        description="Maximum number of similar models to return (default 5).",
+    )
+    repo: str | None = Field(
+        None,
+        description="Filter by repo name. Omit to search all repos.",
+    )
+
+
+@mcp.tool(
+    name="find_similar_models",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def find_similar_models(params: FindSimilarModelsInput) -> dict:
+    """Find existing models similar to what you're building.
+
+    Compares reference overlap, column overlap, and layer placement to find
+    models that already do something similar. Helps avoid duplicate work and
+    suggests models to extend rather than recreate.
+    """
+    return await asyncio.to_thread(
+        _get_graph().query_find_similar_models,
+        references=params.references,
+        output_columns=params.output_columns,
+        model=params.model,
+        limit=params.limit,
+        repo=params.repo,
+    )
+
+
 class ReindexInput(BaseModel):
     repo: str | None = Field(None, description="Specific repo to reindex. Omit for all repos.")
 
 
 @mcp.tool(
     name="reindex",
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def reindex(params: ReindexInput) -> dict:
     """Trigger a reindex of SQL files. Checksums and re-parses only what changed.
@@ -1046,12 +1099,12 @@ class ReindexSqlmeshInput(BaseModel):
 
 @mcp.tool(
     name="reindex_sqlmesh",
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def reindex_sqlmesh(params: ReindexSqlmeshInput) -> dict:
     """Index a sqlmesh project by rendering all models into clean SQL.
@@ -1152,12 +1205,12 @@ class ReindexDbtInput(BaseModel):
 
 @mcp.tool(
     name="reindex_dbt",
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def reindex_dbt(params: ReindexDbtInput) -> dict:
     """Index a dbt project by compiling all models into clean SQL.
@@ -1263,7 +1316,7 @@ async def _flush_reindex(repo_name: str):
         return
 
     # Deduplicate (same file saved twice rapidly)
-    unique_paths = list(dict.fromkeys(paths))
+    unique_paths: list[str | Path] = list(dict.fromkeys(paths))
 
     state = _state
     if not state:
@@ -1293,12 +1346,12 @@ class ReindexFilesInput(BaseModel):
 
 @mcp.tool(
     name="reindex_files",
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
 )
 async def reindex_files(params: ReindexFilesInput) -> dict:
     """Reindex specific files after save. Non-blocking.
@@ -1352,12 +1405,12 @@ async def reindex_files(params: ReindexFilesInput) -> dict:
 
 @mcp.tool(
     name="index_status",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
 )
 async def index_status() -> dict:
     """Current state of the index — repos, file counts, last commit, staleness."""

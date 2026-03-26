@@ -61,7 +61,7 @@ def test_search_input_schema_alias():
 
 def test_search_input_sql_schema_direct():
     """SearchInput accepts sql_schema directly too (populate_by_name)."""
-    inp = SearchInput(pattern="orders", sql_schema="public")
+    inp = SearchInput(pattern="orders", sql_schema="public")  # type: ignore[unknown-argument]
     assert inp.sql_schema == "public"
 
 
@@ -73,7 +73,7 @@ def test_find_references_input_schema_alias():
 
 def test_find_references_input_sql_schema_direct():
     """FindReferencesInput accepts sql_schema directly too."""
-    inp = FindReferencesInput(name="orders", sql_schema="production")
+    inp = FindReferencesInput(name="orders", sql_schema="production")  # type: ignore[unknown-argument]
     assert inp.sql_schema == "production"
 
 
@@ -840,7 +840,7 @@ def test_reindex_failure_shows_in_status(tmp_path):
         def _exploding(*args, **kwargs):
             raise RuntimeError("boom")
 
-        m._get_indexer().reindex_repo = _exploding
+        m._get_indexer().reindex_repo = _exploding  # type: ignore[invalid-assignment]
         try:
             r = await reindex(ReindexInput())
             assert r["status"] == "started"
@@ -889,19 +889,19 @@ def test_pr_impact_delta_mode_includes_note(git_repo):
 def test_compare_mode_rejects_invalid():
     """PrImpactInput rejects invalid compare_mode values (1.6a)."""
     with pytest.raises(Exception):
-        PrImpactInput(base_commit="HEAD", compare_mode="relative")
+        PrImpactInput(base_commit="HEAD", compare_mode="relative")  # type: ignore[invalid-argument-type]
 
 
 def test_find_references_direction_rejects_invalid():
     """FindReferencesInput rejects invalid direction values (1.6b)."""
     with pytest.raises(Exception):
-        FindReferencesInput(name="x", direction="upstream")
+        FindReferencesInput(name="x", direction="upstream")  # type: ignore[invalid-argument-type]
 
 
 def test_trace_dependencies_direction_rejects_invalid():
     """TraceDependenciesInput rejects invalid direction values (1.6c)."""
     with pytest.raises(Exception):
-        TraceDependenciesInput(name="x", direction="inbound")
+        TraceDependenciesInput(name="x", direction="inbound")  # type: ignore[invalid-argument-type]
 
 
 # ── reindex_files tool and debounce tests ──
@@ -925,6 +925,7 @@ def test_mcp_reindex_files_single(tmp_path):
     indexer.reindex_repo("test", str(repo_dir))
 
     # Verify 'status' column is NOT present before modification
+    assert _mcp_mod._state is not None
     graph = _mcp_mod._state.graph
     col_before = graph.query_column_usage(table="orders", column="status")
     assert col_before["total_count"] == 0
@@ -1087,6 +1088,7 @@ def test_debounce_deduplicates_paths(tmp_path):
     configure(db_path=":memory:", repos={"test": str(repo_dir)})
 
     captured_paths = []
+    assert _mcp_mod._state is not None
     original_reindex_files = _mcp_mod._state.indexer.reindex_files
 
     def capture_reindex_files(paths, **kwargs):
@@ -1094,6 +1096,7 @@ def test_debounce_deduplicates_paths(tmp_path):
         return original_reindex_files(paths=paths, **kwargs)
 
     async def _run():
+        assert _mcp_mod._state is not None
         with patch.object(_mcp_mod._state.indexer, "reindex_files", side_effect=capture_reindex_files):
             # Enqueue same path twice
             await _enqueue_reindex("test", "sql", [str(sql_file)])
@@ -1228,6 +1231,7 @@ def test_reindex_concurrent_waits_for_lock(tmp_path):
     indexer.reindex_repo("test", str(repo_dir))
 
     # Verify initial state — no 'status' column
+    assert _mcp_mod._state is not None
     graph = _mcp_mod._state.graph
     col_before = graph.query_column_usage(table="orders", column="status")
     assert col_before["total_count"] == 0
@@ -1467,6 +1471,7 @@ def test_get_schema_mcp_tool_integration(tmp_path):
     configure(db_path=":memory:", repos={"test": str(repo_dir)})
 
     state = _mcp_mod._state
+    assert state is not None
     graph = state.graph
 
     # Manually insert a node with columns (reindex would parse but we want control)
