@@ -203,6 +203,7 @@ def test_dbt_render_project_success(tmp_path):
     for rel_path, parse_result in results.items():
         assert len(parse_result.nodes) > 0, f"Model {rel_path} should have nodes"
         for node in parse_result.nodes:
+            assert node.metadata is not None, "Nodes should have metadata"
             assert "dbt_model" in node.metadata, "Nodes should have dbt_model metadata"
             assert node.metadata["dbt_model"] == rel_path
 
@@ -304,6 +305,7 @@ def test_sqlmesh_render_project_success(tmp_path):
         assert model_name in rendered_models, "Key should be original model name"
         assert len(parse_result.nodes) > 0, f"Model {model_name} should have nodes"
         for node in parse_result.nodes:
+            assert node.metadata is not None, "Nodes should have metadata"
             assert "sqlmesh_model" in node.metadata, "Nodes should have sqlmesh_model metadata"
             assert node.metadata["sqlmesh_model"] == model_name
 

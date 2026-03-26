@@ -26,7 +26,7 @@ def test_column_def_result_dataclass():
 
     # Frozen — cannot mutate
     with pytest.raises(FrozenInstanceError):
-        col.column_name = "id"
+        col.column_name = "id"  # type: ignore[invalid-assignment]
 
 
 def test_column_def_result_defaults():

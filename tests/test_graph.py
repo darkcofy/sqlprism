@@ -137,7 +137,7 @@ def test_delete_repo_cascades():
     node_id = db.insert_node(file_id, "table", "orders", "sql")
     db.insert_edge(node_id, node_id, "self_ref")
     db.insert_column_usage(node_id, "orders", "id", "select", file_id)
-    db.insert_column_lineage(file_id, "orders", "id", 0, 0, "id", "raw_orders")
+    db.insert_column_lineage(file_id, "orders", "id", 0, "id", "raw_orders")
 
     db.delete_repo(repo_id)
 
@@ -594,10 +594,10 @@ def test_column_lineage_limit_by_chain_count():
                 file_id,
                 "dim_users",
                 col,
-                chain_idx,
                 hop_idx,
                 f"src_{hop_idx}",
                 f"table_{hop_idx}",
+                chain_index=chain_idx,
             )
 
     # Limit=2 should return exactly 2 chains with all their hops
@@ -633,10 +633,10 @@ def test_column_lineage_limit_preserves_full_chains():
                 file_id,
                 "wide_table",
                 col,
-                chain_idx,
                 hop_idx,
                 f"src_{hop_idx}",
                 f"tbl_{hop_idx}",
+                chain_index=chain_idx,
             )
 
     # Limit=1: one chain, all its hops intact

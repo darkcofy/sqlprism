@@ -1967,14 +1967,14 @@ class GraphDB:
             }
             for cid, names in comp_map.items()
         ]
-        comp_list.sort(key=lambda c: c["size"], reverse=True)  # type: ignore[type-var]
+        comp_list.sort(key=lambda c: c["size"], reverse=True)
 
         largest_component: dict[str, object] | None = (
             {"name": comp_list[0]["models"][0], "size": comp_list[0]["size"]}  # type: ignore[index]
             if comp_list else None
         )
         orphaned_models: list[str] = sorted(
-            name  # type: ignore[type-var]
+            name
             for c in comp_list
             if c["size"] == 1
             for name in c["models"]  # type: ignore[union-attr]
