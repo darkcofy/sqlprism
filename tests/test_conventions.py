@@ -1644,3 +1644,287 @@ def test_description_signal_boost():
         )
     finally:
         db.close()
+
+
+# ── Tag confidence and edge cases ──
+
+
+def test_tag_confidence_core_member():
+    """Core cluster member with name token match gets ~0.95 confidence."""
+    db = GraphDB()
+    try:
+        # All 5 "customer_*" models reference the SAME two upstream sources.
+        # Since they all share identical ref sets, pairwise Jaccard = 1.0,
+        # so avg_sim = 1.0 → base = 0.85. Name contains "customer" (the tag
+        # token) → +0.10. Total = 0.95.
+        models = [
+            ("models/marts/customer_ltv.sql", "customer_ltv"),
+            ("models/marts/customer_segments.sql", "customer_segments"),
+            ("models/marts/customer_activity.sql", "customer_activity"),
+            ("models/marts/customer_churn.sql", "customer_churn"),
+            ("models/marts/customer_health.sql", "customer_health"),
+            ("models/staging/stg_users.sql", "stg_users"),
+            ("models/staging/stg_orders.sql", "stg_orders"),
+        ]
+        edges = [
+            ("customer_ltv", "stg_users"),
+            ("customer_ltv", "stg_orders"),
+            ("customer_segments", "stg_users"),
+            ("customer_segments", "stg_orders"),
+            ("customer_activity", "stg_users"),
+            ("customer_activity", "stg_orders"),
+            ("customer_churn", "stg_users"),
+            ("customer_churn", "stg_orders"),
+            ("customer_health", "stg_users"),
+            ("customer_health", "stg_orders"),
+        ]
+
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags = engine.infer_semantic_tags(threshold=0.5)
+
+        # All 5 customer models share identical refs → Jaccard = 1.0
+        # base = 0.85 (core), name match bonus = 0.10 → 0.95
+        for model_name in [
+            "customer_ltv", "customer_segments", "customer_activity",
+            "customer_churn", "customer_health",
+        ]:
+            tag = next(
+                (t for t in tags if t.node_id == name_to_id[model_name]), None
+            )
+            assert tag is not None, f"Expected tag for {model_name}"
+            assert tag.confidence == 0.95, (
+                f"{model_name}: expected 0.95, got {tag.confidence}"
+            )
+    finally:
+        db.close()
+
+
+def test_tag_confidence_edge_member():
+    """Edge cluster member just above Jaccard threshold gets ~0.60 confidence."""
+    db = GraphDB()
+    try:
+        # Build a cluster where 4 "core" models share refs {A, B, C, D, E}
+        # and 1 "edge" model shares only a carefully chosen subset so that
+        # its average Jaccard to the 4 core members is ~0.52.
+        #
+        # Core models ref: {src_a, src_b, src_c, src_d, src_e}   (5 refs)
+        # Edge model ref:  {src_a, src_b, src_c, src_f, src_g, src_h}  (6 refs)
+        # Jaccard(edge, core) = |{a,b,c}| / |{a,b,c,d,e,f,g,h}| = 3/8 = 0.375
+        #
+        # That's below 0.5. We need ~0.52 average.
+        # Let edge ref = {src_a, src_b, src_c, src_d, src_f}   (5 refs)
+        # Jaccard(edge, core) = |{a,b,c,d}| / |{a,b,c,d,e,f}| = 4/6 ≈ 0.667
+        # That's too high.
+        #
+        # We want avg_sim ≈ 0.52. With threshold=0.5, the clustering must
+        # merge them. Use individual ref variation among core members.
+        #
+        # Strategy: 4 core models each ref {A,B,C} plus one unique ref each.
+        # Edge model refs {A, X, Y} — shares only A with cores.
+        # Jaccard(edge, core_i) = |{A}| / |{A,B,C,unique_i,X,Y}| = 1/6 ≈ 0.17
+        # Too low — won't cluster.
+        #
+        # Better strategy: use a low threshold and construct carefully.
+        # All 5 models need to end up in one cluster. Use threshold=0.3.
+        #
+        # 4 core models ref exactly {A, B, C, D}
+        # 1 edge model refs {A, B, E, F, G}
+        # Jaccard(edge, core) = 2/7 ≈ 0.286 — still too low for 0.3.
+        #
+        # Simplest: use threshold=0.5. Make 5 core models with identical refs
+        # plus 1 edge model that has ~0.52 Jaccard with each core.
+        # Core refs: {1,2,3,4,5,6,7,8,9,10} (10 refs)
+        # Edge refs: {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19} (19 refs)
+        # Jaccard = 10/19 ≈ 0.526 ✓
+        #
+        # We need 6+ models with refs for clustering (>= 5).
+        # 5 core + 1 edge = 6 models with refs. Plus source nodes.
+
+        # Create source nodes (no refs themselves)
+        sources = [(f"models/staging/src_{i}.sql", f"src_{i}") for i in range(19)]
+        # Core models: all ref src_0..src_9
+        core_models = [
+            (f"models/marts/customer_{c}.sql", f"customer_{c}")
+            for c in ["ltv", "segments", "activity", "churn", "health"]
+        ]
+        # Edge model: refs src_0..src_9 plus src_10..src_18 (19 total refs)
+        edge_model = [("models/marts/loyalty_score.sql", "loyalty_score")]
+
+        models = sources + core_models + edge_model
+        edges = []
+        # Core models each ref src_0..src_9
+        for _, core_name in core_models:
+            for i in range(10):
+                edges.append((core_name, f"src_{i}"))
+        # Edge model refs src_0..src_18
+        for i in range(19):
+            edges.append(("loyalty_score", f"src_{i}"))
+
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags = engine.infer_semantic_tags(threshold=0.5)
+
+        # The edge model "loyalty_score" should have avg Jaccard to cores ≈ 0.526
+        # base = 0.60 + (0.526 - 0.5) * 0.5 = 0.60 + 0.013 ≈ 0.613
+        # No name match (tag is "customer", model is "loyalty_score") → 0.61
+        edge_tag = next(
+            (t for t in tags if t.node_id == name_to_id["loyalty_score"]), None
+        )
+        assert edge_tag is not None, "Expected tag for loyalty_score"
+        # Should be close to 0.60-0.62 (edge member, no name bonus)
+        assert 0.58 <= edge_tag.confidence <= 0.65, (
+            f"Expected ~0.60 confidence for edge member, got {edge_tag.confidence}"
+        )
+    finally:
+        db.close()
+
+
+def test_tag_storage_upsert():
+    """Tags from infer_semantic_tags can be stored and read back via GraphDB."""
+    db = GraphDB()
+    try:
+        # Set up a repo with enough models for clustering
+        models = [
+            ("models/marts/customer_ltv.sql", "customer_ltv"),
+            ("models/marts/customer_segments.sql", "customer_segments"),
+            ("models/marts/customer_activity.sql", "customer_activity"),
+            ("models/marts/customer_churn.sql", "customer_churn"),
+            ("models/marts/customer_health.sql", "customer_health"),
+            ("models/staging/stg_users.sql", "stg_users"),
+        ]
+        edges = [
+            ("customer_ltv", "stg_users"),
+            ("customer_segments", "stg_users"),
+            ("customer_activity", "stg_users"),
+            ("customer_churn", "stg_users"),
+            ("customer_health", "stg_users"),
+        ]
+
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags = engine.infer_semantic_tags(threshold=0.5)
+        assert len(tags) > 0, "Expected at least one tag assignment"
+
+        # Store via upsert_tags
+        tag_dicts = [
+            {
+                "tag_name": t.tag_name,
+                "node_id": t.node_id,
+                "confidence": t.confidence,
+                "source": t.source,
+            }
+            for t in tags
+        ]
+        count = db.upsert_tags(repo_id, tag_dicts)
+        assert count == len(tags)
+
+        # Read back via get_tags
+        stored = db.get_tags(repo_id)
+        assert len(stored) == len(tags)
+
+        # Each stored tag has correct fields
+        for row in stored:
+            assert row["tag_name"] != ""
+            assert row["node_id"] > 0
+            assert row["confidence"] > 0.0
+            assert row["source"] == "inferred"
+            assert row["node_name"] != ""
+
+        # Verify specific (repo_id, tag_name, node_id) combos match
+        stored_set = {(r["tag_name"], r["node_id"]) for r in stored}
+        expected_set = {(t.tag_name, t.node_id) for t in tags}
+        assert stored_set == expected_set
+    finally:
+        db.close()
+
+
+def test_tag_stability_no_flap():
+    """A tagged model stays tagged when similarity drops but stays above threshold."""
+    db = GraphDB()
+    try:
+        # Run 1: all 5 models share refs {A, B} → high similarity, all tagged.
+        models = [
+            ("models/marts/customer_ltv.sql", "customer_ltv"),
+            ("models/marts/customer_segments.sql", "customer_segments"),
+            ("models/marts/customer_activity.sql", "customer_activity"),
+            ("models/marts/customer_churn.sql", "customer_churn"),
+            ("models/marts/customer_health.sql", "customer_health"),
+            ("models/staging/stg_users.sql", "stg_users"),
+            ("models/staging/stg_orders.sql", "stg_orders"),
+            ("models/staging/stg_extra.sql", "stg_extra"),
+        ]
+        edges = [
+            ("customer_ltv", "stg_users"),
+            ("customer_ltv", "stg_orders"),
+            ("customer_segments", "stg_users"),
+            ("customer_segments", "stg_orders"),
+            ("customer_activity", "stg_users"),
+            ("customer_activity", "stg_orders"),
+            ("customer_churn", "stg_users"),
+            ("customer_churn", "stg_orders"),
+            ("customer_health", "stg_users"),
+            ("customer_health", "stg_orders"),
+        ]
+
+        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags_run1 = engine.infer_semantic_tags(threshold=0.5)
+
+        target_id = name_to_id["customer_health"]
+        tag_run1 = next(
+            (t for t in tags_run1 if t.node_id == target_id), None
+        )
+        assert tag_run1 is not None, "Expected tag for customer_health in run 1"
+        assert tag_run1.confidence >= 0.8, (
+            f"Expected high confidence in run 1, got {tag_run1.confidence}"
+        )
+
+        # Run 2: add an extra edge to customer_health to slightly change its
+        # ref set, but it still shares stg_users + stg_orders with others.
+        # Jaccard({users, orders, extra}, {users, orders}) = 2/3 ≈ 0.67 > 0.5
+        db.insert_edge(
+            name_to_id["customer_health"], name_to_id["stg_extra"], "references"
+        )
+
+        tags_run2 = engine.infer_semantic_tags(
+            threshold=0.5, existing_tags=tags_run1
+        )
+
+        tag_run2 = next(
+            (t for t in tags_run2 if t.node_id == target_id), None
+        )
+        assert tag_run2 is not None, (
+            "customer_health should remain tagged after minor graph change"
+        )
+        # Tag name should be preserved
+        assert tag_run2.tag_name == tag_run1.tag_name
+    finally:
+        db.close()
+
+
+def test_clustering_skip_small_repo():
+    """Repos with fewer than 5 models skip clustering and return empty."""
+    db = GraphDB()
+    try:
+        # Only 3 models with refs — below the minimum of 5
+        models = [
+            ("models/marts/revenue.sql", "revenue"),
+            ("models/marts/customers.sql", "customers"),
+            ("models/marts/orders.sql", "orders"),
+            ("models/staging/stg_users.sql", "stg_users"),
+        ]
+        edges = [
+            ("revenue", "stg_users"),
+            ("customers", "stg_users"),
+            ("orders", "stg_users"),
+        ]
+
+        repo_id, _name_to_id = _setup_models_with_edges(db, models, edges)
+        engine = ConventionEngine(db, repo_id)
+        tags = engine.infer_semantic_tags()
+
+        # Only 3 models have refs, which is < 5 → clustering skipped
+        assert tags == []
+    finally:
+        db.close()
