@@ -35,6 +35,7 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 _MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB – skip snippets for oversized files
+_EXTEND_SUGGESTION_THRESHOLD = 0.8
 
 
 @lru_cache(maxsize=128)
@@ -3341,9 +3342,14 @@ class GraphDB:
         dirs = parts[:-1]  # remove filename
         if not dirs:
             return ""
-        # Strip 'models' prefix if present
-        if dirs[0] == "models":
-            dirs = dirs[1:]
+        # Find 'models' anywhere in the path and take the next segment
+        try:
+            idx = dirs.index("models")
+            if idx + 1 < len(dirs):
+                return dirs[idx + 1]
+        except ValueError:
+            pass
+        # Fallback: use first directory segment
         return dirs[0] if dirs else ""
 
     def query_find_similar_models(
@@ -3364,14 +3370,23 @@ class GraphDB:
             repo: Optional repo name filter.
 
         Returns:
-            Dict with ``similar`` list and ``total`` count.
+            Dict with ``similar`` list, ``count``, and ``total_matches``.
         """
+        limit = max(1, min(limit, 50))
 
         def jaccard(a: set[str], b: set[str]) -> float:
             union = a | b
             if not union:
                 return 0.0
             return len(a & b) / len(union)
+
+        # --- Validate inputs ---
+        if references is None and output_columns is None and model is None:
+            return {
+                "error": (
+                    "Provide at least one of: references, output_columns, model"
+                )
+            }
 
         # --- Repo resolution ---
         repo_id = None
@@ -3383,17 +3398,9 @@ class GraphDB:
                 return {"error": f"Repo '{repo}' not found"}
             repo_id = row[0]
 
-        # --- Validate inputs ---
-        if references is None and output_columns is None and model is None:
-            return {
-                "error": (
-                    "Provide at least one of: references, output_columns, model"
-                )
-            }
-
         # --- Target sets ---
-        target_refs: set[str] = set(references) if references else set()
-        target_cols: set[str] = set(output_columns) if output_columns else set()
+        target_refs: set[str] = set(references) if references is not None else set()
+        target_cols: set[str] = set(output_columns) if output_columns is not None else set()
         target_model_node_id: int | None = None
         target_layer: str | None = None
 
@@ -3408,15 +3415,23 @@ class GraphDB:
             if repo_id is not None:
                 model_sql += " AND f.repo_id = ?"
                 model_params.append(repo_id)
-            model_row = self._execute_read(model_sql, model_params).fetchone()
-            if not model_row:
+            model_rows = self._execute_read(model_sql, model_params).fetchmany(2)
+            if not model_rows:
                 return {"error": f"Model '{model}' not found"}
+            if len(model_rows) > 1:
+                return {
+                    "error": (
+                        f"Multiple models named '{model}' found"
+                        " — specify repo to disambiguate"
+                    )
+                }
+            model_row = model_rows[0]
             target_model_node_id = model_row[0]
             model_file_path: str = model_row[1]
             target_layer = self._extract_layer(model_file_path)
 
             # Extract model's references if not provided
-            if not target_refs:
+            if references is None:
                 ref_rows = self._execute_read(
                     "SELECT n.name FROM edges e "
                     "JOIN nodes n ON e.target_id = n.node_id "
@@ -3426,27 +3441,12 @@ class GraphDB:
                 target_refs = {r[0] for r in ref_rows}
 
             # Extract model's output columns if not provided
-            if not target_cols:
+            if output_columns is None:
                 col_rows = self._execute_read(
                     "SELECT column_name FROM columns WHERE node_id = ?",
                     [target_model_node_id],
                 ).fetchall()
                 target_cols = {r[0] for r in col_rows}
-
-        # --- Infer target layer from references if no model ---
-        if target_layer is None and target_refs:
-            prefixes = set()
-            for ref in target_refs:
-                parts = ref.split(".")
-                if len(parts) > 1:
-                    prefixes.add(parts[0])
-                else:
-                    # Try path-like prefix
-                    path_parts = ref.replace("\\", "/").split("/")
-                    if len(path_parts) > 1:
-                        prefixes.add(path_parts[0])
-            if len(prefixes) == 1:
-                target_layer = prefixes.pop()
 
         # --- Batch queries for candidates ---
         # Get all candidate nodes
@@ -3467,34 +3467,39 @@ class GraphDB:
         if not candidates:
             return {
                 "similar": [],
-                "total": 0,
+                "count": 0,
+                "total_matches": 0,
                 "suggestion": "No similar models found for the given criteria.",
             }
 
         cand_node_ids = [c[0] for c in candidates]
 
-        # Batch: all references for candidate nodes
-        placeholders = ",".join("?" * len(cand_node_ids))
-        ref_sql = (
-            f"SELECT e.source_id, n.name FROM edges e "
-            f"JOIN nodes n ON e.target_id = n.node_id "
-            f"WHERE e.source_id IN ({placeholders}) "
-            f"AND e.relationship = 'references'"
-        )
-        ref_rows = self._execute_read(ref_sql, cand_node_ids).fetchall()
+        # Batch: all references and columns for candidate nodes (chunked)
+        chunk_size = 5000
         refs_by_node: dict[int, set[str]] = {}
-        for source_id, name in ref_rows:
-            refs_by_node.setdefault(source_id, set()).add(name)
-
-        # Batch: all columns for candidate nodes
-        col_sql = (
-            f"SELECT node_id, column_name FROM columns "
-            f"WHERE node_id IN ({placeholders})"
-        )
-        col_rows = self._execute_read(col_sql, cand_node_ids).fetchall()
         cols_by_node: dict[int, set[str]] = {}
-        for node_id, col_name in col_rows:
-            cols_by_node.setdefault(node_id, set()).add(col_name)
+
+        for i in range(0, len(cand_node_ids), chunk_size):
+            chunk = cand_node_ids[i : i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+
+            ref_rows = self._execute_read(
+                f"SELECT e.source_id, n.name FROM edges e "
+                f"JOIN nodes n ON e.target_id = n.node_id "
+                f"WHERE e.source_id IN ({placeholders}) "
+                f"AND e.relationship = 'references'",
+                chunk,
+            ).fetchall()
+            for source_id, name in ref_rows:
+                refs_by_node.setdefault(source_id, set()).add(name)
+
+            col_rows = self._execute_read(
+                f"SELECT node_id, column_name FROM columns "
+                f"WHERE node_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for node_id, col_name in col_rows:
+                cols_by_node.setdefault(node_id, set()).add(col_name)
 
         # --- Score candidates ---
         scored: list[tuple[float, str, set[str], set[str], str]] = []
@@ -3514,18 +3519,20 @@ class GraphDB:
                 + layer_bonus
             )
 
-            if similarity > 0:
+            if similarity >= 0.05:
                 scored.append((similarity, name, cand_refs, cand_cols, file_path))
 
         if not scored:
             return {
                 "similar": [],
-                "total": 0,
+                "count": 0,
+                "total_matches": 0,
                 "suggestion": "No similar models found for the given criteria.",
             }
 
         # Sort descending by similarity, apply limit
         scored.sort(key=lambda x: x[0], reverse=True)
+        total_matches = len(scored)
         scored = scored[:limit]
 
         # --- Build result ---
@@ -3538,7 +3545,7 @@ class GraphDB:
                 "shared_columns": sorted(list(target_cols & cand_cols)),
                 "file": file_path,
             }
-            if similarity >= 0.8:
+            if similarity >= _EXTEND_SUGGESTION_THRESHOLD:
                 entry["suggestion"] = (
                     f"Consider extending '{name}' instead of creating a new model"
                 )
@@ -3546,5 +3553,6 @@ class GraphDB:
 
         return {
             "similar": similar,
-            "total": len(similar),
+            "count": len(similar),
+            "total_matches": total_matches,
         }

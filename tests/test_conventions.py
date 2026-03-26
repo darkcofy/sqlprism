@@ -2337,7 +2337,8 @@ def test_find_similar_by_refs():
         _repo_id, _nodes = _setup_similar_models_repo(db)
 
         result = db.query_find_similar_models(
-            references=["stg_orders", "stg_payments"]
+            references=["stg_orders", "stg_payments"],
+            output_columns=["order_id", "payment_amount"],
         )
 
         assert "similar" in result
@@ -2345,7 +2346,7 @@ def test_find_similar_by_refs():
         assert "int_order_payments" in names
 
         iop = next(m for m in result["similar"] if m["name"] == "int_order_payments")
-        assert iop["similarity"] >= 0.5
+        assert iop["similarity"] >= 0.8
         assert "stg_orders" in iop["shared_refs"]
         assert "stg_payments" in iop["shared_refs"]
     finally:
@@ -2368,6 +2369,11 @@ def test_find_similar_by_columns():
         assert "customer_ltv" in names
         # int_customer_orders has customer_id
         assert "int_customer_orders" in names
+
+        # Check shared_columns for customer_ltv
+        cltv = next(m for m in result["similar"] if m["name"] == "customer_ltv")
+        assert "customer_id" in cltv["shared_columns"]
+        assert 0 < cltv["similarity"] < 0.8
     finally:
         db.close()
 
@@ -2385,6 +2391,7 @@ def test_find_similar_to_model():
         names = [m["name"] for m in result["similar"]]
         # int_customer_orders shares ref stg_orders and column order_id
         assert "int_customer_orders" in names
+        assert "int_order_payments" not in names
     finally:
         db.close()
 
@@ -2410,8 +2417,8 @@ def test_find_similar_layer_bonus():
         # same layer (intermediate) → layer_bonus = 0.1
         # total ~0.36
         # Without bonus it would be ~0.26
-        assert ico["similarity"] > 0.25, (
-            f"Expected similarity > 0.25 (with layer bonus), got {ico['similarity']}"
+        assert ico["similarity"] > 0.30, (
+            f"Expected similarity > 0.30 (with layer bonus), got {ico['similarity']}"
         )
     finally:
         db.close()
@@ -2426,7 +2433,7 @@ def test_find_similar_none_found():
         result = db.query_find_similar_models(references=["brand_new_source"])
 
         assert result["similar"] == []
-        assert result["total"] == 0
+        assert result["count"] == 0
         assert "suggestion" in result
     finally:
         db.close()
@@ -2486,7 +2493,7 @@ def test_find_similar_suggestion():
         )
         assert mb is not None, "model_b should appear in results"
         # similarity = 0.6*1.0 + 0.3*(2/4) + 0.1 = 0.6 + 0.15 + 0.1 = 0.85
-        assert mb["similarity"] >= 0.8
+        assert mb["similarity"] == 0.85
         assert "suggestion" in mb
         assert "Consider extending" in mb["suggestion"]
     finally:
@@ -2499,10 +2506,56 @@ def test_find_similar_limit():
     try:
         _repo_id, _nodes = _setup_similar_models_repo(db)
 
-        result = db.query_find_similar_models(
-            references=["stg_orders"], limit=2
+        # First verify more results exist without tight limit
+        unlimited = db.query_find_similar_models(
+            references=["stg_orders"], limit=50
+        )
+        assert len(unlimited["similar"]) > 1, (
+            "Need > 1 matches to test limit"
         )
 
-        assert len(result["similar"]) <= 2
+        # Now verify limit truncates
+        result = db.query_find_similar_models(
+            references=["stg_orders"], limit=1
+        )
+        assert len(result["similar"]) == 1
+    finally:
+        db.close()
+
+
+def test_find_similar_no_inputs():
+    """Error when no inputs provided."""
+    db = GraphDB()
+    try:
+        _setup_similar_models_repo(db)
+        result = db.query_find_similar_models()
+        assert "error" in result
+        assert "at least one" in result["error"].lower()
+    finally:
+        db.close()
+
+
+def test_find_similar_model_not_found():
+    """Error when model name doesn't exist."""
+    db = GraphDB()
+    try:
+        _setup_similar_models_repo(db)
+        result = db.query_find_similar_models(model="nonexistent_model")
+        assert "error" in result
+        assert "not found" in result["error"]
+    finally:
+        db.close()
+
+
+def test_find_similar_repo_not_found():
+    """Error when repo name doesn't exist."""
+    db = GraphDB()
+    try:
+        _setup_similar_models_repo(db)
+        result = db.query_find_similar_models(
+            references=["stg_orders"], repo="nonexistent"
+        )
+        assert "error" in result
+        assert "not found" in result["error"]
     finally:
         db.close()
