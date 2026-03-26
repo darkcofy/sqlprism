@@ -3333,3 +3333,218 @@ class GraphDB:
                 for r in rows
             ],
         }
+
+    @staticmethod
+    def _extract_layer(file_path: str) -> str:
+        """Extract layer name from file path (e.g. 'models/staging/x.sql' -> 'staging')."""
+        parts = file_path.replace("\\", "/").split("/")
+        dirs = parts[:-1]  # remove filename
+        if not dirs:
+            return ""
+        # Strip 'models' prefix if present
+        if dirs[0] == "models":
+            dirs = dirs[1:]
+        return dirs[0] if dirs else ""
+
+    def query_find_similar_models(
+        self,
+        references: list[str] | None = None,
+        output_columns: list[str] | None = None,
+        model: str | None = None,
+        limit: int = 5,
+        repo: str | None = None,
+    ) -> dict:
+        """Find models similar to a given model or set of characteristics.
+
+        Args:
+            references: List of reference/dependency names to match against.
+            output_columns: List of output column names to match against.
+            model: Model name to use as the similarity target.
+            limit: Maximum number of results (default 5).
+            repo: Optional repo name filter.
+
+        Returns:
+            Dict with ``similar`` list and ``total`` count.
+        """
+
+        def jaccard(a: set[str], b: set[str]) -> float:
+            union = a | b
+            if not union:
+                return 0.0
+            return len(a & b) / len(union)
+
+        # --- Repo resolution ---
+        repo_id = None
+        if repo:
+            row = self._execute_read(
+                "SELECT repo_id FROM repos WHERE name = ?", [repo]
+            ).fetchone()
+            if not row:
+                return {"error": f"Repo '{repo}' not found"}
+            repo_id = row[0]
+
+        # --- Validate inputs ---
+        if references is None and output_columns is None and model is None:
+            return {
+                "error": (
+                    "Provide at least one of: references, output_columns, model"
+                )
+            }
+
+        # --- Target sets ---
+        target_refs: set[str] = set(references) if references else set()
+        target_cols: set[str] = set(output_columns) if output_columns else set()
+        target_model_node_id: int | None = None
+        target_layer: str | None = None
+
+        if model:
+            # Look up model node
+            model_sql = (
+                "SELECT n.node_id, f.path FROM nodes n "
+                "JOIN files f ON n.file_id = f.file_id "
+                "WHERE n.name = ? AND n.kind IN ('table', 'view')"
+            )
+            model_params: list = [model]
+            if repo_id is not None:
+                model_sql += " AND f.repo_id = ?"
+                model_params.append(repo_id)
+            model_row = self._execute_read(model_sql, model_params).fetchone()
+            if not model_row:
+                return {"error": f"Model '{model}' not found"}
+            target_model_node_id = model_row[0]
+            model_file_path: str = model_row[1]
+            target_layer = self._extract_layer(model_file_path)
+
+            # Extract model's references if not provided
+            if not target_refs:
+                ref_rows = self._execute_read(
+                    "SELECT n.name FROM edges e "
+                    "JOIN nodes n ON e.target_id = n.node_id "
+                    "WHERE e.source_id = ? AND e.relationship = 'references'",
+                    [target_model_node_id],
+                ).fetchall()
+                target_refs = {r[0] for r in ref_rows}
+
+            # Extract model's output columns if not provided
+            if not target_cols:
+                col_rows = self._execute_read(
+                    "SELECT column_name FROM columns WHERE node_id = ?",
+                    [target_model_node_id],
+                ).fetchall()
+                target_cols = {r[0] for r in col_rows}
+
+        # --- Infer target layer from references if no model ---
+        if target_layer is None and target_refs:
+            prefixes = set()
+            for ref in target_refs:
+                parts = ref.split(".")
+                if len(parts) > 1:
+                    prefixes.add(parts[0])
+                else:
+                    # Try path-like prefix
+                    path_parts = ref.replace("\\", "/").split("/")
+                    if len(path_parts) > 1:
+                        prefixes.add(path_parts[0])
+            if len(prefixes) == 1:
+                target_layer = prefixes.pop()
+
+        # --- Batch queries for candidates ---
+        # Get all candidate nodes
+        cand_sql = (
+            "SELECT n.node_id, n.name, f.path FROM nodes n "
+            "JOIN files f ON n.file_id = f.file_id "
+            "WHERE n.kind IN ('table', 'view')"
+        )
+        cand_params: list = []
+        if repo_id is not None:
+            cand_sql += " AND f.repo_id = ?"
+            cand_params.append(repo_id)
+        if target_model_node_id is not None:
+            cand_sql += " AND n.node_id != ?"
+            cand_params.append(target_model_node_id)
+
+        candidates = self._execute_read(cand_sql, cand_params).fetchall()
+        if not candidates:
+            return {
+                "similar": [],
+                "total": 0,
+                "suggestion": "No similar models found for the given criteria.",
+            }
+
+        cand_node_ids = [c[0] for c in candidates]
+
+        # Batch: all references for candidate nodes
+        placeholders = ",".join("?" * len(cand_node_ids))
+        ref_sql = (
+            f"SELECT e.source_id, n.name FROM edges e "
+            f"JOIN nodes n ON e.target_id = n.node_id "
+            f"WHERE e.source_id IN ({placeholders}) "
+            f"AND e.relationship = 'references'"
+        )
+        ref_rows = self._execute_read(ref_sql, cand_node_ids).fetchall()
+        refs_by_node: dict[int, set[str]] = {}
+        for source_id, name in ref_rows:
+            refs_by_node.setdefault(source_id, set()).add(name)
+
+        # Batch: all columns for candidate nodes
+        col_sql = (
+            f"SELECT node_id, column_name FROM columns "
+            f"WHERE node_id IN ({placeholders})"
+        )
+        col_rows = self._execute_read(col_sql, cand_node_ids).fetchall()
+        cols_by_node: dict[int, set[str]] = {}
+        for node_id, col_name in col_rows:
+            cols_by_node.setdefault(node_id, set()).add(col_name)
+
+        # --- Score candidates ---
+        scored: list[tuple[float, str, set[str], set[str], str]] = []
+        for node_id, name, file_path in candidates:
+            cand_refs = refs_by_node.get(node_id, set())
+            cand_cols = cols_by_node.get(node_id, set())
+            cand_layer = self._extract_layer(file_path)
+
+            layer_bonus = (
+                0.1
+                if target_layer is not None and cand_layer == target_layer
+                else 0.0
+            )
+            similarity = (
+                jaccard(target_refs, cand_refs) * 0.6
+                + jaccard(target_cols, cand_cols) * 0.3
+                + layer_bonus
+            )
+
+            if similarity > 0:
+                scored.append((similarity, name, cand_refs, cand_cols, file_path))
+
+        if not scored:
+            return {
+                "similar": [],
+                "total": 0,
+                "suggestion": "No similar models found for the given criteria.",
+            }
+
+        # Sort descending by similarity, apply limit
+        scored.sort(key=lambda x: x[0], reverse=True)
+        scored = scored[:limit]
+
+        # --- Build result ---
+        similar: list[dict] = []
+        for similarity, name, cand_refs, cand_cols, file_path in scored:
+            entry: dict = {
+                "name": name,
+                "similarity": round(similarity, 4),
+                "shared_refs": sorted(list(target_refs & cand_refs)),
+                "shared_columns": sorted(list(target_cols & cand_cols)),
+                "file": file_path,
+            }
+            if similarity >= 0.8:
+                entry["suggestion"] = (
+                    f"Consider extending '{name}' instead of creating a new model"
+                )
+            similar.append(entry)
+
+        return {
+            "similar": similar,
+            "total": len(similar),
+        }
