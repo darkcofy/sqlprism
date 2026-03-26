@@ -866,6 +866,8 @@ class SearchByTagInput(BaseModel):
     )
     min_confidence: float | None = Field(
         None,
+        ge=0.0,
+        le=1.0,
         description="Minimum confidence threshold (0.0-1.0). Only return models above this confidence.",
     )
     repo: str | None = Field(

@@ -2077,10 +2077,13 @@ def test_search_by_tag_ranked():
         assert len(result["models"]) == 4
 
         confidences = [m["confidence"] for m in result["models"]]
-        assert confidences == sorted(confidences, reverse=True)
+        expected = [0.90, 0.85, 0.70, 0.65]
+        assert len(confidences) == len(expected)
+        for actual, exp in zip(confidences, expected):
+            assert abs(actual - exp) < 0.01, f"Expected ~{exp}, got {actual}"
 
         for m in result["models"]:
-            assert "name" in m
+            assert "node_name" in m
             assert "confidence" in m
             assert "source" in m
     finally:
@@ -2110,6 +2113,7 @@ def test_search_by_tag_min_confidence():
         assert result["total"] == 3
         assert len(result["models"]) == 3
         assert all(m["confidence"] >= 0.5 for m in result["models"])
+        assert not any(m["node_name"] == "customer_health" for m in result["models"])
     finally:
         db.close()
 
@@ -2168,8 +2172,8 @@ def test_list_tags_all():
         assert tag_map["customer"]["model_count"] == 4
         assert tag_map["order"]["model_count"] == 3
 
-        assert "avg_confidence" in tag_map["customer"]
-        assert "avg_confidence" in tag_map["order"]
+        assert abs(tag_map["customer"]["avg_confidence"] - 0.775) < 0.01
+        assert abs(tag_map["order"]["avg_confidence"] - 0.80) < 0.01
     finally:
         db.close()
 
@@ -2224,10 +2228,32 @@ def test_tags_repo_filter():
         # search_by_tag filtered to project_a
         result_search = db.query_search_by_tag(tag="customer", repo="project_a")
         assert result_search["total"] == 2
-        assert all(m["name"].startswith("customer_") for m in result_search["models"])
+        assert all(m["node_name"].startswith("customer_") for m in result_search["models"])
 
         # search_by_tag for tag that only exists in project_b, filtered to project_a
         result_empty = db.query_search_by_tag(tag="order", repo="project_a")
         assert result_empty["total"] == 0
+    finally:
+        db.close()
+
+
+def test_search_by_tag_repo_not_found():
+    """query_search_by_tag returns error when repo name doesn't exist."""
+    db = GraphDB()
+    try:
+        result = db.query_search_by_tag(tag="customer", repo="nonexistent")
+        assert "error" in result
+        assert "nonexistent" in result["error"]
+    finally:
+        db.close()
+
+
+def test_list_tags_repo_not_found():
+    """query_list_tags returns error when repo name doesn't exist."""
+    db = GraphDB()
+    try:
+        result = db.query_list_tags(repo="nonexistent")
+        assert "error" in result
+        assert "nonexistent" in result["error"]
     finally:
         db.close()

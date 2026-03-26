@@ -3274,7 +3274,7 @@ class GraphDB:
 
         models = [
             {
-                "name": r[2],
+                "node_name": r[2],
                 "node_id": r[1],
                 "confidence": r[3],
                 "source": r[4],
@@ -3303,7 +3303,7 @@ class GraphDB:
 
         sql = (
             "SELECT tag_name, COUNT(*) AS model_count, "
-            "AVG(confidence) AS avg_confidence "
+            "ROUND(AVG(confidence), 4) AS avg_confidence "
             "FROM semantic_tags"
         )
         params: list = []
