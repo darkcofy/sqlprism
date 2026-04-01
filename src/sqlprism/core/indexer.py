@@ -231,6 +231,7 @@ class Indexer:
 
         stats = {
             "models_rendered": len(rendered),
+            "models_skipped": 0,
             "nodes_added": 0,
             "edges_added": 0,
             "column_usage_added": 0,
@@ -238,13 +239,22 @@ class Indexer:
             "lineage_chains": 0,
         }
 
+        # Load existing checksums for skip comparison
+        existing_checksums = self.graph.get_file_checksums(repo_id)
+
         with self.graph.write_transaction():
             for model_name, result in rendered.items():
                 clean_name = model_name.strip('"').replace('"."', "/")
                 file_path = clean_name + ".sql"
 
-                self.graph.delete_file_data(repo_id, file_path)
                 checksum = _checksum_parse_result(result)
+
+                # Skip if checksum matches — model hasn't changed
+                if existing_checksums.get(file_path) == checksum:
+                    stats["models_skipped"] += 1
+                    continue
+
+                self.graph.delete_file_data(repo_id, file_path)
                 file_id = self.graph.insert_file(repo_id, file_path, "sql", checksum)
                 self._insert_parse_result(result, file_id, repo_id, stats)
 

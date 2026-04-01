@@ -2146,3 +2146,71 @@ def test_reindex_sqlmesh_batch_transaction_rollback(tmp_path, monkeypatch):
             "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id_row[0]]
         ).fetchone()
         assert files[0] == 0, "Partial data should not exist after rollback"
+
+
+def test_reindex_sqlmesh_checksum_skip(tmp_path):
+    """Unchanged models are skipped on re-run."""
+    from unittest.mock import patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+    from sqlprism.types import NodeResult, ParseResult
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    result_a = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_a")],
+    )
+    rendered = {'"catalog"."schema"."model_a"': result_a}
+
+    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
+        mock_renderer.return_value.render_project.return_value = rendered
+
+        # First run — indexes everything
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 1
+        assert stats1.get("models_skipped", 0) == 0
+
+        # Second run — same rendered output, should skip
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_skipped"] == 1
+        assert stats2["nodes_added"] == 0
+
+
+def test_reindex_sqlmesh_checksum_changed(tmp_path):
+    """Changed models are re-indexed."""
+    from unittest.mock import patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+    from sqlprism.types import NodeResult, ParseResult
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    result_v1 = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_a")],
+    )
+    result_v2 = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_a"), NodeResult(kind="view", name="model_a_view")],
+    )
+
+    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
+        # First run
+        mock_renderer.return_value.render_project.return_value = {
+            '"catalog"."schema"."model_a"': result_v1,
+        }
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 1
+
+        # Second run — different parse result (different checksum)
+        mock_renderer.return_value.render_project.return_value = {
+            '"catalog"."schema"."model_a"': result_v2,
+        }
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_skipped"] == 0
+        assert stats2["nodes_added"] == 2  # re-inserted both nodes
