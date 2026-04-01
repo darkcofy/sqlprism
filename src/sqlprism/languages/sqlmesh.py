@@ -143,6 +143,57 @@ class SqlMeshRenderer:
         """
         self.sql_parser = sql_parser or SqlParser()
 
+    def render_project_raw(
+        self,
+        project_path: str | Path,
+        env_file: str | Path | None = None,
+        variables: dict[str, str | int] | None = None,
+        gateway: str = "local",
+        dialect: str = "athena",
+        sqlmesh_command: str = "uv run python",
+        venv_dir: str | Path | None = None,
+    ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+        """Render all models and return raw SQL + column schemas (no parsing).
+
+        Returns:
+            Tuple of (models_dict, column_schemas_dict) where models maps
+            model_name -> rendered_sql and column_schemas maps
+            model_name -> {col_name: data_type}.
+        """
+        project_path = Path(project_path).resolve()
+        cwd = Path(venv_dir).resolve() if venv_dir else find_venv_dir(project_path)
+        env = build_env(env_file)
+        vars_ = variables or {}
+
+        try:
+            all_models = self._list_models(
+                project_path, cwd, env, vars_, gateway, dialect, sqlmesh_command,
+            )
+        except Exception:
+            logger.warning("Model discovery failed, falling back to single subprocess", exc_info=True)
+            all_models = []
+
+        if len(all_models) >= 20:
+            models, errors, column_schemas = self._render_batches_parallel(
+                project_path, cwd, env, vars_, gateway, dialect,
+                sqlmesh_command, all_models,
+            )
+        else:
+            models, errors, column_schemas = self._run_render_script(
+                project_path=project_path, cwd=cwd, env=env,
+                variables=vars_, gateway=gateway, dialect=dialect,
+                sqlmesh_command=sqlmesh_command, model_filter=all_models if all_models else [],
+            )
+
+        for err in errors:
+            logger.warning(
+                "sqlmesh render error for model %s: %s",
+                err.get("model", "<unknown>"),
+                err.get("error", "<no message>"),
+            )
+
+        return models, column_schemas
+
     def render_project(
         self,
         project_path: str | Path,

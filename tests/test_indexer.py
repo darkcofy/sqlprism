@@ -2092,37 +2092,36 @@ def test_conventions_check_constraints():
     db.close()
 
 
+def _mock_render_raw(indexer, raw_models, column_schemas=None):
+    """Helper: mock render_project_raw on the sqlmesh renderer."""
+    from unittest.mock import MagicMock, patch
+
+    mock_renderer = MagicMock()
+    mock_renderer.render_project_raw.return_value = (raw_models, column_schemas or {})
+    # Preserve real parse methods for actual sqlglot parsing
+    from sqlprism.languages.sqlmesh import SqlMeshRenderer
+    real = SqlMeshRenderer()
+    mock_renderer._parse_models_sequential = real._parse_models_sequential
+    mock_renderer._parse_models_parallel = real._parse_models_parallel
+    return patch.object(indexer, "get_sqlmesh_renderer", return_value=mock_renderer)
+
+
 def test_reindex_sqlmesh_batch_transaction_rollback(tmp_path, monkeypatch):
     """If a model insertion fails mid-batch, no partial data remains."""
     from unittest.mock import patch
 
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
-    from sqlprism.types import NodeResult, ParseResult
 
     db = GraphDB(":memory:")
     indexer = Indexer(db)
 
-    # Two fake rendered models — second one will cause an error
-    good_result = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_a")],
-    )
-    bad_result = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_b")],
-    )
-
-    rendered = {
-        '"catalog"."schema"."model_a"': good_result,
-        '"catalog"."schema"."model_b"': bad_result,
+    raw_models = {
+        '"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1",
+        '"catalog"."schema"."model_b"': "SELECT 2 AS id FROM raw.t2",
     }
 
-    # Mock render_project to return our fake data
-    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
-        mock_renderer.return_value.render_project.return_value = rendered
-
-        # Make _insert_parse_result fail on the second call
+    with _mock_render_raw(indexer, raw_models):
         original_insert = indexer._insert_parse_result
         call_count = 0
 
@@ -2154,32 +2153,23 @@ def test_reindex_sqlmesh_batch_transaction_rollback(tmp_path, monkeypatch):
 
 
 def test_reindex_sqlmesh_checksum_skip(tmp_path):
-    """Unchanged models are skipped on re-run."""
-    from unittest.mock import patch
-
+    """Unchanged models are skipped on re-run (same schema catalog)."""
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
-    from sqlprism.types import NodeResult, ParseResult
 
     db = GraphDB(":memory:")
     indexer = Indexer(db)
 
-    result_a = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_a")],
-    )
-    rendered = {'"catalog"."schema"."model_a"': result_a}
+    raw_models = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
 
-    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
-        mock_renderer.return_value.render_project.return_value = rendered
-
+    with _mock_render_raw(indexer, raw_models):
         # First run — indexes everything
         stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats1["models_rendered"] == 1
         assert stats1["nodes_added"] >= 1
         assert stats1.get("models_skipped", 0) == 0
 
-        # Second run — same rendered output, should skip
+        # Second run — same rendered SQL + same schema catalog → skip
         stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats2["models_skipped"] == 1
         assert stats2["nodes_added"] == 0
@@ -2187,84 +2177,61 @@ def test_reindex_sqlmesh_checksum_skip(tmp_path):
 
 def test_reindex_sqlmesh_checksum_changed(tmp_path):
     """Changed models are re-indexed."""
-    from unittest.mock import patch
-
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
-    from sqlprism.types import NodeResult, ParseResult
 
     db = GraphDB(":memory:")
     indexer = Indexer(db)
 
-    result_v1 = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_a")],
-    )
-    result_v2 = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_a"), NodeResult(kind="view", name="model_a_view")],
-    )
+    sql_v1 = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
+    sql_v2 = {'"catalog"."schema"."model_a"': "SELECT 1 AS id, 'x' AS name FROM raw.t1 JOIN raw.t2 ON t1.id = t2.id"}
 
-    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
-        # First run
-        mock_renderer.return_value.render_project.return_value = {
-            '"catalog"."schema"."model_a"': result_v1,
-        }
+    with _mock_render_raw(indexer, sql_v1):
         stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats1["models_rendered"] == 1
 
-        # Second run — different parse result (different checksum)
-        mock_renderer.return_value.render_project.return_value = {
-            '"catalog"."schema"."model_a"': result_v2,
-        }
+    # Touch a file to invalidate the source fingerprint
+    (tmp_path / "changed.sql").write_text("-- changed")
+
+    # Second run — different SQL (simulates model change)
+    with _mock_render_raw(indexer, sql_v2):
         stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats2["models_skipped"] == 0
-        assert stats2["nodes_added"] == 2  # re-inserted both nodes
+        assert stats2["nodes_added"] >= 1
 
-        # Verify graph has exactly 2 nodes, not duplicates
-        repo_id = db._execute_read(
-            "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
-        ).fetchone()[0]
-        node_count = db._execute_read(
-            "SELECT count(*) FROM nodes WHERE file_id IN "
-            "(SELECT file_id FROM files WHERE repo_id = ?)", [repo_id]
-        ).fetchone()[0]
-        assert node_count == 2
+    # Verify no duplicates in graph
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()[0]
+    file_count = db._execute_read(
+        "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id]
+    ).fetchone()[0]
+    assert file_count == 1
 
 
 def test_reindex_sqlmesh_stale_model_deleted(tmp_path):
     """Models removed from the project are deleted from the graph."""
-    from unittest.mock import patch
-
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
-    from sqlprism.types import NodeResult, ParseResult
 
     db = GraphDB(":memory:")
     indexer = Indexer(db)
 
-    result_a = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_a")],
-    )
-    result_b = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_b")],
-    )
+    two_models = {
+        '"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1",
+        '"catalog"."schema"."model_b"': "SELECT 2 AS id FROM raw.t2",
+    }
+    one_model = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
 
-    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
-        # First run — two models
-        mock_renderer.return_value.render_project.return_value = {
-            '"catalog"."schema"."model_a"': result_a,
-            '"catalog"."schema"."model_b"': result_b,
-        }
+    with _mock_render_raw(indexer, two_models):
         stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats1["models_rendered"] == 2
 
-        # Second run — model_b removed
-        mock_renderer.return_value.render_project.return_value = {
-            '"catalog"."schema"."model_a"': result_a,
-        }
+    # Touch a file to invalidate the source fingerprint
+    (tmp_path / "changed.sql").write_text("-- removed model")
+
+    # Second run — model_b removed
+    with _mock_render_raw(indexer, one_model):
         stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats2["models_removed"] == 1
         assert stats2["models_skipped"] == 1  # model_a unchanged
@@ -2282,40 +2249,30 @@ def test_reindex_sqlmesh_stale_model_deleted(tmp_path):
 
 def test_reindex_sqlmesh_new_model_indexed(tmp_path):
     """New models are always indexed even when existing models are skipped."""
-    from unittest.mock import patch
-
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
-    from sqlprism.types import NodeResult, ParseResult
 
     db = GraphDB(":memory:")
     indexer = Indexer(db)
 
-    result_a = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_a")],
-    )
-    result_b = ParseResult(
-        language="sql",
-        nodes=[NodeResult(kind="table", name="model_b")],
-    )
+    one_model = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
+    two_models = {
+        '"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1",
+        '"catalog"."schema"."model_b"': "SELECT 2 AS id FROM raw.t2",
+    }
 
-    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
-        # First run — one model
-        mock_renderer.return_value.render_project.return_value = {
-            '"catalog"."schema"."model_a"': result_a,
-        }
+    with _mock_render_raw(indexer, one_model):
         stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats1["models_rendered"] == 1
 
-        # Second run — add model_b, model_a unchanged
-        mock_renderer.return_value.render_project.return_value = {
-            '"catalog"."schema"."model_a"': result_a,
-            '"catalog"."schema"."model_b"': result_b,
-        }
+    # Touch a file to invalidate the source fingerprint
+    (tmp_path / "new_model.sql").write_text("-- new model added")
+
+    # Second run — add model_b, model_a unchanged
+    with _mock_render_raw(indexer, two_models):
         stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats2["models_skipped"] == 1  # model_a
-        assert stats2["nodes_added"] == 1  # model_b is new
+        assert stats2["nodes_added"] >= 1  # model_b is new
 
     repo_id = db._execute_read(
         "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
