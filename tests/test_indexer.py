@@ -2137,15 +2137,20 @@ def test_reindex_sqlmesh_batch_transaction_rollback(tmp_path, monkeypatch):
             with pytest.raises(RuntimeError, match="Simulated insertion failure"):
                 indexer.reindex_sqlmesh("test_repo", tmp_path)
 
-    # Verify nothing was committed — no files in the repo
+    # Verify nothing was committed — no files or nodes in the repo
     repo_id_row = db._execute_read(
         "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
     ).fetchone()
-    if repo_id_row:
-        files = db._execute_read(
-            "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id_row[0]]
-        ).fetchone()
-        assert files[0] == 0, "Partial data should not exist after rollback"
+    assert repo_id_row is not None, "Repo row should exist (upsert_repo runs before transaction)"
+    files = db._execute_read(
+        "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id_row[0]]
+    ).fetchone()
+    assert files[0] == 0, "Partial file data should not exist after rollback"
+    nodes = db._execute_read(
+        "SELECT count(*) FROM nodes WHERE file_id IN "
+        "(SELECT file_id FROM files WHERE repo_id = ?)", [repo_id_row[0]]
+    ).fetchone()
+    assert nodes[0] == 0, "Partial node data should not exist after rollback"
 
 
 def test_reindex_sqlmesh_checksum_skip(tmp_path):
@@ -2214,3 +2219,107 @@ def test_reindex_sqlmesh_checksum_changed(tmp_path):
         stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats2["models_skipped"] == 0
         assert stats2["nodes_added"] == 2  # re-inserted both nodes
+
+        # Verify graph has exactly 2 nodes, not duplicates
+        repo_id = db._execute_read(
+            "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+        ).fetchone()[0]
+        node_count = db._execute_read(
+            "SELECT count(*) FROM nodes WHERE file_id IN "
+            "(SELECT file_id FROM files WHERE repo_id = ?)", [repo_id]
+        ).fetchone()[0]
+        assert node_count == 2
+
+
+def test_reindex_sqlmesh_stale_model_deleted(tmp_path):
+    """Models removed from the project are deleted from the graph."""
+    from unittest.mock import patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+    from sqlprism.types import NodeResult, ParseResult
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    result_a = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_a")],
+    )
+    result_b = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_b")],
+    )
+
+    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
+        # First run — two models
+        mock_renderer.return_value.render_project.return_value = {
+            '"catalog"."schema"."model_a"': result_a,
+            '"catalog"."schema"."model_b"': result_b,
+        }
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 2
+
+        # Second run — model_b removed
+        mock_renderer.return_value.render_project.return_value = {
+            '"catalog"."schema"."model_a"': result_a,
+        }
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_removed"] == 1
+        assert stats2["models_skipped"] == 1  # model_a unchanged
+
+    # Verify only model_a remains in graph
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()[0]
+    files = db._execute_read(
+        "SELECT path FROM files WHERE repo_id = ?", [repo_id]
+    ).fetchall()
+    assert len(files) == 1
+    assert files[0][0] == "catalog/schema/model_a.sql"
+
+
+def test_reindex_sqlmesh_new_model_indexed(tmp_path):
+    """New models are always indexed even when existing models are skipped."""
+    from unittest.mock import patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+    from sqlprism.types import NodeResult, ParseResult
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    result_a = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_a")],
+    )
+    result_b = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_b")],
+    )
+
+    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
+        # First run — one model
+        mock_renderer.return_value.render_project.return_value = {
+            '"catalog"."schema"."model_a"': result_a,
+        }
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 1
+
+        # Second run — add model_b, model_a unchanged
+        mock_renderer.return_value.render_project.return_value = {
+            '"catalog"."schema"."model_a"': result_a,
+            '"catalog"."schema"."model_b"': result_b,
+        }
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_skipped"] == 1  # model_a
+        assert stats2["nodes_added"] == 1  # model_b is new
+
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()[0]
+    file_count = db._execute_read(
+        "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id]
+    ).fetchone()[0]
+    assert file_count == 2

@@ -269,6 +269,7 @@ class SqlMeshRenderer:
         merged_models: dict[str, str] = {}
         merged_errors: list[dict] = []
         merged_schemas: dict[str, dict[str, str]] = {}
+        failed_batches = 0
 
         def render_batch(batch: list[str]):
             return self._run_render_script(
@@ -292,8 +293,22 @@ class SqlMeshRenderer:
                     merged_errors.extend(errors)
                     merged_schemas.update(schemas)
                 except Exception as e:
-                    logger.error("Render batch %d failed: %s", batch_idx, e)
-                    merged_errors.append({"model": f"batch_{batch_idx}", "error": str(e)})
+                    failed_batches += 1
+                    batch_size = len(batches[batch_idx])
+                    logger.error(
+                        "Render batch %d failed (%d models lost): %s",
+                        batch_idx, batch_size, e,
+                    )
+                    merged_errors.append({
+                        "model": f"batch_{batch_idx}",
+                        "error": str(e),
+                        "models_lost": batch_size,
+                    })
+
+        if failed_batches == len(batches):
+            raise RuntimeError(
+                f"All {len(batches)} render batches failed. Check logs for details."
+            )
 
         return merged_models, merged_errors, merged_schemas
 

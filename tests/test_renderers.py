@@ -608,12 +608,13 @@ def test_sqlmesh_render_project_unchanged(tmp_path):
 # ── Parallel subprocess rendering tests (#92) ──
 
 
-def test_list_models_script_syntax():
-    """The _LIST_MODELS_SCRIPT is valid Python syntax."""
+def test_inline_scripts_syntax():
+    """Both inline scripts are valid Python syntax."""
     import ast
 
-    from sqlprism.languages.sqlmesh import _LIST_MODELS_SCRIPT
+    from sqlprism.languages.sqlmesh import _LIST_MODELS_SCRIPT, _RENDER_SCRIPT
     ast.parse(_LIST_MODELS_SCRIPT)
+    ast.parse(_RENDER_SCRIPT)
 
 
 def test_batch_splitting():
@@ -627,6 +628,25 @@ def test_batch_splitting():
     assert sorted(flat) == sorted(models)
     sizes = [len(b) for b in batches]
     assert max(sizes) - min(sizes) <= 1
+
+
+def test_batch_splitting_edge_cases():
+    """Batch splitting handles edge cases correctly."""
+    from sqlprism.languages.sqlmesh import _split_into_batches
+
+    # Empty list
+    assert _split_into_batches([], 3) == []
+
+    # num_batches=0 returns single batch
+    assert _split_into_batches(["a", "b"], 0) == [["a", "b"]]
+
+    # num_batches > len(items) produces len(items) batches
+    batches = _split_into_batches(["a", "b"], 5)
+    assert len(batches) == 2
+    assert sorted(m for b in batches for m in b) == ["a", "b"]
+
+    # Single item
+    assert _split_into_batches(["a"], 3) == [["a"]]
 
 
 # ── Integration tests: Indexer → Renderer → Graph (#14) ──
@@ -1166,12 +1186,8 @@ def test_parallel_parse_matches_sequential():
     }
     column_schemas = {}
 
-    sequential_results = {}
-    for model_name, sql in models.items():
-        clean_name = model_name.strip('"').replace('"."', "/")
-        result = renderer.sql_parser.parse(clean_name + ".sql", sql)
-        sequential_results[model_name] = result
-
+    # Use the same code path for both to ensure apples-to-apples comparison
+    sequential_results = renderer._parse_models_sequential(models, column_schemas, schema_catalog=None)
     parallel_results = renderer._parse_models_parallel(models, column_schemas, schema_catalog=None)
 
     for name in models:
