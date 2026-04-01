@@ -78,6 +78,42 @@ _RENDER_SCRIPT = textwrap.dedent("""\
 """)
 
 
+_LIST_MODELS_SCRIPT = textwrap.dedent("""\
+    import json
+    import sys
+
+    project_path = sys.argv[1]
+    dialect = sys.argv[2]
+    gateway = sys.argv[3]
+    variables = json.loads(sys.argv[4])
+
+    from sqlmesh import Context
+    from sqlmesh.core.config import (
+        Config, DuckDBConnectionConfig, GatewayConfig, ModelDefaultsConfig,
+    )
+
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect=dialect),
+        gateways={gateway: GatewayConfig(connection=DuckDBConnectionConfig())},
+        default_gateway=gateway,
+        variables=variables,
+    )
+
+    context = Context(paths=[project_path], config=config)
+    json.dump(list(context.models), sys.stdout)
+""")
+
+
+def _split_into_batches(items: list, num_batches: int) -> list[list]:
+    """Split a list into num_batches balanced sublists."""
+    if num_batches <= 0:
+        return [items]
+    batches: list[list] = [[] for _ in range(min(num_batches, len(items)))]
+    for i, item in enumerate(items):
+        batches[i % len(batches)].append(item)
+    return batches
+
+
 def _parse_model_worker(args: tuple) -> tuple[str, ParseResult]:
     """Worker function for parallel parsing. Must be top-level for pickling."""
     model_name, rendered_sql, dialect, schema_catalog = args
@@ -182,6 +218,84 @@ class SqlMeshRenderer:
             model_filter=model_names,
         )
 
+    def _list_models(
+        self,
+        project_path: Path,
+        cwd: Path,
+        env: dict[str, str],
+        variables: dict[str, str | int],
+        gateway: str,
+        dialect: str,
+        sqlmesh_command: str,
+    ) -> list[str]:
+        """Run a lightweight subprocess to discover all model names."""
+        _validate_command(sqlmesh_command, allowed_keywords={"python", "sqlmesh", "uv"})
+        cmd = shlex.split(sqlmesh_command) + [
+            "-c",
+            _LIST_MODELS_SCRIPT,
+            str(project_path),
+            dialect,
+            gateway,
+            json.dumps(variables),
+        ]
+
+        result = subprocess.run(
+            cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=300,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"sqlmesh list-models failed (exit {result.returncode}):\n{result.stderr}")
+
+        return json.loads(result.stdout)
+
+    def _render_batches_parallel(
+        self,
+        project_path: Path,
+        cwd: Path,
+        env: dict[str, str],
+        variables: dict[str, str | int],
+        gateway: str,
+        dialect: str,
+        sqlmesh_command: str,
+        all_models: list[str],
+    ) -> tuple[dict[str, str], list[dict], dict[str, dict[str, str]]]:
+        """Render models in parallel batches via concurrent subprocesses."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        num_workers = min(os.cpu_count() or 1, 4)
+        batches = _split_into_batches(all_models, num_workers)
+
+        merged_models: dict[str, str] = {}
+        merged_errors: list[dict] = []
+        merged_schemas: dict[str, dict[str, str]] = {}
+
+        def render_batch(batch: list[str]):
+            return self._run_render_script(
+                project_path=project_path,
+                cwd=cwd,
+                env=env,
+                variables=variables,
+                gateway=gateway,
+                dialect=dialect,
+                sqlmesh_command=sqlmesh_command,
+                model_filter=batch,
+            )
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = {pool.submit(render_batch, batch): i for i, batch in enumerate(batches)}
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                try:
+                    models, errors, schemas = future.result()
+                    merged_models.update(models)
+                    merged_errors.extend(errors)
+                    merged_schemas.update(schemas)
+                except Exception as e:
+                    logger.error("Render batch %d failed: %s", batch_idx, e)
+                    merged_errors.append({"model": f"batch_{batch_idx}", "error": str(e)})
+
+        return merged_models, merged_errors, merged_schemas
+
     def _render_and_parse(
         self,
         project_path: str | Path,
@@ -203,17 +317,36 @@ class SqlMeshRenderer:
             cwd = find_venv_dir(project_path)
 
         env = build_env(env_file)
+        vars_ = variables or {}
 
-        models, errors, column_schemas = self._run_render_script(
-            project_path=project_path,
-            cwd=cwd,
-            env=env,
-            variables=variables or {},
-            gateway=gateway,
-            dialect=dialect,
-            sqlmesh_command=sqlmesh_command,
-            model_filter=model_filter or [],
-        )
+        if model_filter:
+            # Selective render — single subprocess, no discovery needed
+            models, errors, column_schemas = self._run_render_script(
+                project_path=project_path, cwd=cwd, env=env,
+                variables=vars_, gateway=gateway, dialect=dialect,
+                sqlmesh_command=sqlmesh_command, model_filter=model_filter,
+            )
+        else:
+            # Full project render — discover models, then parallel batches
+            try:
+                all_models = self._list_models(
+                    project_path, cwd, env, vars_, gateway, dialect, sqlmesh_command,
+                )
+            except Exception:
+                logger.warning("Model discovery failed, falling back to single subprocess", exc_info=True)
+                all_models = []
+
+            if len(all_models) >= 20:
+                models, errors, column_schemas = self._render_batches_parallel(
+                    project_path, cwd, env, vars_, gateway, dialect,
+                    sqlmesh_command, all_models,
+                )
+            else:
+                models, errors, column_schemas = self._run_render_script(
+                    project_path=project_path, cwd=cwd, env=env,
+                    variables=vars_, gateway=gateway, dialect=dialect,
+                    sqlmesh_command=sqlmesh_command, model_filter=all_models if all_models else [],
+                )
 
         for err in errors:
             logger.warning(

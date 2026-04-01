@@ -217,7 +217,10 @@ def test_sqlmesh_render_project_command_construction(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout=json.dumps({"rendered": {}, "errors": []}),
@@ -258,7 +261,10 @@ def test_sqlmesh_render_project_nonzero_exit(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(
             returncode=1,
             stdout="",
@@ -275,7 +281,10 @@ def test_sqlmesh_render_project_timeout(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["uv", "run", "python", "-c", "..."], timeout=600)
 
         with pytest.raises(subprocess.TimeoutExpired):
@@ -294,7 +303,10 @@ def test_sqlmesh_render_project_success(tmp_path):
     }
     stdout_json = json.dumps({"rendered": rendered_models, "errors": []})
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
 
         results = renderer.render_project(project_path=tmp_path)
@@ -316,7 +328,10 @@ def test_sqlmesh_render_project_bad_json(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="this is not valid json {{{",
@@ -578,13 +593,40 @@ def test_sqlmesh_render_project_unchanged(tmp_path):
 
     stdout_json = json.dumps({"rendered": {}, "errors": []})
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
         renderer.render_project(project_path=tmp_path)
 
     # render_project passes empty model_filter (render all)
     cmd = mock_run.call_args[0][0]
     assert json.loads(cmd[-1]) == [], "render_project should pass empty filter"
+
+
+# ── Parallel subprocess rendering tests (#92) ──
+
+
+def test_list_models_script_syntax():
+    """The _LIST_MODELS_SCRIPT is valid Python syntax."""
+    import ast
+
+    from sqlprism.languages.sqlmesh import _LIST_MODELS_SCRIPT
+    ast.parse(_LIST_MODELS_SCRIPT)
+
+
+def test_batch_splitting():
+    """Models are split into balanced batches."""
+    from sqlprism.languages.sqlmesh import _split_into_batches
+
+    models = [f"model_{i}" for i in range(10)]
+    batches = _split_into_batches(models, num_batches=3)
+    assert len(batches) == 3
+    flat = [m for batch in batches for m in batch]
+    assert sorted(flat) == sorted(models)
+    sizes = [len(b) for b in batches]
+    assert max(sizes) - min(sizes) <= 1
 
 
 # ── Integration tests: Indexer → Renderer → Graph (#14) ──
