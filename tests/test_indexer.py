@@ -2090,3 +2090,59 @@ def test_conventions_check_constraints():
             [repo_id, node_id],
         )
     db.close()
+
+
+def test_reindex_sqlmesh_batch_transaction_rollback(tmp_path, monkeypatch):
+    """If a model insertion fails mid-batch, no partial data remains."""
+    from unittest.mock import patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+    from sqlprism.types import NodeResult, ParseResult
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    # Two fake rendered models — second one will cause an error
+    good_result = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_a")],
+    )
+    bad_result = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="table", name="model_b")],
+    )
+
+    rendered = {
+        '"catalog"."schema"."model_a"': good_result,
+        '"catalog"."schema"."model_b"': bad_result,
+    }
+
+    # Mock render_project to return our fake data
+    with patch.object(indexer, "get_sqlmesh_renderer") as mock_renderer:
+        mock_renderer.return_value.render_project.return_value = rendered
+
+        # Make _insert_parse_result fail on the second call
+        original_insert = indexer._insert_parse_result
+        call_count = 0
+
+        def failing_insert(result, file_id, repo_id, stats):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("Simulated insertion failure")
+            return original_insert(result, file_id, repo_id, stats)
+
+        with patch.object(indexer, "_insert_parse_result", side_effect=failing_insert):
+            with pytest.raises(RuntimeError, match="Simulated insertion failure"):
+                indexer.reindex_sqlmesh("test_repo", tmp_path)
+
+    # Verify nothing was committed — no files in the repo
+    repo_id_row = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()
+    if repo_id_row:
+        files = db._execute_read(
+            "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id_row[0]]
+        ).fetchone()
+        assert files[0] == 0, "Partial data should not exist after rollback"

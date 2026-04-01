@@ -238,12 +238,11 @@ class Indexer:
             "lineage_chains": 0,
         }
 
-        for model_name, result in rendered.items():
-            clean_name = model_name.strip('"').replace('"."', "/")
-            file_path = clean_name + ".sql"
+        with self.graph.write_transaction():
+            for model_name, result in rendered.items():
+                clean_name = model_name.strip('"').replace('"."', "/")
+                file_path = clean_name + ".sql"
 
-            # Wrap delete + insert per model in a transaction for atomicity
-            with self.graph.write_transaction():
                 self.graph.delete_file_data(repo_id, file_path)
                 checksum = _checksum_parse_result(result)
                 file_id = self.graph.insert_file(repo_id, file_path, "sql", checksum)
