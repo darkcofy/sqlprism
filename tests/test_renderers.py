@@ -1109,6 +1109,37 @@ models:
     assert len(set(positions)) == 3  # all unique
 
 
+def test_parallel_parse_matches_sequential():
+    """Parallel parsing produces identical results to sequential."""
+    from sqlprism.languages.sqlmesh import SqlMeshRenderer
+
+    renderer = SqlMeshRenderer()
+
+    models = {
+        "model_a": "SELECT id, name FROM raw.users WHERE active = true",
+        "model_b": "SELECT o.id, u.name FROM raw.orders o JOIN raw.users u ON o.user_id = u.id",
+        "model_c": "WITH cte AS (SELECT * FROM raw.events) SELECT * FROM cte",
+        "model_d": "SELECT count(*) as cnt, status FROM raw.orders GROUP BY status",
+        "model_e": "SELECT a.id FROM raw.a a LEFT JOIN raw.b b ON a.id = b.a_id WHERE b.id IS NULL",
+    }
+    column_schemas = {}
+
+    sequential_results = {}
+    for model_name, sql in models.items():
+        clean_name = model_name.strip('"').replace('"."', "/")
+        result = renderer.sql_parser.parse(clean_name + ".sql", sql)
+        sequential_results[model_name] = result
+
+    parallel_results = renderer._parse_models_parallel(models, column_schemas, schema_catalog=None)
+
+    for name in models:
+        seq = sequential_results[name]
+        par = parallel_results[name]
+        assert len(seq.nodes) == len(par.nodes), f"{name}: node count mismatch"
+        assert len(seq.edges) == len(par.edges), f"{name}: edge count mismatch"
+        assert len(seq.column_usage) == len(par.column_usage), f"{name}: column_usage mismatch"
+
+
 def test_extract_schema_yml_sources(tmp_path):
     """sources: blocks with tables and columns are extracted."""
     _write_yaml(

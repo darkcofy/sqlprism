@@ -11,9 +11,11 @@ whatever sqlmesh version the project already has installed.
 
 import json
 import logging
+import os
 import shlex
 import subprocess
 import textwrap
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from sqlprism.languages.sql import SqlParser
@@ -74,6 +76,16 @@ _RENDER_SCRIPT = textwrap.dedent("""\
 
     json.dump({"rendered": rendered, "errors": errors, "column_schemas": column_schemas}, sys.stdout)
 """)
+
+
+def _parse_model_worker(args: tuple) -> tuple[str, ParseResult]:
+    """Worker function for parallel parsing. Must be top-level for pickling."""
+    model_name, rendered_sql, dialect, schema_catalog = args
+    parser = SqlParser(dialect=dialect)
+    clean_name = model_name.strip('"').replace('"."', "/")
+    result = parser.parse(clean_name + ".sql", rendered_sql, schema=schema_catalog)
+    enrich_nodes(result, "sqlmesh_model", model_name)
+    return model_name, result
 
 
 class SqlMeshRenderer:
@@ -210,14 +222,27 @@ class SqlMeshRenderer:
                 err.get("error", "<no message>"),
             )
 
+        # Use parallel parsing for large model sets, sequential for small
+        if len(models) >= 20:
+            results = self._parse_models_parallel(models, column_schemas, schema_catalog)
+        else:
+            results = self._parse_models_sequential(models, column_schemas, schema_catalog)
+
+        return results
+
+    def _parse_models_sequential(
+        self,
+        models: dict[str, str],
+        column_schemas: dict[str, dict[str, str]],
+        schema_catalog: dict | None,
+    ) -> dict[str, ParseResult]:
+        """Parse rendered models sequentially (baseline / fallback)."""
         results: dict[str, ParseResult] = {}
         for model_name, rendered_sql in models.items():
             clean_name = model_name.strip('"').replace('"."', "/")
             result = self.sql_parser.parse(clean_name + ".sql", rendered_sql, schema=schema_catalog)
             enrich_nodes(result, "sqlmesh_model", model_name)
 
-            # Attach column definitions from sqlmesh model schema
-            # sqlmesh_schema wins over inferred/definition columns from parser
             if model_name in column_schemas:
                 col_defs = _build_column_defs(model_name, column_schemas[model_name])
                 schema_names = {c.column_name for c in col_defs}
@@ -228,6 +253,39 @@ class SqlMeshRenderer:
                 result.columns.extend(col_defs)
 
             results[model_name] = result
+        return results
+
+    def _parse_models_parallel(
+        self,
+        models: dict[str, str],
+        column_schemas: dict[str, dict[str, str]],
+        schema_catalog: dict | None,
+    ) -> dict[str, ParseResult]:
+        """Parse rendered models in parallel using ProcessPoolExecutor."""
+        max_workers = min(os.cpu_count() or 1, 8)
+        dialect = self.sql_parser.dialect
+
+        work_items = [
+            (model_name, rendered_sql, dialect, schema_catalog)
+            for model_name, rendered_sql in models.items()
+        ]
+
+        results: dict[str, ParseResult] = {}
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                for model_name, result in pool.map(_parse_model_worker, work_items):
+                    if model_name in column_schemas:
+                        col_defs = _build_column_defs(model_name, column_schemas[model_name])
+                        schema_names = {c.column_name for c in col_defs}
+                        result.columns = [
+                            c for c in result.columns
+                            if c.node_name != model_name or c.column_name not in schema_names
+                        ]
+                        result.columns.extend(col_defs)
+                    results[model_name] = result
+        except Exception:
+            logger.warning("Parallel parsing failed, falling back to sequential", exc_info=True)
+            return self._parse_models_sequential(models, column_schemas, schema_catalog)
 
         return results
 
