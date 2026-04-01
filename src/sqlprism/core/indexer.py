@@ -232,6 +232,7 @@ class Indexer:
         stats = {
             "models_rendered": len(rendered),
             "models_skipped": 0,
+            "models_removed": 0,
             "nodes_added": 0,
             "edges_added": 0,
             "column_usage_added": 0,
@@ -265,9 +266,10 @@ class Indexer:
             # Delete stale models that no longer exist in the project
             for stale_path in set(existing_checksums) - seen_paths:
                 self.graph.delete_file_data(repo_id, stale_path)
-                stats["models_removed"] = stats.get("models_removed", 0) + 1
+                stats["models_removed"] += 1
 
-        phantoms_cleaned = self.graph.cleanup_phantoms()
+            # Cleanup phantoms inside the transaction for atomicity
+            phantoms_cleaned = self.graph.cleanup_phantoms()
 
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
@@ -1187,7 +1189,7 @@ def _checksum_parse_result(result: ParseResult) -> str:
         for cu in result.column_usage
     )
     for cl in sorted(result.column_lineage, key=lambda c: (c.output_node, c.output_column)):
-        hops = "|".join(f"{h.table}.{h.column}:{h.expression}" for h in cl.chain)
+        hops = "|".join(f"{h.table}.{h.column}:{h.expression or ''}" for h in cl.chain)
         parts.append(f"CL:{cl.output_node}:{cl.output_column}:{hops}")
     parts += sorted(
         f"CD:{col.node_name}:{col.column_name}:{col.data_type}:{col.position}:{col.source}"

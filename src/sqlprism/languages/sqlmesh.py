@@ -263,6 +263,9 @@ class SqlMeshRenderer:
         """Render models in parallel batches via concurrent subprocesses."""
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        if not all_models:
+            return {}, [], {}
+
         num_workers = min(os.cpu_count() or 1, 4)
         batches = _split_into_batches(all_models, num_workers)
 

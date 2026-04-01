@@ -2176,6 +2176,7 @@ def test_reindex_sqlmesh_checksum_skip(tmp_path):
         # First run — indexes everything
         stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
         assert stats1["models_rendered"] == 1
+        assert stats1["nodes_added"] >= 1
         assert stats1.get("models_skipped", 0) == 0
 
         # Second run — same rendered output, should skip
