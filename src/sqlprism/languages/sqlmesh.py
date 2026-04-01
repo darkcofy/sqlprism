@@ -475,7 +475,11 @@ class SqlMeshRenderer:
 
         results: dict[str, ParseResult] = {}
         try:
-            ctx = mp.get_context("forkserver")
+            # Use fork (fast) for CLI; forkserver (safe) when called from
+            # multi-threaded contexts like the MCP async server.
+            import threading
+            method = "fork" if threading.active_count() == 1 else "forkserver"
+            ctx = mp.get_context(method)
             with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
                 for model_name, result in pool.map(_parse_model_worker, work_items):
                     if model_name in column_schemas:
