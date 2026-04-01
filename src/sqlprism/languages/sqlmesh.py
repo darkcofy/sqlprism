@@ -11,6 +11,7 @@ whatever sqlmesh version the project already has installed.
 
 import json
 import logging
+import multiprocessing as mp
 import os
 import shlex
 import subprocess
@@ -405,7 +406,8 @@ class SqlMeshRenderer:
 
         results: dict[str, ParseResult] = {}
         try:
-            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            ctx = mp.get_context("forkserver")
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
                 for model_name, result in pool.map(_parse_model_worker, work_items):
                     if model_name in column_schemas:
                         col_defs = _build_column_defs(model_name, column_schemas[model_name])

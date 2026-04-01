@@ -1178,4 +1178,6 @@ def _checksum_parse_result(result: ParseResult) -> str:
     for cl in result.column_lineage:
         hops = "|".join(f"{h.table}.{h.column}:{h.expression}" for h in cl.chain)
         parts.append(f"CL:{cl.output_node}:{cl.output_column}:{hops}")
+    for col in result.columns:
+        parts.append(f"CD:{col.node_name}:{col.column_name}:{col.data_type}:{col.source}")
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
