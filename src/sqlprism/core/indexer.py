@@ -199,6 +199,11 @@ class Indexer:
         Uses ``SqlMeshRenderer`` to render every model via subprocess,
         then parses the rendered SQL and inserts results into the graph.
 
+        When source files haven't changed (matching fingerprint), skips the
+        expensive rendering subprocess and re-parses cached SQL with the
+        current schema catalog. This allows schema enrichment (SELECT *
+        expansion) to converge while avoiding redundant rendering.
+
         Args:
             repo_name: Repo name in the index.
             project_path: Path to the sqlmesh project directory
@@ -219,18 +224,46 @@ class Indexer:
         # Build schema catalog from existing index for SELECT * expansion
         schema_catalog = self.graph.get_table_columns(repo_id) or None
 
-        rendered = self.get_sqlmesh_renderer(dialect).render_project(
-            project_path=project_path,
-            env_file=env_file,
-            variables=variables,
-            dialect=dialect,
-            sqlmesh_command=sqlmesh_command,
-            venv_dir=venv_dir,
-            schema_catalog=schema_catalog,
-        )
+        # Check if source files changed — skip rendering subprocess if not
+        current_fingerprint = _source_fingerprint(project_path)
+        stored_fingerprint = self.graph.get_source_fingerprint(repo_id)
+        cache_hit = (stored_fingerprint == current_fingerprint) and stored_fingerprint is not None
+
+        renderer = self.get_sqlmesh_renderer(dialect)
+
+        if cache_hit:
+            # Source unchanged — load cached rendered SQL
+            cached = self.graph.get_rendered_cache(repo_id)
+            if cached:
+                logger.info("Source unchanged, using cached rendered SQL (%d models)", len(cached))
+                raw_models = {name: sql for name, (sql, _) in cached.items()}
+                column_schemas = {name: schemas for name, (_, schemas) in cached.items()}
+            else:
+                cache_hit = False
+
+        if not cache_hit:
+            # Render from scratch via subprocess
+            raw_models, column_schemas = renderer.render_project_raw(
+                project_path=project_path,
+                env_file=env_file,
+                variables=variables,
+                dialect=dialect,
+                sqlmesh_command=sqlmesh_command,
+                venv_dir=venv_dir,
+            )
+
+        # Parse rendered SQL with current schema catalog (always re-parse
+        # to allow schema enrichment even when rendering was cached)
+        if len(raw_models) >= 20:
+            rendered = renderer._parse_models_parallel(raw_models, column_schemas, schema_catalog)
+        else:
+            rendered = renderer._parse_models_sequential(raw_models, column_schemas, schema_catalog)
 
         stats = {
             "models_rendered": len(rendered),
+            "models_skipped": 0,
+            "models_removed": 0,
+            "render_cached": cache_hit,
             "nodes_added": 0,
             "edges_added": 0,
             "column_usage_added": 0,
@@ -238,16 +271,41 @@ class Indexer:
             "lineage_chains": 0,
         }
 
-        for model_name, result in rendered.items():
-            clean_name = model_name.strip('"').replace('"."', "/")
-            file_path = clean_name + ".sql"
+        with self.graph.write_transaction():
+            # Load existing checksums inside transaction to avoid TOCTOU
+            existing_checksums = self.graph.get_file_checksums(repo_id)
 
-            # Wrap delete + insert per model in a transaction for atomicity
-            with self.graph.write_transaction():
-                self.graph.delete_file_data(repo_id, file_path)
+            # Track which file paths are in the current render
+            seen_paths: set[str] = set()
+
+            for model_name, result in rendered.items():
+                clean_name = model_name.strip('"').replace('"."', "/")
+                file_path = clean_name + ".sql"
+                seen_paths.add(file_path)
+
                 checksum = _checksum_parse_result(result)
+
+                # Skip if checksum matches — model hasn't changed
+                if existing_checksums.get(file_path) == checksum:
+                    stats["models_skipped"] += 1
+                    continue
+
+                self.graph.delete_file_data(repo_id, file_path)
                 file_id = self.graph.insert_file(repo_id, file_path, "sql", checksum)
                 self._insert_parse_result(result, file_id, repo_id, stats)
+
+            # Delete stale models that no longer exist in the project
+            for stale_path in set(existing_checksums) - seen_paths:
+                self.graph.delete_file_data(repo_id, stale_path)
+                stats["models_removed"] += 1
+
+            # Cleanup phantoms inside the transaction for atomicity
+            phantoms_cleaned = self.graph.cleanup_phantoms()
+
+        # Update fingerprint and render cache after successful index
+        self.graph.update_source_fingerprint(repo_id, current_fingerprint)
+        if not cache_hit:
+            self.graph.update_rendered_cache(repo_id, raw_models, column_schemas)
 
         commit, branch = self._get_git_info(project_path)
         self.graph.update_repo_metadata(repo_id, commit=commit, branch=branch)
@@ -255,6 +313,7 @@ class Indexer:
         self._run_convention_inference(repo_id, project_path=project_path)
         self.graph.refresh_property_graph()
         self.graph.clear_snippet_cache()
+        stats["phantoms_cleaned"] = phantoms_cleaned
         return stats
 
     def reindex_dbt(
@@ -1152,21 +1211,40 @@ def _coerce_variables(raw: dict | None) -> dict[str, str | int]:
     return result
 
 
+def _source_fingerprint(project_path: Path) -> str:
+    """Compute a fingerprint of all source files in a project directory.
+
+    Uses file paths, mtimes, and sizes — no content reads needed.
+    Includes .sql, .py, .yaml, .yml, and .cfg files to capture
+    model definitions, macros, and config changes.
+    """
+    entries = []
+    extensions = {".sql", ".py", ".yaml", ".yml", ".cfg"}
+    for p in sorted(project_path.rglob("*")):
+        if p.is_file() and p.suffix in extensions and ".venv" not in p.parts:
+            stat = p.stat()
+            entries.append(f"{p.relative_to(project_path)}:{stat.st_mtime_ns}:{stat.st_size}")
+    return hashlib.sha256("\n".join(entries).encode()).hexdigest()
+
+
 def _checksum_parse_result(result: ParseResult) -> str:
     """Hash the structural content of a ParseResult.
 
     Used for rendered models (sqlmesh/dbt) where we don't have the raw SQL
-    content to hash directly. Produces a stable checksum based on the
-    extracted nodes, edges, and column usage.
+    content to hash directly. Produces a stable, order-independent checksum
+    based on the extracted nodes, edges, and column usage.
     """
-    parts = []
-    for n in result.nodes:
-        parts.append(f"N:{n.kind}:{n.name}")
-    for e in result.edges:
-        parts.append(f"E:{e.source_name}:{e.target_name}:{e.relationship}")
-    for cu in result.column_usage:
-        parts.append(f"CU:{cu.node_name}:{cu.table_name}:{cu.column_name}:{cu.usage_type}")
-    for cl in result.column_lineage:
-        hops = "|".join(f"{h.table}.{h.column}:{h.expression}" for h in cl.chain)
+    parts = sorted(f"N:{n.kind}:{n.name}" for n in result.nodes)
+    parts += sorted(f"E:{e.source_name}:{e.target_name}:{e.relationship}" for e in result.edges)
+    parts += sorted(
+        f"CU:{cu.node_name}:{cu.table_name}:{cu.column_name}:{cu.usage_type}"
+        for cu in result.column_usage
+    )
+    for cl in sorted(result.column_lineage, key=lambda c: (c.output_node, c.output_column)):
+        hops = "|".join(f"{h.table}.{h.column}:{h.expression or ''}" for h in cl.chain)
         parts.append(f"CL:{cl.output_node}:{cl.output_column}:{hops}")
+    parts += sorted(
+        f"CD:{col.node_name}:{col.column_name}:{col.data_type}:{col.position}:{col.source}"
+        for col in result.columns
+    )
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()

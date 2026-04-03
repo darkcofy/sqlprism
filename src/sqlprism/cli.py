@@ -326,8 +326,14 @@ def reindex_sqlmesh(
         dialect=dialect,
         sqlmesh_command=sqlmesh_command,
     )
+    skipped = stats.get('models_skipped', 0)
+    removed = stats.get('models_removed', 0)
+    cached = stats.get('render_cached', False)
+    skip_info = f", skipped={skipped}" if skipped else ""
+    remove_info = f", removed={removed}" if removed else ""
+    cache_info = " (render cached)" if cached else ""
     click.echo(
-        f"  models={stats['models_rendered']}, "
+        f"  models={stats['models_rendered']}{skip_info}{remove_info}{cache_info}, "
         f"nodes={stats['nodes_added']}, "
         f"edges={stats['edges_added']}, "
         f"column_usage={stats['column_usage_added']}"

@@ -217,7 +217,10 @@ def test_sqlmesh_render_project_command_construction(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout=json.dumps({"rendered": {}, "errors": []}),
@@ -258,7 +261,10 @@ def test_sqlmesh_render_project_nonzero_exit(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(
             returncode=1,
             stdout="",
@@ -275,7 +281,10 @@ def test_sqlmesh_render_project_timeout(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["uv", "run", "python", "-c", "..."], timeout=600)
 
         with pytest.raises(subprocess.TimeoutExpired):
@@ -294,7 +303,10 @@ def test_sqlmesh_render_project_success(tmp_path):
     }
     stdout_json = json.dumps({"rendered": rendered_models, "errors": []})
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
 
         results = renderer.render_project(project_path=tmp_path)
@@ -316,7 +328,10 @@ def test_sqlmesh_render_project_bad_json(tmp_path):
 
     renderer = SqlMeshRenderer()
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="this is not valid json {{{",
@@ -578,13 +593,60 @@ def test_sqlmesh_render_project_unchanged(tmp_path):
 
     stdout_json = json.dumps({"rendered": {}, "errors": []})
 
-    with patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run:
+    with (
+        patch.object(renderer, "_list_models", side_effect=RuntimeError("no sqlmesh")),
+        patch("sqlprism.languages.sqlmesh.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
         renderer.render_project(project_path=tmp_path)
 
     # render_project passes empty model_filter (render all)
     cmd = mock_run.call_args[0][0]
     assert json.loads(cmd[-1]) == [], "render_project should pass empty filter"
+
+
+# ── Parallel subprocess rendering tests (#92) ──
+
+
+def test_inline_scripts_syntax():
+    """Both inline scripts are valid Python syntax."""
+    import ast
+
+    from sqlprism.languages.sqlmesh import _LIST_MODELS_SCRIPT, _RENDER_SCRIPT
+    ast.parse(_LIST_MODELS_SCRIPT)
+    ast.parse(_RENDER_SCRIPT)
+
+
+def test_batch_splitting():
+    """Models are split into balanced batches."""
+    from sqlprism.languages.sqlmesh import _split_into_batches
+
+    models = [f"model_{i}" for i in range(10)]
+    batches = _split_into_batches(models, num_batches=3)
+    assert len(batches) == 3
+    flat = [m for batch in batches for m in batch]
+    assert sorted(flat) == sorted(models)
+    sizes = [len(b) for b in batches]
+    assert max(sizes) - min(sizes) <= 1
+
+
+def test_batch_splitting_edge_cases():
+    """Batch splitting handles edge cases correctly."""
+    from sqlprism.languages.sqlmesh import _split_into_batches
+
+    # Empty list
+    assert _split_into_batches([], 3) == []
+
+    # num_batches=0 returns single batch
+    assert _split_into_batches(["a", "b"], 0) == [["a", "b"]]
+
+    # num_batches > len(items) produces len(items) batches
+    batches = _split_into_batches(["a", "b"], 5)
+    assert len(batches) == 2
+    assert sorted(m for b in batches for m in b) == ["a", "b"]
+
+    # Single item
+    assert _split_into_batches(["a"], 3) == [["a"]]
 
 
 # ── Integration tests: Indexer → Renderer → Graph (#14) ──
@@ -1107,6 +1169,33 @@ models:
     # Positions should not collide — second file offset by first file's count
     positions = [c.position for c in cols]
     assert len(set(positions)) == 3  # all unique
+
+
+def test_parallel_parse_matches_sequential():
+    """Parallel parsing produces identical results to sequential."""
+    from sqlprism.languages.sqlmesh import SqlMeshRenderer
+
+    renderer = SqlMeshRenderer()
+
+    models = {
+        "model_a": "SELECT id, name FROM raw.users WHERE active = true",
+        "model_b": "SELECT o.id, u.name FROM raw.orders o JOIN raw.users u ON o.user_id = u.id",
+        "model_c": "WITH cte AS (SELECT * FROM raw.events) SELECT * FROM cte",
+        "model_d": "SELECT count(*) as cnt, status FROM raw.orders GROUP BY status",
+        "model_e": "SELECT a.id FROM raw.a a LEFT JOIN raw.b b ON a.id = b.a_id WHERE b.id IS NULL",
+    }
+    column_schemas = {}
+
+    # Use the same code path for both to ensure apples-to-apples comparison
+    sequential_results = renderer._parse_models_sequential(models, column_schemas, schema_catalog=None)
+    parallel_results = renderer._parse_models_parallel(models, column_schemas, schema_catalog=None)
+
+    for name in models:
+        seq = sequential_results[name]
+        par = parallel_results[name]
+        assert len(seq.nodes) == len(par.nodes), f"{name}: node count mismatch"
+        assert len(seq.edges) == len(par.edges), f"{name}: edge count mismatch"
+        assert len(seq.column_usage) == len(par.column_usage), f"{name}: column_usage mismatch"
 
 
 def test_extract_schema_yml_sources(tmp_path):

@@ -2090,3 +2090,194 @@ def test_conventions_check_constraints():
             [repo_id, node_id],
         )
     db.close()
+
+
+def _mock_render_raw(indexer, raw_models, column_schemas=None):
+    """Helper: mock render_project_raw on the sqlmesh renderer."""
+    from unittest.mock import MagicMock, patch
+
+    mock_renderer = MagicMock()
+    mock_renderer.render_project_raw.return_value = (raw_models, column_schemas or {})
+    # Preserve real parse methods for actual sqlglot parsing
+    from sqlprism.languages.sqlmesh import SqlMeshRenderer
+    real = SqlMeshRenderer()
+    mock_renderer._parse_models_sequential = real._parse_models_sequential
+    mock_renderer._parse_models_parallel = real._parse_models_parallel
+    return patch.object(indexer, "get_sqlmesh_renderer", return_value=mock_renderer)
+
+
+def test_reindex_sqlmesh_batch_transaction_rollback(tmp_path, monkeypatch):
+    """If a model insertion fails mid-batch, no partial data remains."""
+    from unittest.mock import patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    raw_models = {
+        '"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1",
+        '"catalog"."schema"."model_b"': "SELECT 2 AS id FROM raw.t2",
+    }
+
+    with _mock_render_raw(indexer, raw_models):
+        original_insert = indexer._insert_parse_result
+        call_count = 0
+
+        def failing_insert(result, file_id, repo_id, stats):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("Simulated insertion failure")
+            return original_insert(result, file_id, repo_id, stats)
+
+        with patch.object(indexer, "_insert_parse_result", side_effect=failing_insert):
+            with pytest.raises(RuntimeError, match="Simulated insertion failure"):
+                indexer.reindex_sqlmesh("test_repo", tmp_path)
+
+    # Verify nothing was committed — no files or nodes in the repo
+    repo_id_row = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()
+    assert repo_id_row is not None, "Repo row should exist (upsert_repo runs before transaction)"
+    files = db._execute_read(
+        "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id_row[0]]
+    ).fetchone()
+    assert files[0] == 0, "Partial file data should not exist after rollback"
+    nodes = db._execute_read(
+        "SELECT count(*) FROM nodes WHERE file_id IN "
+        "(SELECT file_id FROM files WHERE repo_id = ?)", [repo_id_row[0]]
+    ).fetchone()
+    assert nodes[0] == 0, "Partial node data should not exist after rollback"
+
+
+def test_reindex_sqlmesh_checksum_skip(tmp_path):
+    """Unchanged models are skipped on re-run (same schema catalog)."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    raw_models = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
+
+    with _mock_render_raw(indexer, raw_models):
+        # First run — indexes everything
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 1
+        assert stats1["nodes_added"] >= 1
+        assert stats1.get("models_skipped", 0) == 0
+
+        # Second run — same rendered SQL + same schema catalog → skip
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_skipped"] == 1
+        assert stats2["nodes_added"] == 0
+
+
+def test_reindex_sqlmesh_checksum_changed(tmp_path):
+    """Changed models are re-indexed."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    sql_v1 = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
+    sql_v2 = {'"catalog"."schema"."model_a"': "SELECT 1 AS id, 'x' AS name FROM raw.t1 JOIN raw.t2 ON t1.id = t2.id"}
+
+    with _mock_render_raw(indexer, sql_v1):
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 1
+
+    # Touch a file to invalidate the source fingerprint
+    (tmp_path / "changed.sql").write_text("-- changed")
+
+    # Second run — different SQL (simulates model change)
+    with _mock_render_raw(indexer, sql_v2):
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_skipped"] == 0
+        assert stats2["nodes_added"] >= 1
+
+    # Verify no duplicates in graph
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()[0]
+    file_count = db._execute_read(
+        "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id]
+    ).fetchone()[0]
+    assert file_count == 1
+
+
+def test_reindex_sqlmesh_stale_model_deleted(tmp_path):
+    """Models removed from the project are deleted from the graph."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    two_models = {
+        '"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1",
+        '"catalog"."schema"."model_b"': "SELECT 2 AS id FROM raw.t2",
+    }
+    one_model = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
+
+    with _mock_render_raw(indexer, two_models):
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 2
+
+    # Touch a file to invalidate the source fingerprint
+    (tmp_path / "changed.sql").write_text("-- removed model")
+
+    # Second run — model_b removed
+    with _mock_render_raw(indexer, one_model):
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_removed"] == 1
+        assert stats2["models_skipped"] == 1  # model_a unchanged
+
+    # Verify only model_a remains in graph
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()[0]
+    files = db._execute_read(
+        "SELECT path FROM files WHERE repo_id = ?", [repo_id]
+    ).fetchall()
+    assert len(files) == 1
+    assert files[0][0] == "catalog/schema/model_a.sql"
+
+
+def test_reindex_sqlmesh_new_model_indexed(tmp_path):
+    """New models are always indexed even when existing models are skipped."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    one_model = {'"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1"}
+    two_models = {
+        '"catalog"."schema"."model_a"': "SELECT 1 AS id FROM raw.t1",
+        '"catalog"."schema"."model_b"': "SELECT 2 AS id FROM raw.t2",
+    }
+
+    with _mock_render_raw(indexer, one_model):
+        stats1 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats1["models_rendered"] == 1
+
+    # Touch a file to invalidate the source fingerprint
+    (tmp_path / "new_model.sql").write_text("-- new model added")
+
+    # Second run — add model_b, model_a unchanged
+    with _mock_render_raw(indexer, two_models):
+        stats2 = indexer.reindex_sqlmesh("test_repo", tmp_path)
+        assert stats2["models_skipped"] == 1  # model_a
+        assert stats2["nodes_added"] >= 1  # model_b is new
+
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["test_repo"]
+    ).fetchone()[0]
+    file_count = db._execute_read(
+        "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id]
+    ).fetchone()[0]
+    assert file_count == 2
