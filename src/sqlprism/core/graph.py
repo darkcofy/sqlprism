@@ -141,6 +141,14 @@ CREATE TABLE IF NOT EXISTS columns (
     UNIQUE(node_id, column_name)
 );
 
+CREATE TABLE IF NOT EXISTS rendered_cache (
+    repo_id     INTEGER NOT NULL,
+    model_name  TEXT NOT NULL,
+    rendered_sql TEXT NOT NULL,
+    column_schemas JSON,
+    UNIQUE(repo_id, model_name)
+);
+
 CREATE TABLE IF NOT EXISTS conventions (
     convention_id INTEGER PRIMARY KEY DEFAULT nextval('seq_convention_id'),
     repo_id       INTEGER NOT NULL,   -- logical FK to repos(repo_id)
@@ -302,6 +310,12 @@ class GraphDB:
                     raise
         except duckdb.CatalogException:
             pass  # table doesn't exist yet — created by SCHEMA_SQL
+
+        # v1.2.1: add source_fingerprint column for render cache
+        self._execute_write(
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS "
+            "source_fingerprint TEXT"
+        )
 
     def _init_pgq(self) -> None:
         """Try to load DuckPGQ, installing if needed. Non-fatal if unavailable.
@@ -489,6 +503,54 @@ class GraphDB:
                 [commit, branch, repo_id],
             )
 
+    # ── Rendered SQL cache ──
+
+    def get_source_fingerprint(self, repo_id: int) -> str | None:
+        """Get the stored source fingerprint for a repo."""
+        row = self._execute_read(
+            "SELECT source_fingerprint FROM repos WHERE repo_id = ?", [repo_id],
+        ).fetchone()
+        return row[0] if row else None
+
+    def update_source_fingerprint(self, repo_id: int, fingerprint: str) -> None:
+        """Store the source fingerprint for a repo."""
+        with self._write_lock:
+            self._execute_write(
+                "UPDATE repos SET source_fingerprint = ? WHERE repo_id = ?",
+                [fingerprint, repo_id],
+            )
+
+    def get_rendered_cache(self, repo_id: int) -> dict[str, tuple[str, dict]]:
+        """Load cached rendered SQL for all models in a repo.
+
+        Returns:
+            Dict mapping model_name -> (rendered_sql, column_schemas_dict).
+        """
+        rows = self._execute_read(
+            "SELECT model_name, rendered_sql, column_schemas "
+            "FROM rendered_cache WHERE repo_id = ?",
+            [repo_id],
+        ).fetchall()
+        result = {}
+        for name, sql, schemas_json in rows:
+            schemas = json.loads(schemas_json) if schemas_json else {}
+            result[name] = (sql, schemas)
+        return result
+
+    def update_rendered_cache(
+        self, repo_id: int, models: dict[str, str], column_schemas: dict[str, dict[str, str]],
+    ) -> None:
+        """Replace the rendered SQL cache for a repo."""
+        with self._write_lock:
+            self._execute_write("DELETE FROM rendered_cache WHERE repo_id = ?", [repo_id])
+            for model_name, sql in models.items():
+                schemas = column_schemas.get(model_name, {})
+                self._execute_write(
+                    "INSERT INTO rendered_cache (repo_id, model_name, rendered_sql, column_schemas) "
+                    "VALUES (?, ?, ?, ?)",
+                    [repo_id, model_name, sql, json.dumps(schemas)],
+                )
+
     def delete_repo(self, repo_id: int) -> None:
         """Delete a repo and all associated data (manual cascade).
 
@@ -541,6 +603,8 @@ class GraphDB:
         )
         # Delete files
         self._execute_write("DELETE FROM files WHERE repo_id = ?", [repo_id])
+        # Delete rendered cache
+        self._execute_write("DELETE FROM rendered_cache WHERE repo_id = ?", [repo_id])
         # Delete repo
         self._execute_write("DELETE FROM repos WHERE repo_id = ?", [repo_id])
 
