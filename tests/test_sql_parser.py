@@ -1447,3 +1447,64 @@ def test_extract_columns_create_view_union():
     col_names = [c.column_name for c in inferred]
     assert "a" in col_names
     assert "b" in col_names
+
+
+def test_bare_select_file_gets_query_node():
+    """A bare SELECT file should produce a file-level query node."""
+    parser = SqlParser()
+    result = parser.parse("stg_orders.sql", "SELECT id, name FROM customers")
+    query_nodes = [n for n in result.nodes if n.kind == "query" and n.name == "stg_orders"]
+    assert len(query_nodes) == 1
+    assert query_nodes[0].metadata.get("file_node") is True
+
+
+def test_generic_filename_uses_parent_dir():
+    """When file stem is 'query', use parent directory as node name."""
+    parser = SqlParser()
+    result = parser.parse(
+        "telemetry_derived/clients_daily_v6/query.sql",
+        "WITH base AS (SELECT * FROM raw_data) SELECT * FROM base",
+    )
+    file_nodes = [n for n in result.nodes if n.metadata and n.metadata.get("file_node")]
+    assert len(file_nodes) == 1
+    assert file_nodes[0].name == "clients_daily_v6"
+
+
+def test_create_view_no_duplicate_file_node():
+    """CREATE VIEW should not produce an extra file-level node when names match."""
+    parser = SqlParser()
+    result = parser.parse(
+        "stg_orders.sql",
+        "CREATE VIEW stg_orders AS SELECT id FROM raw_orders",
+    )
+    # Should have the CREATE-defined view node but NOT a separate file_node
+    view_nodes = [n for n in result.nodes if n.name == "stg_orders" and n.kind == "view"]
+    file_nodes = [n for n in result.nodes if n.metadata and n.metadata.get("file_node")]
+    assert len(view_nodes) == 1
+    assert len(file_nodes) == 0
+
+
+def test_create_view_different_name_gets_file_node():
+    """When CREATE VIEW name differs from file, both nodes exist."""
+    parser = SqlParser()
+    result = parser.parse(
+        "my_file.sql",
+        "CREATE VIEW other_name AS SELECT id FROM raw_orders",
+    )
+    view_nodes = [n for n in result.nodes if n.name == "other_name" and n.kind == "view"]
+    file_nodes = [n for n in result.nodes if n.metadata and n.metadata.get("file_node")]
+    assert len(view_nodes) == 1
+    assert len(file_nodes) == 1
+    assert file_nodes[0].name == "my_file"
+
+
+def test_file_node_edges_use_smart_name():
+    """Edges should use the smart file name as source, not raw file stem."""
+    parser = SqlParser()
+    result = parser.parse(
+        "telemetry_derived/clients_daily_v6/query.sql",
+        "SELECT * FROM some_table",
+    )
+    ref_edges = [e for e in result.edges if e.target_name == "some_table" and e.relationship == "references"]
+    assert len(ref_edges) >= 1
+    assert ref_edges[0].source_name == "clients_daily_v6"
