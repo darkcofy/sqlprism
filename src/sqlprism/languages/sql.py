@@ -40,6 +40,8 @@ class SqlParser:
     _LOWERCASE_DIALECTS = frozenset({"postgres", "postgresql", "redshift", "duckdb"})
     # Dialects that fold unquoted identifiers to uppercase
     _UPPERCASE_DIALECTS = frozenset({"snowflake", "oracle", "db2"})
+    # File stems that are too generic to use as node names
+    _GENERIC_STEMS = frozenset({"query", "view", "init", "index", "main", "script"})
 
     def __init__(self, dialect: str | None = None):
         """Initialise with an optional SQL dialect.
@@ -49,6 +51,17 @@ class SqlParser:
                      None for auto-detection.
         """
         self.dialect = dialect
+
+    def _smart_file_name(self, file_path: str) -> str:
+        """Derive a meaningful node name from file path.
+
+        If the file stem is generic (e.g., 'query'), use the parent directory name.
+        """
+        p = Path(file_path)
+        stem = p.stem
+        if stem.lower() in self._GENERIC_STEMS:
+            return p.parent.name or stem
+        return stem
 
     def parse(self, file_path: str, file_content: str, schema: dict | None = None) -> ParseResult:
         """Parse a SQL file into nodes, edges, column usage, and column lineage.
@@ -75,7 +88,7 @@ class SqlParser:
         columns: list[ColumnDefResult] = []
         errors: list[str] = []
 
-        file_stem = Path(file_path).stem
+        file_stem = self._smart_file_name(file_path)
 
         try:
             statements = sqlglot.parse(file_content, dialect=self.dialect)
@@ -112,6 +125,32 @@ class SqlParser:
             except Exception as e:
                 errors.append(f"Lineage stmt {stmt_idx}: {type(e).__name__}: {e}")
                 continue
+
+        # Emit a file-level query node (or promote existing bare_query node).
+        # Only skip if a CREATE-defined node (table/view) already uses the file name,
+        # or if the file had no parseable statements.
+        has_statements = any(stmt is not None for stmt in statements)
+        create_defined = {n.name for n in nodes if not (n.metadata or {}).get("bare_query")}
+        if has_statements and file_stem not in create_defined:
+            for i, n in enumerate(nodes):
+                if n.name == file_stem and (n.metadata or {}).get("bare_query"):
+                    # Promote existing bare_query node by adding file_node flag
+                    nodes[i] = NodeResult(
+                        kind=n.kind,
+                        name=n.name,
+                        line_start=n.line_start,
+                        line_end=n.line_end,
+                        metadata={**(n.metadata or {}), "file_node": True},
+                    )
+                    break
+            else:
+                nodes.append(
+                    NodeResult(
+                        kind="query",
+                        name=file_stem,
+                        metadata={"file_node": True},
+                    )
+                )
 
         return ParseResult(
             language="sql",
