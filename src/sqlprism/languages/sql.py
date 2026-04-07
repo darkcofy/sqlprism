@@ -88,7 +88,9 @@ class SqlParser:
         columns: list[ColumnDefResult] = []
         errors: list[str] = []
 
-        file_stem = self._smart_file_name(file_path)
+        file_stem = self._normalize_identifier(self._smart_file_name(file_path))
+
+        has_statements = False
 
         try:
             statements = sqlglot.parse(file_content, dialect=self.dialect)
@@ -102,6 +104,7 @@ class SqlParser:
         for stmt_idx, stmt in enumerate(statements):
             if stmt is None:
                 continue
+            has_statements = True
 
             try:
                 self._process_statement(
@@ -129,8 +132,10 @@ class SqlParser:
         # Emit a file-level query node (or promote existing bare_query node).
         # Only skip if a CREATE-defined node (table/view) already uses the file name,
         # or if the file had no parseable statements.
-        has_statements = any(stmt is not None for stmt in statements)
-        create_defined = {n.name for n in nodes if not (n.metadata or {}).get("bare_query")}
+        create_defined = {
+            n.name for n in nodes
+            if n.kind in ("table", "view") and (n.metadata or {}).get("create_type")
+        }
         if has_statements and file_stem not in create_defined:
             for i, n in enumerate(nodes):
                 if n.name == file_stem and (n.metadata or {}).get("bare_query"):
