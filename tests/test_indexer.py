@@ -2281,3 +2281,28 @@ def test_reindex_sqlmesh_new_model_indexed(tmp_path):
         "SELECT count(*) FROM files WHERE repo_id = ?", [repo_id]
     ).fetchone()[0]
     assert file_count == 2
+
+
+def test_reindex_repo_bigquery_dialect(tmp_path):
+    """BigQuery files with backtick identifiers should parse when dialect is set."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    repo_dir = tmp_path / "bq_repo"
+    repo_dir.mkdir()
+    (repo_dir / "clients_daily.sql").write_text(
+        "CREATE OR REPLACE VIEW `myproject.dataset.clients_daily` AS\n"
+        "SELECT client_id, submission_date FROM `myproject.dataset.raw_clients`"
+    )
+    (repo_dir / "sessions.sql").write_text(
+        "SELECT session_id, client_id FROM `myproject.dataset.sessions_v1`"
+    )
+
+    stats = indexer.reindex_repo("bq-test", str(repo_dir), dialect="bigquery")
+
+    assert stats["nodes_added"] >= 2
+    assert stats["edges_added"] >= 1
+    assert len(stats["parse_errors"]) == 0
