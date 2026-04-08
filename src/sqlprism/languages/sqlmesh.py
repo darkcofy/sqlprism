@@ -535,7 +535,14 @@ class SqlMeshRenderer:
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"sqlmesh render failed (exit {result.returncode}):\n{result.stderr}")
+            stderr = result.stderr.strip()
+            if "No module named" in stderr and "sqlmesh" in stderr:
+                raise RuntimeError(
+                    f"sqlmesh is not installed in the project environment at {cwd}. "
+                    "Install it with: pip install sqlmesh (in the project's virtualenv)"
+                )
+            output = stderr or result.stdout.strip()
+            raise RuntimeError(f"sqlmesh render failed (exit {result.returncode}):\n{output}")
 
         output = json.loads(result.stdout)
         return output.get("rendered", {}), output.get("errors", []), output.get("column_schemas", {})
