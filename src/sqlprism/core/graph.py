@@ -2687,7 +2687,7 @@ class GraphDB:
         if not start_nodes:
             return {"root": None, "paths": [], "depth_summary": {}, "repos_affected": []}
 
-        start_id = start_nodes[0][0]
+        start_ids = [r[0] for r in start_nodes]
 
         # "both" — run downstream and upstream separately and merge
         if direction == "both":
@@ -2722,16 +2722,24 @@ class GraphDB:
                 "repos_affected": list(set(down["repos_affected"] + up["repos_affected"])),
             }
 
-        # Dispatch to PGQ or CTE
+        # Dispatch to PGQ or CTE — trace from ALL matching start nodes
+        all_paths: list[dict] = []
+        seen_names: set[str] = set()
         use_pgq = self.has_pgq and exclude_edges is None
-        if use_pgq:
-            paths = self._trace_pgq(
-                start_id, name, direction, max_depth, limit, include_snippets
-            )
-        else:
-            paths = self._trace_cte(
-                start_id, direction, max_depth, limit, include_snippets, exclude_edges
-            )
+        for sid in start_ids:
+            if use_pgq:
+                paths = self._trace_pgq(
+                    sid, name, direction, max_depth, limit, include_snippets
+                )
+            else:
+                paths = self._trace_cte(
+                    sid, direction, max_depth, limit, include_snippets, exclude_edges
+                )
+            for p in paths:
+                if p["name"] not in seen_names:
+                    seen_names.add(p["name"])
+                    all_paths.append(p)
+        paths = all_paths[:limit]
 
         depth_summary: dict[int, int] = {}
         repos_affected: set[str] = set()
