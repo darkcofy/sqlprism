@@ -271,7 +271,7 @@ def test_sqlmesh_render_project_nonzero_exit(tmp_path):
             stderr="ModuleNotFoundError: No module named 'sqlmesh'",
         )
 
-        with pytest.raises(RuntimeError, match="No module named"):
+        with pytest.raises(RuntimeError, match="sqlmesh is not installed"):
             renderer.render_project(project_path=tmp_path)
 
 
@@ -1256,4 +1256,37 @@ def test_dbt_compile_error_includes_stdout(tmp_path, monkeypatch):
             env={},
             target=None,
             dbt_command="dbt",
+        )
+
+
+def test_sqlmesh_render_missing_module_error(tmp_path, monkeypatch):
+    """When sqlmesh is not installed, error message should say so clearly."""
+    import subprocess as sp
+
+    from sqlprism.languages.sqlmesh import SqlMeshRenderer
+
+    renderer = SqlMeshRenderer()
+
+    def fake_run(*args, **kwargs):
+        return sp.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout="",
+            stderr="ModuleNotFoundError: No module named 'sqlmesh'",
+        )
+
+    monkeypatch.setattr(sp, "run", fake_run)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="sqlmesh is not installed"):
+        renderer._run_render_script(
+            project_path=tmp_path,
+            cwd=tmp_path,
+            env={},
+            variables={},
+            gateway="local",
+            dialect="duckdb",
+            sqlmesh_command="python",
+            model_filter=[],
         )
