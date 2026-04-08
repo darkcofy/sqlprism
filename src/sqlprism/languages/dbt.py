@@ -244,7 +244,8 @@ class DbtRenderer:
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"dbt compile failed (exit {result.returncode}):\n{result.stderr}")
+            output = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"dbt compile failed (exit {result.returncode}):\n{output}")
 
     def _get_project_name(self, project_path: Path) -> str:
         """Read project name from dbt_project.yml."""

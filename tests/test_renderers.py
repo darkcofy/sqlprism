@@ -1228,3 +1228,32 @@ sources:
     assert result["raw.orders"][0].source == "schema_yml"
     assert "raw.customers" in result
     assert result["raw.customers"][0].column_name == "customer_id"
+
+
+# ── dbt compile error reporting ──
+
+
+def test_dbt_compile_error_includes_stdout(tmp_path, monkeypatch):
+    """dbt writes errors to stdout; RuntimeError should include it."""
+    import subprocess as sp
+
+    renderer = DbtRenderer()
+
+    def fake_run(*args, **kwargs):
+        return sp.CompletedProcess(
+            args=args[0],
+            returncode=2,
+            stdout="Compilation Error: missing ref\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    with pytest.raises(RuntimeError, match="Compilation Error: missing ref"):
+        renderer._run_dbt_compile(
+            project_path=tmp_path,
+            profiles_dir=tmp_path,
+            cwd=tmp_path,
+            env={},
+            target=None,
+            dbt_command="dbt",
+        )
