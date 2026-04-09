@@ -174,6 +174,9 @@ class Indexer:
         # Clean up phantom nodes that now have real counterparts
         phantoms_cleaned = self.graph.cleanup_phantoms()
         stats["phantoms_cleaned"] = phantoms_cleaned
+        # Merge stub "table" nodes into their defining query/view counterparts
+        stubs_merged = self.graph.merge_duplicate_nodes()
+        stats["stubs_merged"] = stubs_merged
 
         # Update repo metadata
         commit, branch = self._get_git_info(path)
@@ -301,6 +304,7 @@ class Indexer:
 
             # Cleanup phantoms inside the transaction for atomicity
             phantoms_cleaned = self.graph.cleanup_phantoms()
+            self.graph.merge_duplicate_nodes()
 
         # Update fingerprint and render cache after successful index
         self.graph.update_source_fingerprint(repo_id, current_fingerprint)
@@ -578,6 +582,7 @@ class Indexer:
 
         if did_reindex:
             self.graph.cleanup_phantoms()
+            self.graph.merge_duplicate_nodes()
         self.graph.clear_snippet_cache()
 
     def _delete_stored_files_by_stem(self, repo_id: int, stem: str, stats: dict, display_path: str) -> None:

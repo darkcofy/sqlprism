@@ -809,7 +809,16 @@ class GraphDB:
 
         Matches on short name (e.g. ``"orders"``) which covers both
         unqualified references and qualified ones (stored as short name
-        plus schema column). Search order: same repo first, then cross-repo.
+        plus schema column). Search order:
+
+        1. Exact (name + kind) in same repo
+        2. Exact (name + kind) cross-repo
+        3. Kind-relaxed (name only, real nodes with a file) in same repo
+        4. Kind-relaxed cross-repo
+
+        The kind-relaxed fallback handles the common case where a SQL
+        reference uses ``target_kind="table"`` but the actual node was
+        indexed as ``"query"`` or ``"view"`` (e.g. sqlmesh/dbt models).
 
         Args:
             name: Unqualified entity name.
@@ -829,6 +838,7 @@ class GraphDB:
             schema_params = [schema]
 
         if repo_id:
+            # 1. Exact kind match in same repo
             row = self._execute_read(
                 "SELECT n.node_id FROM nodes n "
                 "JOIN files f ON n.file_id = f.file_id "
@@ -838,10 +848,32 @@ class GraphDB:
             if row:
                 return row[0]
 
-        # Cross-repo search (use alias so schema_clause referencing 'n.' works)
+        # 2. Exact kind match cross-repo
         row = self._execute_read(
             "SELECT n.node_id FROM nodes n WHERE n.name = ? AND n.kind = ?" + schema_clause + " LIMIT 1",
             [name, kind] + schema_params,
+        ).fetchone()
+        if row:
+            return row[0]
+
+        # 3. Kind-relaxed: match by name only, prefer real nodes (file_id IS NOT NULL)
+        if repo_id:
+            row = self._execute_read(
+                "SELECT n.node_id FROM nodes n "
+                "JOIN files f ON n.file_id = f.file_id "
+                "WHERE n.name = ? AND f.repo_id = ?" + schema_clause
+                + " ORDER BY (n.kind = ?) DESC LIMIT 1",
+                [name, repo_id] + schema_params + [kind],
+            ).fetchone()
+            if row:
+                return row[0]
+
+        # 4. Kind-relaxed cross-repo
+        row = self._execute_read(
+            "SELECT n.node_id FROM nodes n "
+            "WHERE n.name = ? AND n.file_id IS NOT NULL" + schema_clause
+            + " ORDER BY (n.kind = ?) DESC LIMIT 1",
+            [name] + schema_params + [kind],
         ).fetchone()
         return row[0] if row else None
 
@@ -951,6 +983,79 @@ class GraphDB:
                 )
 
             return len(phantoms) + len(orphaned)
+
+    def merge_duplicate_nodes(self) -> int:
+        """Merge stub nodes into their defining counterparts.
+
+        When file A references model X (creating a ``"table"`` stub node
+        attached to A's file_id) and file B defines model X (creating a
+        ``"query"`` or ``"view"`` node), edges targeting the stub should be
+        repointed to the defining node. The stub is then deleted.
+
+        A "defining" node is one whose kind is NOT ``"table"`` (i.e. it was
+        parsed from its own SQL file as a query/view/cte). A "stub" is a
+        ``"table"`` node that merely records a reference in another file.
+
+        Only merges nodes within the **same repo** to avoid cross-repo
+        name collisions (e.g. two repos both defining ``orders``).
+
+        Returns the number of stub nodes merged.
+        """
+        with self._write_lock:
+            # Find stub → defining pairs in the same repo.
+            # Schema match is relaxed: a stub with schema "sushi" (from a
+            # qualified reference like sushi.orders) matches a defining node
+            # with schema NULL (common for sqlmesh/dbt models whose own file
+            # doesn't set a schema). Exact matches are preferred via ORDER BY.
+            dupes = self._execute_write(
+                "SELECT stub.node_id AS stub_id, def.node_id AS def_id "
+                "FROM nodes stub "
+                "JOIN files fs ON stub.file_id = fs.file_id "
+                "JOIN nodes def ON stub.name = def.name "
+                "JOIN files fd ON def.file_id = fd.file_id "
+                "WHERE stub.kind = 'table' "
+                "  AND def.kind != 'table' "
+                "  AND fs.repo_id = fd.repo_id "
+                "  AND stub.node_id != def.node_id "
+                "  AND (COALESCE(stub.schema, '') = COALESCE(def.schema, '') "
+                "       OR def.schema IS NULL OR stub.schema IS NULL)"
+            ).fetchall()
+
+            if not dupes:
+                return 0
+
+            # Repoint edges from stubs to defining nodes
+            mapping_values = ", ".join(
+                [f"({stub_id}, {def_id})" for stub_id, def_id in dupes]
+            )
+            self._execute_write(
+                f"UPDATE edges SET source_id = m.def_id "
+                f"FROM (VALUES {mapping_values}) AS m(stub_id, def_id) "
+                f"WHERE edges.source_id = m.stub_id"
+            )
+            self._execute_write(
+                f"UPDATE edges SET target_id = m.def_id "
+                f"FROM (VALUES {mapping_values}) AS m(stub_id, def_id) "
+                f"WHERE edges.target_id = m.stub_id"
+            )
+
+            # Delete duplicate edges that may have been created by the merge
+            self._execute_write(
+                "DELETE FROM edges WHERE rowid NOT IN ("
+                "  SELECT MIN(rowid) FROM edges "
+                "  GROUP BY source_id, target_id, relationship"
+                ")"
+            )
+
+            # Delete the stub nodes
+            stub_ids = [s[0] for s in dupes]
+            placeholders = ",".join(["?"] * len(stub_ids))
+            self._execute_write(
+                f"DELETE FROM nodes WHERE node_id IN ({placeholders})",
+                stub_ids,
+            )
+
+            return len(dupes)
 
     # ── Edge management ──
 
