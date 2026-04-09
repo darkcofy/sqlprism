@@ -732,6 +732,72 @@ def test_phantom_cleanup_graph_layer():
     db.close()
 
 
+def test_merge_duplicate_nodes():
+    """Stub 'table' nodes are merged into defining 'query' nodes in the same repo."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+
+    # File A defines a query node "orders"
+    file_a = db.insert_file(repo_id, "orders.sql", "sql", "aaa")
+    query_id = db.insert_node(file_a, "query", "orders", "sql")
+
+    # File B references "orders" as a table (stub node created in same repo)
+    file_b = db.insert_file(repo_id, "report.sql", "sql", "bbb")
+    stub_id = db.insert_node(file_b, "table", "orders", "sql")
+    report_id = db.insert_node(file_b, "query", "report", "sql")
+    db.insert_edge(report_id, stub_id, "references")
+
+    # Add outbound edges from the real query node
+    file_c = db.insert_file(repo_id, "customers.sql", "sql", "ccc")
+    customers_id = db.insert_node(file_c, "query", "customers", "sql")
+    db.insert_edge(query_id, customers_id, "references")
+
+    # Before merge: report -> stub (dead end), query_id -> customers
+    merged = db.merge_duplicate_nodes()
+    assert merged >= 1
+
+    # After merge: report -> query_id -> customers (traversable)
+    refs = db.query_references("orders")
+    assert len(refs["inbound"]) == 1
+    assert refs["inbound"][0]["name"] == "report"
+    assert len(refs["outbound"]) == 1
+    assert refs["outbound"][0]["name"] == "customers"
+
+    db.close()
+
+
+def test_merge_duplicate_nodes_schema_mismatch():
+    """Stub with schema='sushi' merges into defining node with schema=NULL."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+
+    # Defining query node with schema=NULL (sqlmesh model)
+    file_a = db.insert_file(repo_id, "orders.sql", "sql", "aaa")
+    db.insert_node(file_a, "query", "orders", "sql")
+
+    # Stub table node with schema='sushi' (from qualified reference)
+    file_b = db.insert_file(repo_id, "report.sql", "sql", "bbb")
+    stub_id = db.insert_node(file_b, "table", "orders", "sql")
+    # Set schema on the stub
+    db._execute_write("UPDATE nodes SET schema = 'sushi' WHERE node_id = ?", [stub_id])
+    report_id = db.insert_node(file_b, "query", "report", "sql")
+    db.insert_edge(report_id, stub_id, "references")
+
+    merged = db.merge_duplicate_nodes()
+    assert merged >= 1
+
+    # After merge: report should reference the query node
+    refs = db.query_references("orders")
+    assert len(refs["inbound"]) == 1
+    assert refs["inbound"][0]["name"] == "report"
+
+    db.close()
+
+
 # ── 5.5: Column usage dropped counter integration test ──
 
 
