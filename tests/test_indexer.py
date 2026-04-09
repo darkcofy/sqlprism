@@ -732,6 +732,70 @@ def test_phantom_cleanup_graph_layer():
     db.close()
 
 
+def test_noise_nodes_filtered_from_trace():
+    """dbt test nodes and CTEs are excluded from trace results."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+
+    file_a = db.insert_file(repo_id, "stg_orders.sql", "sql", "aaa")
+    stg_id = db.insert_node(file_a, "query", "stg_orders", "sql")
+
+    # Real downstream model
+    file_b = db.insert_file(repo_id, "orders.sql", "sql", "bbb")
+    orders_id = db.insert_node(file_b, "query", "orders", "sql")
+    db.insert_edge(stg_id, orders_id, "references")
+
+    # dbt test node (should be filtered)
+    file_c = db.insert_file(repo_id, "test_not_null.sql", "sql", "ccc")
+    test_id = db.insert_node(file_c, "table", "not_null_stg_orders_order_id", "sql")
+    db.insert_edge(stg_id, test_id, "references")
+
+    # CTE node (should be filtered)
+    cte_id = db.insert_node(file_b, "cte", "joined", "sql")
+    db.insert_edge(stg_id, cte_id, "references")
+
+    db.refresh_property_graph()
+    result = db.query_trace("stg_orders", direction="downstream", max_depth=3)
+    names = [p["name"] for p in result["paths"]]
+
+    assert "orders" in names
+    assert "not_null_stg_orders_order_id" not in names
+    assert "joined" not in names
+
+    db.close()
+
+
+def test_noise_nodes_filtered_from_references():
+    """dbt test nodes are excluded from query_references results."""
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test")
+
+    file_a = db.insert_file(repo_id, "stg_orders.sql", "sql", "aaa")
+    stg_id = db.insert_node(file_a, "query", "stg_orders", "sql")
+
+    # Real inbound ref
+    file_b = db.insert_file(repo_id, "orders.sql", "sql", "bbb")
+    orders_id = db.insert_node(file_b, "query", "orders", "sql")
+    db.insert_edge(orders_id, stg_id, "references")
+
+    # dbt test inbound ref (should be filtered)
+    file_c = db.insert_file(repo_id, "test.sql", "sql", "ccc")
+    test_id = db.insert_node(file_c, "table", "unique_stg_orders_order_id", "sql")
+    db.insert_edge(test_id, stg_id, "references")
+
+    refs = db.query_references("stg_orders")
+    inbound_names = [r["name"] for r in refs["inbound"]]
+
+    assert "orders" in inbound_names
+    assert "unique_stg_orders_order_id" not in inbound_names
+
+    db.close()
+
+
 def test_merge_duplicate_nodes():
     """Stub 'table' nodes are merged into defining 'query' nodes in the same repo."""
     from sqlprism.core.graph import GraphDB
