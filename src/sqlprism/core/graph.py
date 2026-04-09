@@ -2545,7 +2545,8 @@ class GraphDB:
                     snippet = self._read_snippet(r[5], r[4], r[6], r[7])
                     if snippet:
                         entry["snippet"] = snippet
-                result["inbound"].append(entry)
+                if not self._is_noise_node(entry):
+                    result["inbound"].append(entry)
 
         if direction in ("both", "outbound"):
             outbound_sql = (
@@ -2572,7 +2573,8 @@ class GraphDB:
                     snippet = self._read_snippet(r[5], r[4], r[6], r[7])
                     if snippet:
                         entry["snippet"] = snippet
-                result["outbound"].append(entry)
+                if not self._is_noise_node(entry):
+                    result["outbound"].append(entry)
 
         return result
 
@@ -2841,7 +2843,7 @@ class GraphDB:
                     sid, direction, max_depth, limit, include_snippets, exclude_edges
                 )
             for p in paths:
-                if p["name"] not in seen_names:
+                if p["name"] not in seen_names and not self._is_noise_node(p):
                     seen_names.add(p["name"])
                     all_paths.append(p)
         paths = all_paths[:limit]
@@ -2859,6 +2861,24 @@ class GraphDB:
             "depth_summary": depth_summary,
             "repos_affected": sorted(repos_affected),
         }
+
+    @staticmethod
+    def _is_noise_node(path_entry: dict) -> bool:
+        """Return True for nodes that should be excluded from trace results.
+
+        Filters out:
+        - dbt test nodes (not_null_*, unique_*, relationships_*, accepted_values_*)
+        - CTE-kind nodes (internal to a query, not standalone models)
+        """
+        name = path_entry.get("name", "")
+        kind = path_entry.get("kind", "")
+        if kind == "cte":
+            return True
+        # dbt schema test patterns
+        for prefix in ("not_null_", "unique_", "relationships_", "accepted_values_"):
+            if name.startswith(prefix):
+                return True
+        return False
 
     def _trace_cte(
         self,
@@ -2971,22 +2991,24 @@ class GraphDB:
         # -> follows source-to-target. <- follows target-to-source.
         # Downstream (what does start_id reach) = follow -> (outgoing).
         # Upstream (what reaches start_id) = follow <- (incoming).
+        # DuckPGQ does not support bind parameters inside GRAPH_TABLE
+        # MATCH patterns, so we inline start_id (always an int) directly.
         if direction == "downstream":
-            edge_pattern = f"(a:nodes WHERE a.node_id = ?)-[e:edges]->{{1,{max_depth}}}"
+            edge_pattern = f"(a:nodes WHERE a.node_id = {int(start_id)})-[e:edges]->{{1,{max_depth}}}"
         else:
-            edge_pattern = f"(a:nodes WHERE a.node_id = ?)<-[e:edges]-{{1,{max_depth}}}"
+            edge_pattern = f"(a:nodes WHERE a.node_id = {int(start_id)})<-[e:edges]-{{1,{max_depth}}}"
 
         # Step 1: PGQ bounded traversal to discover reachable node_ids
         pgq_sql = (
             f"SELECT DISTINCT node_id FROM ("
             f"FROM GRAPH_TABLE (sqlprism_graph "
             f"MATCH {edge_pattern}(b:nodes) "
-            f"COLUMNS (b.node_id))) LIMIT ?"
+            f"COLUMNS (b.node_id))) LIMIT {int(limit)}"
         )
         try:
             node_ids = [
                 r[0]
-                for r in self._execute_read(pgq_sql, [start_id, limit]).fetchall()
+                for r in self._execute_read(pgq_sql, []).fetchall()
             ]
         except duckdb.Error as e:
             logger.warning("DuckPGQ trace failed for %s: %s, falling back to CTE", name, e)
