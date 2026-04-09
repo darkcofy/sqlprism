@@ -777,7 +777,7 @@ def test_merge_duplicate_nodes_schema_mismatch():
 
     # Defining query node with schema=NULL (sqlmesh model)
     file_a = db.insert_file(repo_id, "orders.sql", "sql", "aaa")
-    query_id = db.insert_node(file_a, "query", "orders", "sql")
+    db.insert_node(file_a, "query", "orders", "sql")
 
     # Stub table node with schema='sushi' (from qualified reference)
     file_b = db.insert_file(repo_id, "report.sql", "sql", "bbb")
