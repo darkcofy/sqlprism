@@ -185,7 +185,9 @@ class DbtRenderer:
             if selected and sql_file.stem not in selected:
                 continue
 
-            rel_path = str(sql_file.relative_to(compiled_dir))
+            # Use posix-style separators so dict keys match manifest `path`
+            # values (always forward-slash) across Windows and Unix.
+            rel_path = sql_file.relative_to(compiled_dir).as_posix()
             content = sql_file.read_text(errors="replace")
             if not content.strip():
                 continue

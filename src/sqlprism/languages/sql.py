@@ -217,7 +217,7 @@ class SqlParser:
         if not kind_expr:
             return
 
-        kind_str = kind_expr.upper() if isinstance(kind_expr, str) else str(kind_expr).upper()
+        kind_str = self._create_kind_str(stmt)
 
         # Unwrap Schema -> Table if needed
         table_expr = stmt.this
@@ -349,24 +349,13 @@ class SqlParser:
                     self._is_quoted_identifier(target_expr),
                 )
                 if create_target == file_stem:
-                    kind_expr = stmt.args.get("kind")
-                    kind_str = (
-                        kind_expr.upper() if isinstance(kind_expr, str)
-                        else str(kind_expr).upper() if kind_expr else ""
+                    source_kind = (
+                        "view" if "VIEW" in self._create_kind_str(stmt) else "table"
                     )
-                    source_kind = "view" if "VIEW" in kind_str else "table"
                     target_metadata = self._build_table_metadata(target_expr)
                     source_schema = target_metadata.get("schema")
 
-        # Collect CTE aliases in this statement so `FROM cte_alias` is not
-        # mistaken for an external table reference. CTE→CTE and CTE→table
-        # edges are handled by `_extract_ctes`.
-        cte_aliases: set[str] = set()
-        for cte in stmt.find_all(exp.CTE):
-            if cte.alias:
-                alias_node = cte.args.get("alias")
-                quoted = self._is_quoted_identifier(alias_node) if alias_node else False
-                cte_aliases.add(self._normalize_identifier(cte.alias, quoted))
+        edge_source_metadata = {"source_schema": source_schema} if source_schema else None
 
         for table in stmt.find_all(exp.Table):
             name = self._normalize_identifier(table.name, self._is_quoted_identifier(table))
@@ -380,11 +369,10 @@ class SqlParser:
                 if isinstance(parent, (exp.Create, exp.Schema)):
                     continue
 
-            # Skip references to CTE aliases — they are local query names,
-            # not external tables. The CTE's own references (what it FROMs)
-            # are still captured because `find_all(exp.Table)` walks into
-            # the CTE body.
-            if name in cte_aliases:
+            # Skip references to CTE aliases visible in the table's enclosing
+            # scope. A flat statement-wide check would over-suppress when a
+            # nested subquery's CTE shadows an outer-scope real table name.
+            if self._is_cte_reference(table, name):
                 continue
 
             # Avoid duplicating nodes for the same table+schema within one file (O(1) check)
@@ -406,7 +394,6 @@ class SqlParser:
                 continue
             seen_edges.add(edge_key)
 
-            edge_metadata = {"source_schema": source_schema} if source_schema else None
             edges.append(
                 EdgeResult(
                     source_name=file_stem,
@@ -415,7 +402,7 @@ class SqlParser:
                     target_kind="table",
                     relationship=relationship,
                     context=context,
-                    metadata=edge_metadata,
+                    metadata=edge_source_metadata,
                 )
             )
 
@@ -439,13 +426,7 @@ class SqlParser:
         if seen_ctes is None:
             seen_ctes = set()
 
-        # Collect all CTE names in this statement first
-        cte_names: set[str] = set()
-        for cte in stmt.find_all(exp.CTE):
-            if cte.alias:
-                alias_node = cte.args.get("alias")
-                quoted = self._is_quoted_identifier(alias_node) if alias_node else False
-                cte_names.add(self._normalize_identifier(cte.alias, quoted))
+        cte_names = self._collect_cte_aliases(stmt)
 
         for cte in stmt.find_all(exp.CTE):
             alias_node = cte.args.get("alias")
@@ -1123,6 +1104,55 @@ class SqlParser:
         if d in self._UPPERCASE_DIALECTS:
             return name.upper()
         return name
+
+    @staticmethod
+    def _create_kind_str(stmt: exp.Expression) -> str:
+        """Uppercased `kind` string of a CREATE statement, or '' if not present."""
+        kind_expr = stmt.args.get("kind") if hasattr(stmt, "args") else None
+        if not kind_expr:
+            return ""
+        return kind_expr.upper() if isinstance(kind_expr, str) else str(kind_expr).upper()
+
+    def _collect_cte_aliases(self, stmt: exp.Expression) -> set[str]:
+        """Collect every CTE alias appearing anywhere in the statement tree.
+
+        Used where flat lookup is safe (e.g. identifying CTE→CTE edges inside
+        ``_extract_ctes``). For scope-aware suppression of outer-scope table
+        references, use :meth:`_is_cte_reference` instead.
+        """
+        aliases: set[str] = set()
+        for cte in stmt.find_all(exp.CTE):
+            if not cte.alias:
+                continue
+            alias_node = cte.args.get("alias")
+            quoted = self._is_quoted_identifier(alias_node) if alias_node else False
+            aliases.add(self._normalize_identifier(cte.alias, quoted))
+        return aliases
+
+    def _is_cte_reference(self, table: exp.Table, normalized_name: str) -> bool:
+        """Return True if ``table`` references a CTE alias visible in its scope.
+
+        Walks up the AST from the table and, at each ancestor that carries a
+        ``with`` argument (i.e. a Select with an attached WITH clause), checks
+        whether that clause defines ``normalized_name``. Scope-local so an
+        inner subquery's CTE cannot mask an outer-scope real table reference.
+        """
+        node = table.parent
+        while node is not None:
+            args = getattr(node, "args", None)
+            # sqlglot stores the WITH clause under `with_` (the trailing
+            # underscore avoids colliding with the Python keyword).
+            with_clause = args.get("with") or args.get("with_") if args else None
+            if with_clause is not None:
+                for cte in with_clause.expressions:
+                    if not cte.alias:
+                        continue
+                    alias_node = cte.args.get("alias")
+                    quoted = self._is_quoted_identifier(alias_node) if alias_node else False
+                    if self._normalize_identifier(cte.alias, quoted) == normalized_name:
+                        return True
+            node = node.parent
+        return False
 
     @staticmethod
     def _is_quoted_identifier(node: exp.Expression) -> bool:

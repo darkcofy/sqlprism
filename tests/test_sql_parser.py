@@ -387,6 +387,82 @@ def test_cte_alias_not_indexed_as_table_reference():
     assert "stg_orders" in table_targets
     assert "order_items" in table_targets
 
+    # CTE nodes still created as first-class kind='cte' entities
+    assert {n.name for n in result.nodes if n.kind == "cte"} == cte_names
+
+    # CTE→real-table edges still flow (needed for column lineage)
+    assert any(
+        e.source_name == "orders" and e.source_kind == "cte" and e.target_name == "stg_orders"
+        for e in result.edges
+    )
+
+
+def test_create_table_wrap_with_colliding_cte_stamps_source_kind():
+    """dbt-compiled shape: CREATE TABLE wrap where a CTE name equals the file stem.
+
+    Reproduces the jaffle-mesh finance/orders bug where kind-relaxed fallback
+    landed manifest edges on the CTE node instead of the wrapped table node.
+    Verifies the new source_kind/source_schema stamping.
+    """
+    sql = (
+        'CREATE TABLE "marts"."orders" AS\n'
+        "WITH orders AS (SELECT * FROM stg_orders),\n"
+        "     final AS (SELECT * FROM orders)\n"
+        "SELECT * FROM final"
+    )
+    parser = SqlParser()
+    result = parser.parse("marts/orders.sql", sql)
+
+    stg_edges = [e for e in result.edges if e.target_name == "stg_orders"]
+    # At least one edge from file_stem ("orders") to stg_orders with the new stamp
+    stem_sourced = [e for e in stg_edges if e.source_name == "orders" and e.source_kind == "table"]
+    assert stem_sourced, f"expected a table-kind outbound edge to stg_orders; got {stg_edges}"
+    assert (stem_sourced[0].metadata or {}).get("source_schema") == "marts"
+
+
+def test_create_view_wrap_stamps_source_kind_view():
+    """CREATE VIEW wrap emits edges with source_kind='view' (not 'table')."""
+    sql = (
+        'CREATE VIEW "analytics"."customer_stats" AS\n'
+        "WITH c AS (SELECT * FROM customers) SELECT * FROM c"
+    )
+    parser = SqlParser()
+    result = parser.parse("analytics/customer_stats.sql", sql)
+
+    cust_edges = [
+        e for e in result.edges
+        if e.target_name == "customers" and e.source_name == "customer_stats"
+    ]
+    assert cust_edges, "expected outbound edge to customers from the view"
+    assert cust_edges[0].source_kind == "view"
+    assert (cust_edges[0].metadata or {}).get("source_schema") == "analytics"
+
+
+def test_nested_cte_does_not_suppress_outer_scope_table():
+    """A CTE alias inside a subquery must not mask an outer-scope real table of the same name.
+
+    Regression guard: the CTE-skip uses a scope-local walk, so `foo` defined
+    inside a subquery's WITH does not suppress a sibling `FROM foo` in the
+    outer query.
+    """
+    sql = """
+    SELECT o.id, s.total
+    FROM foo o
+    JOIN (
+        WITH foo AS (SELECT id, sum(x) AS total FROM other GROUP BY id)
+        SELECT * FROM foo
+    ) s ON s.id = o.id
+    """
+    parser = SqlParser()
+    result = parser.parse("nested.sql", sql)
+
+    table_targets = {e.target_name for e in result.edges if e.target_kind == "table"}
+    # Outer `FROM foo` is a real table reference — it must NOT be suppressed
+    # even though a nested subquery has a CTE also named `foo`.
+    assert "foo" in table_targets
+    # `other` (inside the nested CTE) is also a real reference
+    assert "other" in table_targets
+
 
 def test_qualified_table_names():
     """Schema-qualified and catalog-qualified table names store metadata."""
