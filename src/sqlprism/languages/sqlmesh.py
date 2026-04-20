@@ -536,12 +536,19 @@ class SqlMeshRenderer:
 
         if result.returncode != 0:
             stderr = result.stderr.strip()
-            if "No module named" in stderr and "sqlmesh" in stderr:
+            stdout = result.stdout.strip()
+            combined = f"{stderr}\n{stdout}"
+            if (
+                ("No module named" in combined and "sqlmesh" in combined)
+                or "Failed to spawn: sqlmesh" in combined
+            ):
                 raise RuntimeError(
                     f"sqlmesh is not installed in the project environment at {cwd}. "
-                    "Install it with: pip install sqlmesh (in the project's virtualenv)"
+                    "Install it in the sqlmesh project's virtualenv "
+                    "(e.g. `uv add sqlmesh` or `pip install sqlmesh`), "
+                    "or point `sqlmesh_command` at a command that can launch sqlmesh."
                 )
-            output = stderr or result.stdout.strip()
+            output = stderr or stdout
             raise RuntimeError(f"sqlmesh render failed (exit {result.returncode}):\n{output}")
 
         output = json.loads(result.stdout)
