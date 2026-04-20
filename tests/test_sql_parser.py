@@ -343,6 +343,51 @@ def test_cte_chain_edges():
     assert final_to_enriched[0].target_kind == "cte"
 
 
+def test_cte_alias_not_indexed_as_table_reference():
+    """CTE aliases referenced in FROM clauses must not create phantom `table` nodes or edges.
+
+    Regression for #119: dbt-compiled SQL with CTEs was emitting `query -> cte_alias (table)`
+    edges and creating `kind=table` nodes for CTE names like compute_booleans/joined.
+    """
+    sql = """
+    WITH orders AS (
+        SELECT * FROM stg_orders
+    ),
+    order_items_table AS (
+        SELECT * FROM order_items
+    ),
+    order_items_summary AS (
+        SELECT order_id, COUNT(*) FROM order_items_table GROUP BY 1
+    ),
+    compute_booleans AS (
+        SELECT orders.*, order_items_summary.order_id > 0 AS has_items
+        FROM orders LEFT JOIN order_items_summary ON orders.id = order_items_summary.order_id
+    )
+    SELECT * FROM compute_booleans
+    """
+    parser = SqlParser()
+    result = parser.parse("finance_orders.sql", sql)
+
+    cte_names = {"orders", "order_items_table", "order_items_summary", "compute_booleans"}
+
+    # No `kind=table` nodes for CTE aliases
+    table_nodes = {n.name for n in result.nodes if n.kind == "table"}
+    for alias in cte_names:
+        assert alias not in table_nodes, f"CTE alias {alias!r} must not be indexed as a table"
+
+    # No top-level references to CTE aliases from the file node
+    file_to_cte = [
+        e for e in result.edges
+        if e.source_name == "finance_orders" and e.target_name in cte_names
+    ]
+    assert not file_to_cte, f"File must not reference CTE aliases: {file_to_cte}"
+
+    # Real upstream tables ARE captured
+    table_targets = {e.target_name for e in result.edges if e.target_kind == "table"}
+    assert "stg_orders" in table_targets
+    assert "order_items" in table_targets
+
+
 def test_qualified_table_names():
     """Schema-qualified and catalog-qualified table names store metadata."""
     sql = """

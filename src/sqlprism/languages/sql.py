@@ -344,6 +344,16 @@ class SqlParser:
                     self._is_quoted_identifier(target_expr),
                 )
 
+        # Collect CTE aliases in this statement so `FROM cte_alias` is not
+        # mistaken for an external table reference. CTE→CTE and CTE→table
+        # edges are handled by `_extract_ctes`.
+        cte_aliases: set[str] = set()
+        for cte in stmt.find_all(exp.CTE):
+            if cte.alias:
+                alias_node = cte.args.get("alias")
+                quoted = self._is_quoted_identifier(alias_node) if alias_node else False
+                cte_aliases.add(self._normalize_identifier(cte.alias, quoted))
+
         for table in stmt.find_all(exp.Table):
             name = self._normalize_identifier(table.name, self._is_quoted_identifier(table))
             if not name:
@@ -355,6 +365,13 @@ class SqlParser:
                 parent = table.parent
                 if isinstance(parent, (exp.Create, exp.Schema)):
                     continue
+
+            # Skip references to CTE aliases — they are local query names,
+            # not external tables. The CTE's own references (what it FROMs)
+            # are still captured because `find_all(exp.Table)` walks into
+            # the CTE body.
+            if name in cte_aliases:
+                continue
 
             # Avoid duplicating nodes for the same table+schema within one file (O(1) check)
             metadata = self._build_table_metadata(table)
