@@ -1427,6 +1427,85 @@ def test_reindex_files_dbt_model(tmp_path):
     db.close()
 
 
+def test_reindex_dbt_manifest_edges_end_to_end(tmp_path):
+    """Issue #96: reindex_dbt persists manifest-derived ref edges into the graph.
+
+    Builds a fake dbt project with a compiled `orders.sql` and `stg_orders.sql`
+    plus a manifest.json that declares `orders` depends on `stg_orders`. After
+    `reindex_dbt`, `query_references("stg_orders", direction="inbound")` must
+    surface `orders` as a consumer — the behavioural acceptance criterion
+    from the issue body.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "dbt_proj"
+    repo_dir.mkdir()
+    (repo_dir / "dbt_project.yml").write_text("name: my_proj\n")
+    (repo_dir / ".venv").mkdir()
+
+    compiled = repo_dir / "target" / "compiled" / "my_proj" / "models"
+    (compiled / "staging").mkdir(parents=True)
+    (compiled / "marts").mkdir(parents=True)
+    # Compiled SQL resolves to a physical schema unrelated to the model name —
+    # the parser can't recover the logical ref from this alone; manifest must.
+    (compiled / "staging" / "stg_orders.sql").write_text(
+        'SELECT id FROM "raw"."raw_orders"'
+    )
+    (compiled / "marts" / "orders.sql").write_text(
+        'SELECT * FROM "analytics_prod"."stg_orders"'
+    )
+
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_orders"]},
+            },
+            "model.my_proj.stg_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": ["source.my_proj.raw.raw_orders"]},
+            },
+        },
+        "sources": {
+            "source.my_proj.raw.raw_orders": {
+                "name": "raw_orders",
+                "identifier": "raw_orders",
+            },
+        },
+    }
+    (repo_dir / "target" / "manifest.json").write_text(json.dumps(manifest))
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        stats = indexer.reindex_dbt(
+            repo_name="jaffle", project_path=str(repo_dir), dialect="duckdb"
+        )
+
+    assert stats["models_compiled"] == 2
+    assert stats["edges_added"] > 0
+
+    # The behavioural assertion from issue #96: stg_orders has `orders` as
+    # an inbound model consumer, not just its test/materialization nodes.
+    refs = db.query_references("stg_orders", direction="inbound", include_snippets=False)
+    inbound_names = {r["name"] for r in refs["inbound"]}
+    assert "orders" in inbound_names, f"Expected 'orders' in inbound refs, got {inbound_names}"
+
+    db.close()
+
+
 def test_reindex_files_sqlmesh_model(tmp_path):
     """reindex_files() renders a sqlmesh model via render_models() and inserts the result."""
     from unittest.mock import patch
