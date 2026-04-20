@@ -208,6 +208,154 @@ def test_dbt_render_project_success(tmp_path):
             assert node.metadata["dbt_model"] == rel_path
 
 
+def test_dbt_extract_manifest_edges(tmp_path):
+    """Unit test: manifest.json is parsed into ref/source EdgeResults per model."""
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {
+                    "nodes": [
+                        "model.my_proj.stg_orders",
+                        "source.my_proj.raw.raw_orders",
+                    ],
+                },
+            },
+            "model.my_proj.stg_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": ["source.my_proj.raw.raw_orders"]},
+            },
+            # Test node — should not appear as a source of ref edges
+            "test.my_proj.not_null_stg_orders_id": {
+                "resource_type": "test",
+                "package_name": "my_proj",
+                "name": "not_null_stg_orders_id",
+                "path": "staging/stg_orders.yml/not_null_stg_orders_id.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_orders"]},
+            },
+            # Foreign-package model — skipped (belongs to another project)
+            "model.other_proj.shared": {
+                "resource_type": "model",
+                "package_name": "other_proj",
+                "name": "shared",
+                "path": "marts/shared.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {
+            "source.my_proj.raw.raw_orders": {
+                "name": "raw_orders",
+                "identifier": "raw_orders",
+            },
+        },
+    }
+
+    (tmp_path / "target").mkdir()
+    (tmp_path / "target" / "manifest.json").write_text(json.dumps(manifest))
+
+    renderer = DbtRenderer()
+    edges_by_path = renderer._extract_manifest_edges(tmp_path, "my_proj")
+
+    # Two owned models → two entries
+    assert set(edges_by_path.keys()) == {"marts/orders.sql", "staging/stg_orders.sql"}
+
+    orders_edges = edges_by_path["marts/orders.sql"]
+    orders_targets = {(e.target_name, e.context) for e in orders_edges}
+    assert orders_targets == {("stg_orders", "ref()"), ("raw_orders", "source()")}
+
+    for edge in orders_edges:
+        assert edge.source_name == "orders"
+        assert edge.source_kind == "query"
+        assert edge.target_kind == "table"
+        assert edge.relationship == "references"
+
+    # Test nodes and foreign-project models are NOT emitted as sources
+    for path in edges_by_path:
+        assert "not_null" not in path
+        assert "shared" not in path
+
+
+def test_dbt_extract_manifest_edges_missing_file(tmp_path):
+    """Returns empty dict when target/manifest.json does not exist."""
+    renderer = DbtRenderer()
+    assert renderer._extract_manifest_edges(tmp_path, "my_proj") == {}
+
+
+def test_dbt_render_project_merges_manifest_edges(tmp_path):
+    """Manifest ref edges are merged into ParseResult.edges alongside parsed SQL."""
+    (tmp_path / "dbt_project.yml").write_text("name: my_proj\n")
+    (tmp_path / ".venv").mkdir()
+
+    compiled_dir = tmp_path / "target" / "compiled" / "my_proj" / "models"
+    compiled_dir.mkdir(parents=True)
+    # Compiled SQL references only raw_orders — manifest must add the logical
+    # ref to stg_orders (e.g. a macro-derived ref the parser can't see).
+    (compiled_dir / "marts").mkdir()
+    (compiled_dir / "marts" / "orders.sql").write_text(
+        "SELECT id FROM raw_orders"
+    )
+
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {
+                    "nodes": [
+                        "model.my_proj.stg_orders",
+                        "source.my_proj.raw.raw_orders",
+                    ],
+                },
+            },
+            "model.my_proj.stg_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": ["source.my_proj.raw.raw_orders"]},
+            },
+        },
+        "sources": {
+            "source.my_proj.raw.raw_orders": {
+                "name": "raw_orders",
+                "identifier": "raw_orders",
+            },
+        },
+    }
+    (tmp_path / "target" / "manifest.json").write_text(json.dumps(manifest))
+
+    renderer = DbtRenderer()
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    assert "marts/orders.sql" in results
+    parse_result = results["marts/orders.sql"]
+
+    # Manifest adds the logical ref to stg_orders (not present in compiled SQL)
+    stg_orders_edges = [e for e in parse_result.edges if e.target_name == "stg_orders"]
+    assert len(stg_orders_edges) == 1
+    edge = stg_orders_edges[0]
+    assert edge.source_name == "orders"
+    assert edge.source_kind == "query"
+    assert edge.target_kind == "table"
+    assert edge.relationship == "references"
+    assert edge.context == "ref()"
+
+    # Parser already extracted raw_orders from the FROM clause — manifest's
+    # duplicate source() edge is deduped so we keep exactly one.
+    raw_edges = [e for e in parse_result.edges if e.target_name == "raw_orders"]
+    assert len(raw_edges) == 1
+
+
 # ── SqlMeshRenderer.render_project mocked tests ──
 
 

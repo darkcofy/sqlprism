@@ -17,6 +17,7 @@ The dbt command can be customised (e.g. "uvx --with dbt-starrocks dbt" or
 just "dbt" if globally installed).
 """
 
+import json
 import logging
 import shlex
 import subprocess
@@ -25,7 +26,7 @@ from pathlib import Path
 from sqlprism.languages.sql import SqlParser
 from sqlprism.languages.sqlmesh import _validate_command
 from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
-from sqlprism.types import ColumnDefResult, ParseResult
+from sqlprism.types import ColumnDefResult, EdgeResult, ParseResult
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,133 @@ class DbtRenderer:
 
             results[rel_path] = result
 
+        # Merge in authoritative ref/source edges from the dbt manifest so
+        # model→model relationships survive the loss of `ref()` context
+        # during compilation (including cross-project mesh refs).
+        manifest_edges = self._extract_manifest_edges(project_path, project_name)
+        for rel_path, extra_edges in manifest_edges.items():
+            pr = results.get(rel_path)
+            if pr is None:
+                continue
+            existing = {
+                (e.source_name, e.source_kind, e.target_name, e.target_kind, e.relationship)
+                for e in pr.edges
+            }
+            for edge in extra_edges:
+                key = (
+                    edge.source_name,
+                    edge.source_kind,
+                    edge.target_name,
+                    edge.target_kind,
+                    edge.relationship,
+                )
+                if key not in existing:
+                    pr.edges.append(edge)
+                    existing.add(key)
+
         return results
+
+    def _extract_manifest_edges(
+        self, project_path: Path, project_name: str
+    ) -> dict[str, list[EdgeResult]]:
+        """Read ``target/manifest.json`` and derive ref/source edges for each model.
+
+        dbt's manifest preserves the logical dependency graph expressed via
+        ``ref()`` and ``source()`` — information that is lost when Jinja is
+        compiled to SQL. For each model owned by ``project_name``, emit an
+        edge per entry in ``depends_on.nodes`` pointing at the referenced
+        model (or source's physical ``identifier``).
+
+        Edges are keyed by the model's ``path`` from the manifest, which
+        matches the ``rel_path`` used by ``_compile_and_parse`` results.
+
+        Returns an empty dict if the manifest is missing or unreadable.
+        """
+        manifest_path = project_path / "target" / "manifest.json"
+        if not manifest_path.exists():
+            return {}
+
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Cannot read dbt manifest %s: %s", manifest_path, e)
+            return {}
+
+        nodes = manifest.get("nodes") or {}
+        sources = manifest.get("sources") or {}
+
+        def _resolve_dep(key: str) -> tuple[str, str] | None:
+            """Resolve a manifest dep key to (target_name, context).
+
+            Prefers the node/source entry for accurate naming (sources may
+            have an ``identifier`` that differs from ``name``). Falls back
+            to the last segment of the key so that disabled models or
+            partial manifests still yield an edge rather than a silent drop.
+            """
+            if key in nodes:
+                dep = nodes[key]
+                if dep.get("resource_type") in ("model", "seed", "snapshot"):
+                    dep_name = dep.get("name")
+                    if dep_name:
+                        return dep_name, "ref()"
+            if key in sources:
+                dep = sources[key]
+                dep_name = dep.get("identifier") or dep.get("name")
+                if dep_name:
+                    return dep_name, "source()"
+            # Fallback: parse from the key. Formats:
+            #   model|seed|snapshot.<pkg>.<name>
+            #   source.<pkg>.<source_name>.<table>
+            parts = key.split(".")
+            if len(parts) < 3:
+                return None
+            kind = parts[0]
+            if kind == "source" and len(parts) >= 4:
+                return parts[-1], "source()"
+            if kind in ("model", "seed", "snapshot"):
+                return parts[-1], "ref()"
+            return None
+
+        edges_by_path: dict[str, list[EdgeResult]] = {}
+        for node in nodes.values():
+            if node.get("resource_type") != "model":
+                continue
+            if node.get("package_name") != project_name:
+                continue
+
+            model_name = node.get("name")
+            rel_path = node.get("path")
+            if not model_name or not rel_path:
+                continue
+
+            deps = (node.get("depends_on") or {}).get("nodes") or []
+            edges: list[EdgeResult] = []
+            seen: set[tuple[str, str]] = set()
+            for dep_key in deps:
+                resolved = _resolve_dep(dep_key)
+                if resolved is None:
+                    continue
+                target_name, context = resolved
+                if target_name == model_name:
+                    continue
+                key = (target_name, context)
+                if key in seen:
+                    continue
+                seen.add(key)
+                edges.append(
+                    EdgeResult(
+                        source_name=model_name,
+                        source_kind="query",
+                        target_name=target_name,
+                        target_kind="table",
+                        relationship="references",
+                        context=context,
+                    )
+                )
+            if edges:
+                edges_by_path[rel_path] = edges
+
+        return edges_by_path
 
     def _run_dbt_compile(
         self,
