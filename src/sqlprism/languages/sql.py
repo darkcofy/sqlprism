@@ -332,8 +332,13 @@ class SqlParser:
         if seen_edges is None:
             seen_edges = set()
 
-        # Identify the CREATE target so we don't double-count it as a reference
+        # Identify the CREATE target so we don't double-count it as a reference,
+        # and pull its kind/schema so the edges we emit resolve directly to the
+        # created node instead of kind-relaxed fallback (which may pick the
+        # wrong node when a CTE shares the file stem's name).
         create_target: str | None = None
+        source_kind: str = "query"
+        source_schema: str | None = None
         if isinstance(stmt, exp.Create):
             target_expr = stmt.this
             if isinstance(target_expr, exp.Schema):
@@ -343,6 +348,15 @@ class SqlParser:
                     target_expr.name,
                     self._is_quoted_identifier(target_expr),
                 )
+                if create_target == file_stem:
+                    kind_expr = stmt.args.get("kind")
+                    kind_str = (
+                        kind_expr.upper() if isinstance(kind_expr, str)
+                        else str(kind_expr).upper() if kind_expr else ""
+                    )
+                    source_kind = "view" if "VIEW" in kind_str else "table"
+                    target_metadata = self._build_table_metadata(target_expr)
+                    source_schema = target_metadata.get("schema")
 
         # Collect CTE aliases in this statement so `FROM cte_alias` is not
         # mistaken for an external table reference. CTE→CTE and CTE→table
@@ -392,14 +406,16 @@ class SqlParser:
                 continue
             seen_edges.add(edge_key)
 
+            edge_metadata = {"source_schema": source_schema} if source_schema else None
             edges.append(
                 EdgeResult(
                     source_name=file_stem,
-                    source_kind="query",
+                    source_kind=source_kind,
                     target_name=name,
                     target_kind="table",
                     relationship=relationship,
                     context=context,
+                    metadata=edge_metadata,
                 )
             )
 

@@ -313,9 +313,10 @@ def test_dbt_extract_manifest_edges(tmp_path):
 
     for edge in edges_by_path["marts/orders.sql"]:
         assert edge.source_name == "orders"
-        assert edge.source_kind == "query"
+        assert edge.source_kind == "table"
         assert edge.target_kind == "table"
         assert edge.relationship == "references"
+        assert (edge.metadata or {}).get("source_schema") == "marts"
 
 
 def test_dbt_extract_manifest_edges_missing_file(tmp_path):
@@ -536,7 +537,7 @@ def test_dbt_render_project_merges_manifest_edges(tmp_path):
     assert len(stg_orders_edges) == 1
     edge = stg_orders_edges[0]
     assert edge.source_name == "orders"
-    assert edge.source_kind == "query"
+    assert edge.source_kind == "table"
     assert edge.target_kind == "table"
     assert edge.relationship == "references"
     assert edge.context == "ref()"
@@ -549,7 +550,7 @@ def test_dbt_render_project_merges_manifest_edges(tmp_path):
     raw_contexts = {e.context for e in raw_edges}
     assert raw_contexts == {"FROM clause", "source()"}
     for e in raw_edges:
-        assert e.source_kind == "query"
+        assert e.source_kind == "table"
         assert e.relationship == "references"
 
 
