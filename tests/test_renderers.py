@@ -1604,6 +1604,58 @@ def test_dbt_compile_error_includes_stdout(tmp_path, monkeypatch):
         )
 
 
+def test_dbt_missing_binary_error(tmp_path, monkeypatch):
+    """When dbt isn't installed, uv reports 'Failed to spawn: dbt' — surface actionable message."""
+    import subprocess as sp
+
+    renderer = DbtRenderer()
+
+    def fake_run(*args, **kwargs):
+        return sp.CompletedProcess(
+            args=args[0],
+            returncode=2,
+            stdout="",
+            stderr="error: Failed to spawn: dbt\n  Caused by: No such file or directory (os error 2)",
+        )
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    with pytest.raises(RuntimeError, match="dbt is not installed in the project environment"):
+        renderer._run_dbt_compile(
+            project_path=tmp_path,
+            profiles_dir=tmp_path,
+            cwd=tmp_path,
+            env={},
+            target=None,
+            dbt_command="uv run dbt",
+        )
+
+
+def test_dbt_missing_module_error(tmp_path, monkeypatch):
+    """ModuleNotFoundError for dbt should also trip the friendly message."""
+    import subprocess as sp
+
+    renderer = DbtRenderer()
+
+    def fake_run(*args, **kwargs):
+        return sp.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout="",
+            stderr="ModuleNotFoundError: No module named 'dbt'",
+        )
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    with pytest.raises(RuntimeError, match="dbt is not installed in the project environment"):
+        renderer._run_dbt_compile(
+            project_path=tmp_path,
+            profiles_dir=tmp_path,
+            cwd=tmp_path,
+            env={},
+            target=None,
+            dbt_command="uv run dbt",
+        )
+
+
 def test_sqlmesh_render_missing_module_error(tmp_path, monkeypatch):
     """When sqlmesh is not installed, error message should say so clearly."""
     import subprocess as sp
@@ -1624,7 +1676,7 @@ def test_sqlmesh_render_missing_module_error(tmp_path, monkeypatch):
 
     import pytest
 
-    with pytest.raises(RuntimeError, match="sqlmesh is not installed"):
+    with pytest.raises(RuntimeError, match="sqlmesh is not installed") as exc_info:
         renderer._run_render_script(
             project_path=tmp_path,
             cwd=tmp_path,
@@ -1633,5 +1685,37 @@ def test_sqlmesh_render_missing_module_error(tmp_path, monkeypatch):
             gateway="local",
             dialect="duckdb",
             sqlmesh_command="python",
+            model_filter=[],
+        )
+    # Message should point at the cwd so users know which venv to fix
+    assert str(tmp_path) in str(exc_info.value)
+
+
+def test_sqlmesh_render_failed_to_spawn_error(tmp_path, monkeypatch):
+    """When sqlmesh binary isn't on PATH, 'Failed to spawn: sqlmesh' should map to the friendly error."""
+    import subprocess as sp
+
+    from sqlprism.languages.sqlmesh import SqlMeshRenderer
+
+    renderer = SqlMeshRenderer()
+
+    def fake_run(*args, **kwargs):
+        return sp.CompletedProcess(
+            args=args[0],
+            returncode=2,
+            stdout="",
+            stderr="error: Failed to spawn: sqlmesh\n  Caused by: No such file or directory",
+        )
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    with pytest.raises(RuntimeError, match="sqlmesh is not installed"):
+        renderer._run_render_script(
+            project_path=tmp_path,
+            cwd=tmp_path,
+            env={},
+            variables={},
+            gateway="local",
+            dialect="duckdb",
+            sqlmesh_command="uv run sqlmesh",
             model_filter=[],
         )

@@ -451,7 +451,20 @@ class DbtRenderer:
         )
 
         if result.returncode != 0:
-            output = result.stderr.strip() or result.stdout.strip()
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            combined = f"{stderr}\n{stdout}"
+            if "Failed to spawn: dbt" in combined or (
+                "No module named" in combined and "dbt" in combined
+            ):
+                raise RuntimeError(
+                    f"dbt is not installed in the project environment at {cwd}. "
+                    "Install it in the dbt project's virtualenv "
+                    "(e.g. `uv add dbt-core dbt-<adapter>` or "
+                    "`pip install dbt-core dbt-<adapter>`), "
+                    "or point `dbt_command` at a command that can launch dbt."
+                )
+            output = stderr or stdout
             raise RuntimeError(f"dbt compile failed (exit {result.returncode}):\n{output}")
 
     def _get_project_name(self, project_path: Path) -> str:

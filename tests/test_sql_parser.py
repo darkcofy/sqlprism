@@ -1456,7 +1456,9 @@ def test_bare_select_file_gets_query_node():
     result = parser.parse("stg_orders.sql", "SELECT id, name FROM customers")
     query_nodes = [n for n in result.nodes if n.kind == "query" and n.name == "stg_orders"]
     assert len(query_nodes) == 1
-    assert query_nodes[0].metadata.get("file_node") is True
+    metadata = query_nodes[0].metadata
+    assert metadata is not None
+    assert metadata.get("file_node") is True
 
 
 def test_generic_filename_uses_parent_dir():
