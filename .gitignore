@@ -1,6 +1,7 @@
 # Claude
 .claude/research/
 .claude/plans/
+.claude/worktrees/
 .claude/settings.local.json
 .mcp.json
 
