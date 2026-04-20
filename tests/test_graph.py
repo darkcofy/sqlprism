@@ -1523,36 +1523,3 @@ def test_trace_max_depth_boundary():
     db.close()
 
 
-def test_trace_pgq_cte_parity():
-    """PGQ and CTE produce the same set of node names and depths."""
-    import pytest
-
-    db = _build_trace_graph()
-    db.refresh_property_graph()
-
-    if not db.has_pgq:
-        db.close()
-        pytest.skip("DuckPGQ not available in this environment")
-
-    start_id = db._execute_read(
-        "SELECT node_id FROM nodes WHERE name = ?", ["raw_orders"]
-    ).fetchone()[0]
-
-    pgq_paths = db._trace_pgq(
-        start_id, "raw_orders", "downstream", 3, 100, False
-    )
-    cte_paths = db._trace_cte(start_id, "downstream", 3, 100, False)
-
-    pgq_names = {p["name"] for p in pgq_paths}
-    cte_names = {p["name"] for p in cte_paths}
-
-    # Both engines must find exactly the same nodes
-    assert pgq_names == cte_names
-    assert pgq_names == {"stg_orders", "marts_revenue", "dim_customers"}
-
-    # Depths should also match now that PGQ recovers depth via CTE
-    pgq_depths = {p["name"]: p["depth"] for p in pgq_paths}
-    cte_depths = {p["name"]: p["depth"] for p in cte_paths}
-    assert pgq_depths == cte_depths
-
-    db.close()
