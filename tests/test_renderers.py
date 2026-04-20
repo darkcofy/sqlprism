@@ -313,9 +313,43 @@ def test_dbt_extract_manifest_edges(tmp_path):
 
     for edge in edges_by_path["marts/orders.sql"]:
         assert edge.source_name == "orders"
-        assert edge.source_kind == "query"
+        assert edge.source_kind == "table"
         assert edge.target_kind == "table"
         assert edge.relationship == "references"
+        assert (edge.metadata or {}).get("source_schema") == "marts"
+
+
+def test_dbt_extract_manifest_edges_root_model_has_no_source_schema(tmp_path):
+    """A model at the project root (no subdirectory) emits edges with metadata=None."""
+    manifest = {
+        "nodes": {
+            "model.my_proj.flat_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "flat_orders",
+                "path": "flat_orders.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_orders"]},
+            },
+            "model.my_proj.stg_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {},
+    }
+    _write_manifest(tmp_path, manifest)
+
+    renderer = DbtRenderer()
+    edges_by_path = renderer._extract_manifest_edges(
+        tmp_path, "my_proj", renderer.sql_parser
+    )
+    edges = edges_by_path["flat_orders.sql"]
+    assert len(edges) == 1
+    assert edges[0].source_kind == "table"
+    assert edges[0].metadata is None
 
 
 def test_dbt_extract_manifest_edges_missing_file(tmp_path):
@@ -536,7 +570,7 @@ def test_dbt_render_project_merges_manifest_edges(tmp_path):
     assert len(stg_orders_edges) == 1
     edge = stg_orders_edges[0]
     assert edge.source_name == "orders"
-    assert edge.source_kind == "query"
+    assert edge.source_kind == "table"
     assert edge.target_kind == "table"
     assert edge.relationship == "references"
     assert edge.context == "ref()"
@@ -549,7 +583,7 @@ def test_dbt_render_project_merges_manifest_edges(tmp_path):
     raw_contexts = {e.context for e in raw_edges}
     assert raw_contexts == {"FROM clause", "source()"}
     for e in raw_edges:
-        assert e.source_kind == "query"
+        assert e.source_kind == "table"
         assert e.relationship == "references"
 
 

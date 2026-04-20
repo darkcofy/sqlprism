@@ -185,7 +185,9 @@ class DbtRenderer:
             if selected and sql_file.stem not in selected:
                 continue
 
-            rel_path = str(sql_file.relative_to(compiled_dir))
+            # Use posix-style separators so dict keys match manifest `path`
+            # values (always forward-slash) across Windows and Unix.
+            rel_path = sql_file.relative_to(compiled_dir).as_posix()
             content = sql_file.read_text(errors="replace")
             if not content.strip():
                 continue
@@ -378,9 +380,14 @@ class DbtRenderer:
             if selected is not None and raw_name not in selected:
                 continue
 
-            # Align source_name with the SQL parser's file_stem so edges
-            # collapse onto the same node the parser creates for this model.
-            source_name = _norm(Path(rel_path).stem)
+            # Align source_name/kind/schema with the `CREATE TABLE
+            # "<path-schema>"."<stem>"` node the renderer wraps around each
+            # compiled model, so manifest edges resolve to the exact table
+            # node (not a kind-relaxed fallback that may pick a CTE sharing
+            # the stem's name).
+            path_parts = rel_path.removesuffix(".sql").split("/")
+            source_name = _norm(path_parts[-1])
+            source_schema = "/".join(path_parts[:-1]) if len(path_parts) > 1 else None
 
             deps_obj = node.get("depends_on") or {}
             deps = list(deps_obj.get("nodes") or [])
@@ -405,11 +412,12 @@ class DbtRenderer:
                 edges.append(
                     EdgeResult(
                         source_name=source_name,
-                        source_kind="query",
+                        source_kind="table",
                         target_name=target_name,
                         target_kind="table",
                         relationship="references",
                         context=context,
+                        metadata={"source_schema": source_schema} if source_schema else None,
                     )
                 )
             if edges:
