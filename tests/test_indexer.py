@@ -425,6 +425,44 @@ def test_reindex_with_dialect_overrides(tmp_path):
     db.close()
 
 
+def test_reindex_skips_jinja_templated_sql(tmp_path):
+    """Files containing Jinja markers are skipped, not parsed."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = tmp_path / "jinja_repo"
+    repo_dir.mkdir()
+    (repo_dir / "clean.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
+    (repo_dir / "expr_template.sql").write_text(
+        "CREATE OR REPLACE VIEW {{ project }}.analytics.orders AS SELECT * FROM raw.orders"
+    )
+    (repo_dir / "block_template.sql").write_text(
+        "SELECT {% for col in columns %}{{ col }},{% endfor %} 1 FROM t"
+    )
+
+    db = GraphDB()
+    indexer = Indexer(db)
+
+    stats = indexer.reindex_repo("jinja", str(repo_dir))
+    assert stats["files_scanned"] == 3
+    assert stats["files_added"] == 3
+    assert stats["files_skipped_jinja"] == 2
+    # Only clean.sql contributes nodes
+    nodes = db.query_search("orders")
+    assert nodes["total_count"] >= 1
+    # No nodes from the Jinja files (e.g. no `analytics` view, no template CTE names)
+    raw_nodes = db.query_search("analytics")
+    assert raw_nodes["total_count"] == 0
+
+    # Second reindex — skipped files have checksums recorded, so nothing is re-read
+    stats2 = indexer.reindex_repo("jinja", str(repo_dir))
+    assert stats2["files_added"] == 0
+    assert stats2["files_changed"] == 0
+    assert stats2["files_skipped_jinja"] == 0
+
+    db.close()
+
+
 # ── P6.3: MCP tool + integration tests ──
 
 

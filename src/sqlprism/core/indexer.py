@@ -129,6 +129,7 @@ class Indexer:
             "columns_added": 0,
             "lineage_chains": 0,
             "column_usage_dropped": 0,
+            "files_skipped_jinja": 0,
             "parse_errors": [],
         }
 
@@ -157,6 +158,18 @@ class Indexer:
                 stats["parse_errors"].append(f"{rel_path}: unreadable (OS/permission error)")
                 continue
             checksum = current_files[rel_path]
+
+            # Jinja-templated SQL (e.g. bigquery-etl sql_generators/) is not
+            # deployable SQL — record the checksum but skip parsing so the
+            # index isn't polluted with partially-parsed template nodes.
+            if _contains_jinja(content):
+                logger.debug("Skipping Jinja-templated SQL file: %s", rel_path)
+                stats["files_skipped_jinja"] += 1
+                with self.graph.write_transaction():
+                    if rel_path in changed_set:
+                        self.graph.delete_file_data(repo_id, rel_path)
+                    self.graph.insert_file(repo_id, rel_path, "sql", checksum)
+                continue
 
             # Parse — pass schema catalog for SELECT * lineage expansion
             result = parser.parse(rel_path, content, schema=schema_catalog)
@@ -1177,6 +1190,19 @@ class Indexer:
             return [f.strip() for f in result.stdout.strip().split("\n") if f.strip() and is_sql_file(f.strip())]
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return []
+
+
+_JINJA_MARKERS = ("{{", "{%")
+
+
+def _contains_jinja(content: str) -> bool:
+    """Detect Jinja template markers in SQL content.
+
+    Returns True if the content contains ``{{`` expression or ``{%`` statement
+    markers — a signal that the file is a SQL generator template rather than
+    deployable SQL.
+    """
+    return any(marker in content for marker in _JINJA_MARKERS)
 
 
 def _resolve_dialect(
