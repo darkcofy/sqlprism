@@ -1,5 +1,7 @@
 """Tests for dbt and sqlmesh renderer utilities (Phase 5.2)."""
 
+from pathlib import Path
+
 import pytest
 
 from sqlprism.languages.dbt import DbtRenderer
@@ -206,6 +208,349 @@ def test_dbt_render_project_success(tmp_path):
             assert node.metadata is not None, "Nodes should have metadata"
             assert "dbt_model" in node.metadata, "Nodes should have dbt_model metadata"
             assert node.metadata["dbt_model"] == rel_path
+
+
+def _write_manifest(tmp_path: Path, manifest: dict) -> None:
+    (tmp_path / "target").mkdir(exist_ok=True)
+    (tmp_path / "target" / "manifest.json").write_text(json.dumps(manifest))
+
+
+def test_dbt_extract_manifest_edges(tmp_path):
+    """Unit test: manifest.json is parsed into ref/source EdgeResults per model."""
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {
+                    "nodes": [
+                        "model.my_proj.stg_orders",
+                        "source.my_proj.raw.raw_orders",
+                        "seed.my_proj.countries",
+                        "snapshot.my_proj.customers_snapshot",
+                    ],
+                },
+            },
+            "model.my_proj.stg_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": ["source.my_proj.raw.raw_orders"]},
+            },
+            # Model with zero deps — excluded from edges_by_path since no edges emitted
+            "model.my_proj.static_lookup": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "static_lookup",
+                "path": "marts/static_lookup.sql",
+                "depends_on": {"nodes": []},
+            },
+            # Model with no depends_on key at all — handled without crashing
+            "model.my_proj.no_depends": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "no_depends",
+                "path": "marts/no_depends.sql",
+            },
+            "seed.my_proj.countries": {
+                "resource_type": "seed",
+                "package_name": "my_proj",
+                "name": "countries",
+                "path": "seeds/countries.csv",
+            },
+            "snapshot.my_proj.customers_snapshot": {
+                "resource_type": "snapshot",
+                "package_name": "my_proj",
+                "name": "customers_snapshot",
+                "path": "snapshots/customers_snapshot.sql",
+            },
+            # Test node — should not appear as a source of ref edges
+            "test.my_proj.not_null_stg_orders_id": {
+                "resource_type": "test",
+                "package_name": "my_proj",
+                "name": "not_null_stg_orders_id",
+                "path": "staging/stg_orders.yml/not_null_stg_orders_id.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_orders"]},
+            },
+            # Foreign-package model — skipped (belongs to another project)
+            "model.other_proj.shared": {
+                "resource_type": "model",
+                "package_name": "other_proj",
+                "name": "shared",
+                "path": "marts/shared.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {
+            "source.my_proj.raw.raw_orders": {
+                "name": "raw_orders",
+                "identifier": "raw_orders",
+            },
+        },
+    }
+    _write_manifest(tmp_path, manifest)
+
+    renderer = DbtRenderer()
+    edges_by_path = renderer._extract_manifest_edges(
+        tmp_path, "my_proj", renderer.sql_parser
+    )
+
+    # Only the two owned models with non-empty deps appear as keys.
+    assert set(edges_by_path.keys()) == {"marts/orders.sql", "staging/stg_orders.sql"}
+
+    orders_targets = {
+        (e.target_name, e.context) for e in edges_by_path["marts/orders.sql"]
+    }
+    assert orders_targets == {
+        ("stg_orders", "ref()"),
+        ("raw_orders", "source()"),
+        ("countries", "ref()"),
+        ("customers_snapshot", "ref()"),
+    }
+
+    for edge in edges_by_path["marts/orders.sql"]:
+        assert edge.source_name == "orders"
+        assert edge.source_kind == "query"
+        assert edge.target_kind == "table"
+        assert edge.relationship == "references"
+
+
+def test_dbt_extract_manifest_edges_missing_file(tmp_path):
+    """Returns empty dict when manifest.json does not exist."""
+    renderer = DbtRenderer()
+    assert (
+        renderer._extract_manifest_edges(tmp_path, "my_proj", renderer.sql_parser) == {}
+    )
+
+
+def test_dbt_extract_manifest_edges_malformed_json(tmp_path, caplog):
+    """Malformed manifest.json returns {} and logs an error."""
+    (tmp_path / "target").mkdir()
+    (tmp_path / "target" / "manifest.json").write_text("not-json-garbage-{{")
+
+    renderer = DbtRenderer()
+    with caplog.at_level("ERROR", logger="sqlprism.languages.dbt"):
+        result = renderer._extract_manifest_edges(
+            tmp_path, "my_proj", renderer.sql_parser
+        )
+    assert result == {}
+    assert any("manifest" in rec.message.lower() for rec in caplog.records)
+
+
+def test_dbt_extract_manifest_edges_only_foreign_packages(tmp_path):
+    """Manifest with only foreign-package models returns {}."""
+    manifest = {
+        "nodes": {
+            "model.upstream.shared": {
+                "resource_type": "model",
+                "package_name": "upstream",
+                "name": "shared",
+                "path": "models/shared.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {},
+    }
+    _write_manifest(tmp_path, manifest)
+
+    renderer = DbtRenderer()
+    assert (
+        renderer._extract_manifest_edges(tmp_path, "my_proj", renderer.sql_parser) == {}
+    )
+
+
+def test_dbt_extract_manifest_edges_snowflake_case_folding(tmp_path):
+    """Snowflake dialect uppercases identifiers so edges match parser-created nodes."""
+    from sqlprism.languages.sql import SqlParser
+
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_orders"]},
+            },
+            "model.my_proj.stg_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {},
+    }
+    _write_manifest(tmp_path, manifest)
+
+    renderer = DbtRenderer()
+    sf_parser = SqlParser(dialect="snowflake")
+    edges_by_path = renderer._extract_manifest_edges(tmp_path, "my_proj", sf_parser)
+
+    edge = edges_by_path["marts/orders.sql"][0]
+    assert edge.source_name == "ORDERS"
+    assert edge.target_name == "STG_ORDERS"
+
+
+def test_dbt_extract_manifest_edges_select_short_circuits(tmp_path):
+    """When `select` is passed, only listed models produce edges."""
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_orders"]},
+            },
+            "model.my_proj.customers": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "customers",
+                "path": "marts/customers.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_customers"]},
+            },
+        },
+        "sources": {},
+    }
+    _write_manifest(tmp_path, manifest)
+
+    renderer = DbtRenderer()
+    edges = renderer._extract_manifest_edges(
+        tmp_path, "my_proj", renderer.sql_parser, select=["orders"]
+    )
+    assert set(edges.keys()) == {"marts/orders.sql"}
+
+
+def test_dbt_extract_manifest_edges_public_nodes_union(tmp_path):
+    """Cross-project mesh refs in `public_nodes` are unioned with `nodes`."""
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {
+                    "nodes": [],
+                    "public_nodes": ["model.upstream_proj.stg_orders"],
+                },
+            },
+        },
+        "sources": {},
+    }
+    _write_manifest(tmp_path, manifest)
+
+    renderer = DbtRenderer()
+    edges = renderer._extract_manifest_edges(
+        tmp_path, "my_proj", renderer.sql_parser
+    )
+    targets = {(e.target_name, e.context) for e in edges["marts/orders.sql"]}
+    assert targets == {("stg_orders", "ref()")}
+
+
+def test_dbt_extract_manifest_edges_custom_target_path(tmp_path, monkeypatch):
+    """DBT_TARGET_PATH env var redirects manifest lookup."""
+    custom_target = tmp_path / "custom-target"
+    custom_target.mkdir()
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {"nodes": ["model.my_proj.stg_orders"]},
+            },
+        },
+        "sources": {},
+    }
+    (custom_target / "manifest.json").write_text(json.dumps(manifest))
+
+    monkeypatch.setenv("DBT_TARGET_PATH", str(custom_target))
+    renderer = DbtRenderer()
+    edges = renderer._extract_manifest_edges(
+        tmp_path, "my_proj", renderer.sql_parser
+    )
+    assert "marts/orders.sql" in edges
+
+
+def test_dbt_render_project_merges_manifest_edges(tmp_path):
+    """Manifest ref edges are merged into ParseResult.edges alongside parsed SQL."""
+    (tmp_path / "dbt_project.yml").write_text("name: my_proj\n")
+    (tmp_path / ".venv").mkdir()
+
+    compiled_dir = tmp_path / "target" / "compiled" / "my_proj" / "models"
+    compiled_dir.mkdir(parents=True)
+    # Realistic dbt compiled output: source() compiles to quoted schema-qualified name.
+    (compiled_dir / "marts").mkdir()
+    (compiled_dir / "marts" / "orders.sql").write_text(
+        'SELECT id FROM "raw"."raw_orders"'
+    )
+
+    manifest = {
+        "nodes": {
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "marts/orders.sql",
+                "depends_on": {
+                    "nodes": [
+                        "model.my_proj.stg_orders",
+                        "source.my_proj.raw.raw_orders",
+                    ],
+                },
+            },
+            "model.my_proj.stg_orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": ["source.my_proj.raw.raw_orders"]},
+            },
+        },
+        "sources": {
+            "source.my_proj.raw.raw_orders": {
+                "name": "raw_orders",
+                "identifier": "raw_orders",
+            },
+        },
+    }
+    _write_manifest(tmp_path, manifest)
+
+    renderer = DbtRenderer()
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        results = renderer.render_project(project_path=tmp_path)
+
+    assert "marts/orders.sql" in results
+    parse_result = results["marts/orders.sql"]
+
+    # Manifest adds the logical ref to stg_orders (not present in compiled SQL)
+    stg_orders_edges = [e for e in parse_result.edges if e.target_name == "stg_orders"]
+    assert len(stg_orders_edges) == 1
+    edge = stg_orders_edges[0]
+    assert edge.source_name == "orders"
+    assert edge.source_kind == "query"
+    assert edge.target_kind == "table"
+    assert edge.relationship == "references"
+    assert edge.context == "ref()"
+
+    # Parser emits raw_orders with context="FROM clause"; manifest emits the
+    # same edge with context="source()". Dedup key includes context so both
+    # coexist — preserving the source() semantic tag without losing the
+    # parser's positional info.
+    raw_edges = [e for e in parse_result.edges if e.target_name == "raw_orders"]
+    raw_contexts = {e.context for e in raw_edges}
+    assert raw_contexts == {"FROM clause", "source()"}
+    for e in raw_edges:
+        assert e.source_kind == "query"
+        assert e.relationship == "references"
 
 
 # ── SqlMeshRenderer.render_project mocked tests ──
