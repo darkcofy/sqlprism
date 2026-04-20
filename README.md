@@ -46,6 +46,8 @@ uv run sqlprism reindex                 # index plain SQL repos
 
 For [dbt](https://www.getdbt.com/) and [SQLMesh](https://sqlmesh.com/) projects, use `reindex-dbt` and `reindex-sqlmesh` respectively. See the [CLI guide](https://darkcofy.github.io/sqlprism/guide/cli/) for full options.
 
+> **Prerequisite:** dbt and SQLMesh are **not** dependencies of sqlprism. The renderers shell out to `dbt compile` / `sqlmesh` inside the target project's own virtualenv (via `uv run` by default). Install the renderer in that project — for example `uv add dbt-core dbt-<adapter>` or `uv add sqlmesh` — before running `reindex-dbt` / `reindex-sqlmesh`. If the renderer is missing, sqlprism will raise a clear error pointing at the project directory.
+
 ### 3. Connect your MCP client
 
 **Claude Code:**
