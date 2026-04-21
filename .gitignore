@@ -1,9 +1,14 @@
 # Claude
 .claude/research/
 .claude/plans/
+.claude/specs/
 .claude/worktrees/
 .claude/settings.local.json
+.claude/*.lock
 .mcp.json
+
+# User config (personal paths)
+sqlprism.yml
 
 # Coverage
 .coverage

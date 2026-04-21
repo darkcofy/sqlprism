@@ -321,12 +321,10 @@ class SqlMeshRenderer:
     ) -> list[str]:
         """Run a lightweight subprocess to discover all model names."""
         _validate_command(sqlmesh_command, allowed_keywords={"python", "sqlmesh", "uv"})
-        cmd = shlex.split(sqlmesh_command) + [
-            "-c",
-            _LIST_MODELS_SCRIPT,
-            str(project_path),
-            dialect,
-            gateway,
+        cmd = [
+            *shlex.split(sqlmesh_command),
+            "-c", _LIST_MODELS_SCRIPT,
+            str(project_path), dialect, gateway,
             json.dumps(variables),
         ]
 
@@ -556,12 +554,10 @@ class SqlMeshRenderer:
             column_schemas maps model_name -> {col_name: data_type}.
         """
         _validate_command(sqlmesh_command, allowed_keywords={"python", "sqlmesh", "uv"})
-        cmd = shlex.split(sqlmesh_command) + [
-            "-c",
-            _RENDER_SCRIPT,
-            str(project_path),
-            dialect,
-            gateway,
+        cmd = [
+            *shlex.split(sqlmesh_command),
+            "-c", _RENDER_SCRIPT,
+            str(project_path), dialect, gateway,
             json.dumps(variables),
             json.dumps(model_filter),
         ]

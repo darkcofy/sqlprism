@@ -693,11 +693,11 @@ async def pr_impact(params: PrImpactInput) -> dict:
 
     # Determine which repo
     if params.repo:
-        path, dialect, dialect_overrides = _resolve_repo_config(params.repo)
+        path, dialect, _dialect_overrides = _resolve_repo_config(params.repo)
         repo_path = Path(path)
     elif len(config["repos"]) == 1:
-        repo_name = list(config["repos"].keys())[0]
-        path, dialect, dialect_overrides = _resolve_repo_config(repo_name)
+        repo_name = next(iter(config["repos"].keys()))
+        path, dialect, _dialect_overrides = _resolve_repo_config(repo_name)
         repo_path = Path(path)
     else:
         return {"error": "Multiple repos configured — specify which repo to analyse."}
@@ -1072,7 +1072,7 @@ async def reindex(params: ReindexInput) -> dict:
                 def _blocking():
                     global _reindex_status
                     results = {}
-                    for name, cfg in repos.items():
+                    for name, _cfg in repos.items():
                         _reindex_status = {**_reindex_status, "current_repo": name}
                         path, dialect, dialect_overrides = _resolve_repo_config(name)
                         results[name] = indexer.reindex_repo(
@@ -1421,7 +1421,7 @@ async def reindex_files(params: ReindexFilesInput) -> dict:
     for path in sql_files:
         resolved = state.indexer._resolve_file_repo(Path(path).resolve(), all_repos)
         if resolved:
-            repo_id, repo_name, repo_path, repo_type = resolved
+            _repo_id, repo_name, _repo_path, repo_type = resolved
             grouped[(repo_name, repo_type)].append(path)
             enqueued += 1
         else:

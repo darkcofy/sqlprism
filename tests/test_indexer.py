@@ -1318,7 +1318,7 @@ def test_resolve_file_repo_deepest_match(tmp_path):
     file_path = child / "model.sql"
     resolved = indexer._resolve_file_repo(file_path, all_repos)
     assert resolved is not None
-    repo_id, repo_name, repo_path, repo_type = resolved
+    _repo_id, repo_name, _repo_path, repo_type = resolved
     assert repo_name == "child"
     assert repo_type == "dbt"
 
@@ -1624,7 +1624,7 @@ def test_resolve_file_repo_various_layouts(tmp_path):
     # File in child → resolves to child (deepest)
     resolved = indexer._resolve_file_repo(child / "model.sql", all_repos)
     assert resolved is not None
-    repo_id, repo_name, repo_path, repo_type = resolved
+    _repo_id, repo_name, _repo_path, repo_type = resolved
     assert repo_name == "child"
     assert repo_type == "dbt"
 
@@ -3518,7 +3518,7 @@ def test_reindex_dbt_source_identifier_and_schema_keyed_separately(tmp_path):
     ).fetchall()
 
     by_schema: dict[str | None, set[str]] = {}
-    for name, schema, col_name, src in rows:
+    for _name, schema, col_name, src in rows:
         assert src == "schema_yml", rows
         by_schema.setdefault(schema, set()).add(col_name)
 

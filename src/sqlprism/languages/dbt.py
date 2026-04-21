@@ -25,6 +25,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
+
 from sqlprism.languages.sql import SqlParser
 from sqlprism.languages.sqlmesh import _merge_column_schemas, _validate_command
 from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
@@ -348,15 +350,15 @@ class DbtRenderer:
 
         configured: str | None = None
         try:
-            import yaml
-
             data = yaml.safe_load((project_path / "dbt_project.yml").read_text())
             if isinstance(data, dict):
                 value = data.get("target-path")
                 if isinstance(value, str):
                     configured = value
-        except (ImportError, OSError, Exception):
-            pass
+        except (OSError, yaml.YAMLError) as e:
+            logger.warning(
+                "Could not read target-path from %s/dbt_project.yml: %s", project_path, e,
+            )
 
         if configured:
             p = Path(configured)
@@ -897,12 +899,11 @@ class DbtRenderer:
     ) -> None:
         """Run dbt compile, pointing at the project directory."""
         _validate_command(dbt_command, allowed_keywords={"dbt", "uv", "uvx"})
-        cmd = shlex.split(dbt_command) + [
+        cmd = [
+            *shlex.split(dbt_command),
             "compile",
-            "--project-dir",
-            str(project_path),
-            "--profiles-dir",
-            str(profiles_dir),
+            "--project-dir", str(project_path),
+            "--profiles-dir", str(profiles_dir),
         ]
         if target:
             cmd.extend(["--target", target])
@@ -943,15 +944,15 @@ class DbtRenderer:
 
         content = dbt_project_file.read_text()
 
-        # Try proper YAML parsing first (pyyaml may be available via dbt)
         try:
-            import yaml
-
             data = yaml.safe_load(content)
             if isinstance(data, dict) and "name" in data:
                 return str(data["name"])
-        except (ImportError, Exception):
-            pass
+        except yaml.YAMLError as e:
+            logger.warning(
+                "Could not parse %s as YAML, falling back to line scan: %s",
+                dbt_project_file, e,
+            )
 
         # Fallback: line scanning for top-level name: field
         for line in content.splitlines():
@@ -1014,8 +1015,6 @@ class DbtRenderer:
         two sources sharing a bare name across different schemas must
         resolve to distinct nodes.
         """
-        import yaml
-
         project_path = Path(project_path).resolve()
         models_dir = project_path / "models"
         models: dict[str, list[ColumnDefResult]] = {}

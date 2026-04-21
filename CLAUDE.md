@@ -4,7 +4,7 @@ SQL knowledge graph MCP server — indexes SQL, dbt, and sqlmesh repos into a Du
 
 ## Quick Reference
 
-- **Language**: Python 3.12+
+- **Language**: Python 3.11+
 - **Package manager**: uv
 - **Lint**: `uv run ruff check .`
 - **Type check**: `uv run ty check`
@@ -18,7 +18,7 @@ src/sqlprism/
   core/
     graph.py       — DuckDB storage layer (MVCC, repo_type tracking)
     indexer.py      — Orchestrates parsing + indexing; file-level reindex with repo-type dispatch
-    mcp_tools.py   — MCP server tools (24 tools, non-blocking reindex, per-repo debounce)
+    mcp_tools.py   — MCP server tools (non-blocking reindex, per-repo debounce)
     conventions.py — Convention inference engine (layers, naming, references, tags, overrides)
   languages/
     sql.py         — sqlglot-based SQL parser
