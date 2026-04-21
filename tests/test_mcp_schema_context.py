@@ -11,7 +11,6 @@ from sqlprism.core.mcp_tools import (
     get_schema,
 )
 
-
 # ── get_schema (query_schema) tests ──
 
 

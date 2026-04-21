@@ -10,7 +10,6 @@ from sqlprism.core.mcp_tools import (
     configure,
 )
 
-
 # ── 5.1: Pydantic validation and field aliases ──
 
 

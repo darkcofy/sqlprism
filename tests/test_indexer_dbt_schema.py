@@ -1,19 +1,7 @@
 """Tests for the indexer orchestrator."""
 
-import importlib.metadata
 
-import pytest
 
-from sqlprism.core.indexer import _resolve_dialect
-from sqlprism.core.mcp_tools import _compute_structural_diff
-from sqlprism.languages.sqlmesh import _validate_command
-from sqlprism.types import (
-    ColumnDefResult,
-    ColumnUsageResult,
-    EdgeResult,
-    NodeResult,
-    ParseResult,
-)
 
 
 # ── #125: dbt ColumnDefResult persistence ──

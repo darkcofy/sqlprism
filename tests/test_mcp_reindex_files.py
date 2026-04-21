@@ -12,7 +12,6 @@ from sqlprism.core.mcp_tools import (
     reindex_files,
 )
 
-
 # ── reindex_files tool and debounce tests ──
 
 

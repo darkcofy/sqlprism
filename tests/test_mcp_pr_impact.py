@@ -17,7 +17,6 @@ from sqlprism.core.mcp_tools import (
     reindex,
 )
 
-
 # ── pr_impact end-to-end tests ──
 
 

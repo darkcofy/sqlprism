@@ -21,7 +21,6 @@ from sqlprism.core.mcp_tools import (
     trace_dependencies,
 )
 
-
 # ── 5.1: Async end-to-end MCP tool test ──
 
 
