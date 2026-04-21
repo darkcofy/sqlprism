@@ -1760,6 +1760,9 @@ def test_parser_emits_column_defs_for_ctas_projection():
         f"unexpected columns: {orders}"
     assert all(c.source == "inferred" for c in orders), orders
     assert [c.position for c in orders] == [0, 1], orders
+    # Inferred rows carry names only — a regression that started emitting
+    # "TEXT" here would silently shadow better-typed schema.yml overrides.
+    assert [c.data_type for c in orders] == [None, None], orders
 
 
 def test_parser_ctas_inferred_columns_do_not_shadow_explicit_definition():

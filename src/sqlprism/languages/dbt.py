@@ -22,6 +22,7 @@ import logging
 import os
 import shlex
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlprism.languages.sql import SqlParser
@@ -30,6 +31,23 @@ from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
 from sqlprism.types import ColumnDefResult, EdgeResult, ParseResult
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _SchemaYmlSource:
+    """One ``sources:`` table parsed from schema.yml.
+
+    Keeps the source *family* and physical *schema/identifier* separate so
+    the indexer can target the exact graph node a referencing model created.
+    ``schema`` defaults to ``family`` when the YAML doesn't override it,
+    matching dbt's own default.
+    """
+
+    family: str
+    identifier: str
+    schema: str | None
+    database: str | None
+    columns: list[ColumnDefResult] = field(default_factory=list)
 
 
 def _manifest_columns_dict(columns: dict | None) -> dict[str, str | None]:
@@ -206,10 +224,20 @@ class DbtRenderer:
         # typically multi-MB on real projects.
         manifest = self._load_manifest(project_path)
 
-        # Walk schema.yml once per compile. Shared by the SELECT * catalog
-        # and the post-parse merge that persists `source='schema_yml'`
-        # columns into the graph.
-        schema_yml_per_model = self.extract_schema_yml(project_path)
+        # Walk schema.yml once per compile. The split form (models + sources
+        # kept apart) is the critical input for the post-parse merge — a
+        # flattened key can't safely distinguish a source from a model whose
+        # name happens to contain a dot. The catalog builder still uses the
+        # flat form via _schema_yml_columns.
+        schema_yml_models, schema_yml_sources = (
+            self._extract_schema_yml_by_kind(project_path)
+        )
+        schema_yml_flat: dict[str, list[ColumnDefResult]] = dict(schema_yml_models)
+        for src in schema_yml_sources:
+            key = (
+                f"{src.family}.{src.identifier}" if src.family else src.identifier
+            )
+            schema_yml_flat.setdefault(key, []).extend(src.columns)
 
         # Build an effective schema catalog that layers dbt-sourced columns
         # (manifest + schema.yml) over the graph-derived catalog. Needed so
@@ -223,7 +251,7 @@ class DbtRenderer:
         # schema.yml metadata, not via mid-run in-graph writes.
         effective_schema = self._build_effective_schema(
             project_path, parser, schema_catalog, manifest=manifest,
-            schema_yml_per_model=schema_yml_per_model,
+            schema_yml_per_model=schema_yml_flat,
         )
 
         # Only read files for selected models when filtering
@@ -295,11 +323,13 @@ class DbtRenderer:
         # Merge schema.yml column defs into matching ParseResults so the
         # `columns` table carries real types (`source='schema_yml'`),
         # winning over the inferred projection entries the parser emitted
-        # from the CTAS wrap. Source entries that don't align with any
-        # compiled model land in a synthetic ParseResult whose columns
-        # attach to source table nodes created by referencing models.
+        # from the CTAS wrap. Source entries go into a synthetic
+        # ParseResult whose columns attach to source table nodes created
+        # by referencing models. Models and sources are handed in
+        # separately so a partial reindex (``render_models(select=...)``)
+        # can't misclassify an unselected model as a source.
         self._merge_schema_yml_into_results(
-            results, schema_yml_per_model, parser,
+            results, schema_yml_models, schema_yml_sources, parser,
         )
 
         return results
@@ -673,7 +703,8 @@ class DbtRenderer:
     def _merge_schema_yml_into_results(
         self,
         results: dict[str, ParseResult],
-        schema_yml_per_model: dict[str, list[ColumnDefResult]],
+        schema_yml_models: dict[str, list[ColumnDefResult]],
+        schema_yml_sources: list[_SchemaYmlSource],
         parser: SqlParser,
     ) -> None:
         """Fold schema.yml ``ColumnDefResult`` entries into the render output.
@@ -681,45 +712,79 @@ class DbtRenderer:
         For each compiled model, schema.yml entries win per ``column_name``
         over the inferred projection the parser emitted — concrete types and
         descriptions replace name-only ``inferred`` rows. Schema.yml source
-        entries (keyed ``source_name.table_name``) get collected into one
-        synthetic ParseResult so their columns persist via the graph
-        fallback in ``Indexer._resolve_column_def_node`` (which resolves to
-        the source table node any referencing model has already created).
+        entries land in a synthetic ParseResult so their columns persist
+        via the graph fallback in ``Indexer._resolve_column_def_node``
+        (which resolves to the source table node any referencing model has
+        already created).
+
+        Models are only merged when their compiled ParseResult is present in
+        ``results`` — on a partial reindex where the caller passed
+        ``select=[...]``, documented models that aren't being re-rendered
+        are skipped rather than being misrouted to the synthetic source
+        file.
         """
-        if not schema_yml_per_model:
+        if not schema_yml_models and not schema_yml_sources:
             return
 
-        # Index compiled results by normalized file stem so schema.yml model
-        # keys (the raw model name) line up with the CTAS-wrapped node the
-        # parser stored.
+        # Index compiled results by normalized file stem so schema.yml
+        # model keys (the raw model name) line up with the CTAS-wrapped
+        # node the parser stored. Log a warning if two compiled files
+        # share a stem — schema.yml can only merge into one of them.
         stem_to_result: dict[str, tuple[str, ParseResult]] = {}
         for rel_path, pr in results.items():
             stem = Path(rel_path).stem
-            stem_to_result[parser._normalize_identifier(stem)] = (rel_path, pr)
-
-        source_col_defs: list[ColumnDefResult] = []
-
-        for raw_name, col_defs in schema_yml_per_model.items():
-            if not col_defs:
-                continue
-            normalized = parser._normalize_identifier(raw_name)
-
-            match = stem_to_result.get(normalized)
-            if match is not None:
-                _rel, pr = match
-                self._apply_schema_yml_to_parse_result(
-                    pr, node_name=normalized, col_defs=col_defs,
+            key = parser._normalize_identifier(stem)
+            if key in stem_to_result:
+                prior_path, _ = stem_to_result[key]
+                logger.warning(
+                    "Duplicate compiled model stem %s — schema.yml merge will"
+                    " only target %s, not %s",
+                    key, prior_path, rel_path,
                 )
                 continue
+            stem_to_result[key] = (rel_path, pr)
 
-            # Not a compiled model — treat as a source entry. The
-            # extract_schema_yml walker encodes sources as
-            # ``source_name.table_name``; use the table segment as the
-            # physical node name (the parser stored source references
-            # under the identifier, not the source family name).
-            table_name = raw_name.rsplit(".", 1)[-1]
-            node_name = parser._normalize_identifier(table_name)
-            for c in col_defs:
+        for model_name, col_defs in schema_yml_models.items():
+            if not col_defs:
+                continue
+            normalized = parser._normalize_identifier(model_name)
+            match = stem_to_result.get(normalized)
+            if match is None:
+                # No compiled match — on partial reindex this is expected
+                # for unselected models. Skip rather than mislabel as a
+                # source.
+                continue
+            _rel, pr = match
+            self._apply_schema_yml_to_parse_result(
+                pr, node_name=normalized, col_defs=col_defs,
+            )
+            self._renumber_columns_for_node(pr.columns, normalized)
+
+        source_col_defs: list[ColumnDefResult] = []
+        seen_source_targets: dict[str, tuple[str | None, str]] = {}
+        for src in schema_yml_sources:
+            if not src.columns:
+                continue
+            identifier = parser._normalize_identifier(src.identifier)
+            schema = (
+                parser._normalize_identifier(src.schema) if src.schema else None
+            )
+            # Qualify the node_name with the source's physical schema so
+            # two sources sharing a bare identifier across different
+            # schemas resolve to their own graph nodes (collisions are
+            # otherwise silent — UNIQUE upsert makes the last writer win).
+            node_name = f'"{schema}"."{identifier}"' if schema else identifier
+
+            prior = seen_source_targets.get(node_name)
+            if prior is not None:
+                logger.warning(
+                    "Duplicate schema.yml source target %s (families %s vs %s)"
+                    " — later columns will clobber earlier on the same node",
+                    node_name, prior[1], src.family,
+                )
+            seen_source_targets[node_name] = (schema, src.family)
+
+            for c in src.columns:
                 source_col_defs.append(
                     ColumnDefResult(
                         node_name=node_name,
@@ -732,9 +797,28 @@ class DbtRenderer:
                 )
 
         if source_col_defs:
+            # Renumber each target node's columns sequentially so entries
+            # merged from distinct source families don't share positions.
+            by_node: dict[str, list[ColumnDefResult]] = {}
+            for c in source_col_defs:
+                by_node.setdefault(c.node_name, []).append(c)
+            flattened: list[ColumnDefResult] = []
+            for target_name, rows in by_node.items():
+                rows.sort(key=lambda r: (r.position if r.position is not None else 0))
+                flattened.extend(
+                    ColumnDefResult(
+                        node_name=target_name,
+                        column_name=r.column_name,
+                        data_type=r.data_type,
+                        position=i,
+                        source=r.source,
+                        description=r.description,
+                    )
+                    for i, r in enumerate(rows)
+                )
             results[self._SCHEMA_YML_SOURCES_PATH] = ParseResult(
                 language="sql",
-                columns=source_col_defs,
+                columns=flattened,
             )
 
     @staticmethod
@@ -764,6 +848,41 @@ class DbtRenderer:
                     source="schema_yml",
                     description=c.description,
                 )
+            )
+
+    @staticmethod
+    def _renumber_columns_for_node(
+        columns: list[ColumnDefResult],
+        node_name: str,
+    ) -> None:
+        """Reassign ``position`` 0..N-1 on every row targeting ``node_name``.
+
+        Merging schema.yml rows (carrying their YAML ordinals) with surviving
+        CTAS-inferred rows (carrying SELECT ordinals) yields duplicate
+        positions on a single node. Renumbering stably preserves the current
+        relative order — inferred rows come first (the parser appends them
+        before the merge writes schema.yml rows) — so ``position`` stays
+        monotonic for consumers that order by it.
+        """
+        targets = [(i, c) for i, c in enumerate(columns) if c.node_name == node_name]
+        if not targets:
+            return
+        targets.sort(
+            key=lambda pair: (
+                pair[1].position if pair[1].position is not None else 0,
+                pair[0],
+            )
+        )
+        for new_pos, (orig_idx, c) in enumerate(targets):
+            if c.position == new_pos:
+                continue
+            columns[orig_idx] = ColumnDefResult(
+                node_name=c.node_name,
+                column_name=c.column_name,
+                data_type=c.data_type,
+                position=new_pos,
+                source=c.source,
+                description=c.description,
             )
 
     def _run_dbt_compile(
@@ -852,7 +971,9 @@ class DbtRenderer:
         Scans all ``*.yml`` and ``*.yaml`` files under the project's ``models/``
         directory for model and source entries with ``columns:`` lists. Returns
         a mapping of model name to ``ColumnDefResult`` entries with
-        ``source='schema_yml'``.
+        ``source='schema_yml'``. Sources are keyed as
+        ``"{source_family}.{table_name}"`` for backwards compat with the
+        pre-existing catalog flatten.
 
         Args:
             project_path: Path to dbt project dir (containing ``models/``).
@@ -860,16 +981,53 @@ class DbtRenderer:
         Returns:
             Dict mapping model name -> list of ``ColumnDefResult``.
         """
+        models, sources = self._extract_schema_yml_by_kind(project_path)
+        result: dict[str, list[ColumnDefResult]] = dict(models)
+        for src in sources:
+            key = (
+                f"{src.family}.{src.identifier}" if src.family else src.identifier
+            )
+            existing = result.get(key)
+            if existing is None:
+                result[key] = list(src.columns)
+            else:
+                existing.extend(src.columns)
+        return result
+
+    def _extract_schema_yml_by_kind(
+        self,
+        project_path: str | Path,
+    ) -> tuple[dict[str, list[ColumnDefResult]], list[_SchemaYmlSource]]:
+        """Parse schema.yml into separated models and sources.
+
+        Callers that need to distinguish models from sources (the critical
+        use case: the indexer merge can't guess from a flattened key whether
+        ``raw.users`` is a source table or a model named with a dot) should
+        consume this directly. ``extract_schema_yml`` remains the flat-form
+        public API for the SELECT * catalog builder and existing tests.
+
+        Source entries preserve the source's family, physical schema
+        (``sources[].schema`` defaulting to ``sources[].name``), optional
+        database, and the physical ``identifier`` (``tables[].identifier``
+        defaulting to ``tables[].name``). Both a schema and identifier
+        override at dbt's semantic layer must flow through to the graph —
+        two sources sharing a bare name across different schemas must
+        resolve to distinct nodes.
+        """
         import yaml
 
         project_path = Path(project_path).resolve()
         models_dir = project_path / "models"
+        models: dict[str, list[ColumnDefResult]] = {}
+        sources: list[_SchemaYmlSource] = []
         if not models_dir.exists():
-            return {}
+            return models, sources
 
-        result: dict[str, list[ColumnDefResult]] = {}
-
+        # Skip the rglob if no YAML files exist at all — avoids a full
+        # directory traversal on projects that aren't documented.
         yml_files = [f for f in models_dir.rglob("*") if f.suffix in (".yml", ".yaml")]
+        if not yml_files:
+            return models, sources
         for yml_file in yml_files:
             try:
                 data = yaml.safe_load(yml_file.read_text())
@@ -880,30 +1038,47 @@ class DbtRenderer:
             if not isinstance(data, dict):
                 continue
 
-            # Extract columns from models: entries
+            # Models — keyed by plain model name.
             for model in data.get("models") or []:
                 if not isinstance(model, dict):
                     continue
                 model_name = model.get("name")
                 if not model_name:
                     continue
-                self._extract_yml_columns(model_name, model.get("columns"), result)
+                self._extract_yml_columns(model_name, model.get("columns"), models)
 
-            # Extract columns from sources: entries
+            # Sources — keep family/schema/identifier separate.
             for source_entry in data.get("sources") or []:
                 if not isinstance(source_entry, dict):
                     continue
-                source_name = source_entry.get("name", "")
+                family = source_entry.get("name") or ""
+                source_schema = source_entry.get("schema") or family or None
+                source_database = source_entry.get("database") or None
                 for table_entry in source_entry.get("tables") or []:
                     if not isinstance(table_entry, dict):
                         continue
                     table_name = table_entry.get("name")
                     if not table_name:
                         continue
-                    full_name = f"{source_name}.{table_name}" if source_name else table_name
-                    self._extract_yml_columns(full_name, table_entry.get("columns"), result)
+                    identifier = table_entry.get("identifier") or table_name
+                    per_table: dict[str, list[ColumnDefResult]] = {}
+                    self._extract_yml_columns(
+                        identifier, table_entry.get("columns"), per_table,
+                    )
+                    col_defs = per_table.get(identifier, [])
+                    if not col_defs:
+                        continue
+                    sources.append(
+                        _SchemaYmlSource(
+                            family=family,
+                            identifier=identifier,
+                            schema=source_schema,
+                            database=source_database,
+                            columns=col_defs,
+                        )
+                    )
 
-        return result
+        return models, sources
 
     @staticmethod
     def _extract_yml_columns(
