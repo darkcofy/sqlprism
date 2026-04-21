@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.2] — 2026-04-21
+
+### Changed
+- CLI commands now share `_open_graph_for_write` / `_open_graph_for_read`
+  context-manager helpers, replacing the ad-hoc "load config + resolve
+  db_path + open graph" prologue across `reindex`, `reindex-file`,
+  `reindex-sqlmesh`, `reindex-dbt`, `status`, `conventions`, and the five
+  query subcommands (#137).
+- Split `tests/test_indexer.py`, `tests/test_conventions.py`, and
+  `tests/test_mcp_tools.py` into smaller per-feature files; shared MCP
+  reset fixture moved to `tests/conftest.py` (#136).
+- Expand ruff rules to include `B` (bugbear) and `RUF`; narrow
+  `pytest.raises(Exception)` to `ValidationError` in tests (#134).
+
+### Fixed
+- `graph.py` snippet reader now narrows the except to `OSError` and logs
+  at debug instead of silently swallowing; `dbt.py` replaces broad
+  `except (ImportError, OSError, Exception)` with `yaml.YAMLError` +
+  `OSError` and logs failures (#134).
+
+### Docs
+- Align `CLAUDE.md` on Python 3.11+; replace placeholder `<repo-url>`
+  with real clone URL; drop hardcoded tool count from README and guides;
+  add `CONTRIBUTING.md`, `CHANGELOG.md`, and `SECURITY.md` (#134).
+
 ## [1.2.1] — 2026-04-21
 
 ### Fixed
