@@ -25,11 +25,32 @@ import subprocess
 from pathlib import Path
 
 from sqlprism.languages.sql import SqlParser
-from sqlprism.languages.sqlmesh import _validate_command
+from sqlprism.languages.sqlmesh import _merge_column_schemas, _validate_command
 from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
 from sqlprism.types import ColumnDefResult, EdgeResult, ParseResult
 
 logger = logging.getLogger(__name__)
+
+
+def _manifest_columns_dict(columns: dict | None) -> dict[str, str]:
+    """Flatten a manifest node's ``columns`` field to ``{col: type}``.
+
+    dbt manifests store columns as ``{col_name: {data_type, description, ...}}``.
+    Columns without a ``data_type`` still flow through as ``"TEXT"`` so they
+    are visible to ``SELECT *`` expansion even when the user hasn't documented
+    types.
+    """
+    if not isinstance(columns, dict):
+        return {}
+    out: dict[str, str] = {}
+    for col_name, meta in columns.items():
+        if not col_name:
+            continue
+        data_type = None
+        if isinstance(meta, dict):
+            data_type = meta.get("data_type")
+        out[col_name] = data_type or "TEXT"
+    return out
 
 
 class DbtRenderer:
@@ -178,6 +199,14 @@ class DbtRenderer:
         if not compiled_dir.exists():
             return {}
 
+        # Build an effective schema catalog that layers dbt-sourced columns
+        # (manifest + schema.yml) over the graph-derived catalog. Needed so
+        # SELECT * through CTEs can expand on a fresh index — before any
+        # columns have been inserted into the graph.
+        effective_schema = self._build_effective_schema(
+            project_path, parser, schema_catalog
+        )
+
         # Only read files for selected models when filtering
         selected = set(select) if select else None
         results: dict[str, ParseResult] = {}
@@ -208,7 +237,7 @@ class DbtRenderer:
             else:
                 wrapped_sql = f'CREATE TABLE "{safe_name}" AS\n{content}'
 
-            result = parser.parse(rel_path, wrapped_sql, schema=schema_catalog)
+            result = parser.parse(rel_path, wrapped_sql, schema=effective_schema)
             enrich_nodes(result, "dbt_model", rel_path)
 
             results[rel_path] = result
@@ -424,6 +453,91 @@ class DbtRenderer:
                 edges_by_path[rel_path] = edges
 
         return edges_by_path
+
+    def _build_effective_schema(
+        self,
+        project_path: Path,
+        parser: SqlParser,
+        schema_catalog: dict | None,
+    ) -> dict[str, dict[str, str]]:
+        """Merge dbt-sourced column schemas on top of the graph schema catalog.
+
+        Reads fresh column metadata from ``manifest.json`` (authoritative, with
+        types when dbt has compiled types) and ``schema.yml`` (fallback). Both
+        are layered onto ``schema_catalog`` so the catalog includes upstream
+        columns for freshly-rendered models even when they've never been
+        indexed before.
+        """
+        overlays: dict[str, dict[str, str]] = {}
+        for name, cols in self._schema_yml_columns(project_path, parser).items():
+            overlays.setdefault(name, {}).update(cols)
+        # Manifest comes second so its typed columns win over schema.yml gaps.
+        for name, cols in self._extract_manifest_columns(project_path, parser).items():
+            overlays.setdefault(name, {}).update(cols)
+        if not overlays and not schema_catalog:
+            return {}
+        return _merge_column_schemas(schema_catalog, overlays)
+
+    def _extract_manifest_columns(
+        self,
+        project_path: Path,
+        parser: SqlParser,
+    ) -> dict[str, dict[str, str]]:
+        """Read per-model column schemas from ``manifest.json``.
+
+        Each manifest node carries a ``columns`` dict (populated from
+        ``schema.yml`` at compile time) keyed by column name. Returns a flat
+        ``{normalized_model_name: {col: type}}`` mapping with dialect-aware
+        identifier normalization so schema lookups match the parser's keys.
+        """
+        manifest_path = self._resolve_target_dir(project_path) / "manifest.json"
+        if not manifest_path.exists():
+            return {}
+
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        out: dict[str, dict[str, str]] = {}
+        # Models + seeds + snapshots — anything downstream refs via ref().
+        for node in (manifest.get("nodes") or {}).values():
+            if node.get("resource_type") not in ("model", "seed", "snapshot"):
+                continue
+            name = node.get("name")
+            if not name:
+                continue
+            cols = _manifest_columns_dict(node.get("columns"))
+            if cols:
+                out[parser._normalize_identifier(name)] = cols
+        # Sources — referenced by physical identifier, not ref() name.
+        for src in (manifest.get("sources") or {}).values():
+            identifier = src.get("identifier") or src.get("name")
+            if not identifier:
+                continue
+            cols = _manifest_columns_dict(src.get("columns"))
+            if cols:
+                out[parser._normalize_identifier(identifier)] = cols
+        return out
+
+    def _schema_yml_columns(
+        self,
+        project_path: Path,
+        parser: SqlParser,
+    ) -> dict[str, dict[str, str]]:
+        """Column schemas from ``schema.yml`` files as a flat catalog.
+
+        Reuses the existing ``extract_schema_yml`` walker and flattens each
+        ``ColumnDefResult`` into ``{normalized_name: {col: type_or_TEXT}}``.
+        """
+        per_model = self.extract_schema_yml(project_path)
+        out: dict[str, dict[str, str]] = {}
+        for name, col_defs in per_model.items():
+            key = parser._normalize_identifier(name)
+            out.setdefault(key, {})
+            for c in col_defs:
+                out[key][c.column_name] = c.data_type or "TEXT"
+        return out
 
     def _run_dbt_compile(
         self,

@@ -1445,6 +1445,21 @@ class GraphDB:
 
         return schema
 
+    def get_cross_repo_columns(self, current_repo_id: int) -> dict[str, dict[str, str]]:
+        """Build a schema catalog that spans all repos, with current repo winning.
+
+        Upstream mesh refs (e.g. dbt cross-project ``ref()`` or sqlmesh
+        multi-project indexing) need column schemas from sibling repos so
+        ``SELECT *`` through CTEs can expand. Merge the current repo's columns
+        on top of every other repo's columns so local definitions always take
+        precedence over cross-repo siblings.
+        """
+        other_repos = self.get_table_columns(None)
+        current = self.get_table_columns(current_repo_id)
+        for table, cols in current.items():
+            other_repos[table] = {**other_repos.get(table, {}), **cols}
+        return other_repos
+
     def query_schema(
         self,
         name: str,

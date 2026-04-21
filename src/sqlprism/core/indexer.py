@@ -139,8 +139,10 @@ class Indexer:
                 for rel_path in deleted:
                     self.graph.delete_file_data(repo_id, rel_path)
 
-        # Build schema catalog from existing index for SELECT * expansion
-        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        # Build schema catalog from existing index for SELECT * expansion.
+        # Cross-repo so mesh lineage (finance→platform) can expand starred
+        # CTEs against columns indexed under a sibling repo.
+        schema_catalog = self.graph.get_cross_repo_columns(repo_id) or None
 
         # Changed + added files: delete old + insert new in same transaction
         # so a crash never leaves a file in a "deleted but not yet reinserted" state
@@ -237,8 +239,10 @@ class Indexer:
         project_path = Path(project_path).resolve()
         repo_id = self.graph.upsert_repo(repo_name, str(project_path), repo_type="sqlmesh")
 
-        # Build schema catalog from existing index for SELECT * expansion
-        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        # Build schema catalog from existing index for SELECT * expansion.
+        # Cross-repo so mesh lineage (finance→platform) can expand starred
+        # CTEs against columns indexed under a sibling repo.
+        schema_catalog = self.graph.get_cross_repo_columns(repo_id) or None
 
         # Check if source files changed — skip rendering subprocess if not
         current_fingerprint = _source_fingerprint(project_path)
@@ -367,8 +371,10 @@ class Indexer:
         project_path = Path(project_path).resolve()
         repo_id = self.graph.upsert_repo(repo_name, str(project_path), repo_type="dbt")
 
-        # Build schema catalog from existing index for SELECT * expansion
-        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        # Build schema catalog from existing index for SELECT * expansion.
+        # Cross-repo so mesh lineage (finance→platform) can expand starred
+        # CTEs against columns indexed under a sibling repo.
+        schema_catalog = self.graph.get_cross_repo_columns(repo_id) or None
 
         rendered = self.dbt_renderer.render_project(
             project_path=project_path,
@@ -541,7 +547,7 @@ class Indexer:
         if repo_config:
             _, dialect, dialect_overrides = parse_repo_config(repo_config)
 
-        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        schema_catalog = self.graph.get_cross_repo_columns(repo_id) or None
         did_reindex = False
 
         for file_path in files:
@@ -639,7 +645,7 @@ class Indexer:
         model_names = [f.stem for f in remaining]
 
         # Call render_models with config params
-        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        schema_catalog = self.graph.get_cross_repo_columns(repo_id) or None
         try:
             rendered = self.dbt_renderer.render_models(
                 project_path=repo_config.get("project_path", str(repo_path)),
@@ -699,7 +705,7 @@ class Indexer:
         model_names = self._resolve_model_names_by_stem(repo_id, remaining)
 
         dialect = repo_config.get("dialect", "athena")
-        schema_catalog = self.graph.get_table_columns(repo_id) or None
+        schema_catalog = self.graph.get_cross_repo_columns(repo_id) or None
         variables = _coerce_variables(repo_config.get("variables"))
 
         try:
