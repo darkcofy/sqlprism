@@ -1700,13 +1700,19 @@ class GraphDB:
         node_ids = [r[0] for r in node_rows]
         placeholders = ", ".join("?" for _ in node_ids)
 
-        # Fetch downstream models via edges, excluding the model itself
+        # Fetch downstream models via edges, excluding the model itself.
+        # The explicit defines-edge filter makes the exclusion robust to
+        # callers that resolve node_rows by kind (e.g. only 'table'): the
+        # file-stem query node is no longer in node_ids, so the existing
+        # NOT IN clause would otherwise let the defines edge surface as a
+        # phantom downstream consumer (#127).
         ds_rows = self._execute_read(
             "SELECT DISTINCT n2.name, n2.kind "
             "FROM edges e "
             "JOIN nodes n2 ON e.source_id = n2.node_id "
             f"WHERE e.target_id IN ({placeholders}) "
-            f"AND e.source_id NOT IN ({placeholders})",
+            f"AND e.source_id NOT IN ({placeholders}) "
+            "AND e.relationship <> 'defines'",
             node_ids + node_ids,
         ).fetchall()
         all_downstream = [{"name": r[0], "kind": r[1]} for r in ds_rows]
@@ -1873,6 +1879,11 @@ class GraphDB:
         # Step 1: Find shortest path length via PGQ ANY SHORTEST
         # DuckPGQ does not support bind parameters inside GRAPH_TABLE,
         # so we interpolate integer node_ids (safe, no escaping needed).
+        # PGQ's quantified edge binding does not accept a per-edge WHERE
+        # predicate, so the defines filter is applied in the BFS recovery
+        # step below — if PGQ returns a defines-dependent length the BFS
+        # will fail to reconstruct a path and the result collapses to
+        # path_found=false (#127).
         try:
             rows = self._execute_read(
                 f"FROM GRAPH_TABLE (sqlprism_graph "
@@ -1899,6 +1910,8 @@ class GraphDB:
 
         # Step 2: Recover intermediate nodes via BFS CTE
         # No file_id filter — BFS must traverse the same topology as PGQ
+        # (including the identical defines exclusion, so the two stages
+        # cannot disagree about reachability).
         path_cte = f"""
         WITH RECURSIVE path_bfs AS (
             SELECT n.node_id, n.name, 0 as depth,
@@ -1913,6 +1926,7 @@ class GraphDB:
             JOIN path_bfs pb ON e.source_id = pb.node_id
             WHERE pb.depth < {path_length}
             AND NOT array_contains(pb.path_names, n2.name)
+            AND e.relationship <> 'defines'
         )
         SELECT path_names FROM path_bfs
         WHERE node_id = ? AND depth = {path_length}
@@ -2298,16 +2312,22 @@ class GraphDB:
         #        → COUNT = downstream dependents
         # upstream CTE: edges where n depends on other nodes (n is the source)
         #               → COUNT = upstream dependencies
+        # defines edges are filtered from both counts because they encode
+        # CREATE-statement identity (file-stem query -> declared table),
+        # not dataflow — otherwise every indexed model's fan-in is +1 too
+        # high via its own file-stem query node (#127).
         fan_sql = (
             "WITH upstream_counts AS ("
             "SELECT source_id, COUNT(DISTINCT target_id) AS upstream "
-            "FROM edges GROUP BY source_id"
+            "FROM edges WHERE relationship <> 'defines' "
+            "GROUP BY source_id"
             ") "
             "SELECT n.node_id, n.name, n.kind, "
             "COUNT(DISTINCT e_dep.source_id) AS downstream, "
             "COALESCE(uc.upstream, 0) AS upstream "
             "FROM nodes n "
             "LEFT JOIN edges e_dep ON e_dep.target_id = n.node_id "
+            "AND e_dep.relationship <> 'defines' "
             "LEFT JOIN upstream_counts uc ON uc.source_id = n.node_id "
             f"{repo_join}"
             f"WHERE n.file_id IS NOT NULL {repo_where}"
