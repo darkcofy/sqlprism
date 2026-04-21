@@ -7,13 +7,19 @@ initialises the server, and runs it.
 import json
 import logging
 import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 import yaml
 
 from sqlprism.core.mcp_tools import configure, mcp
 from sqlprism.types import parse_repo_config
+
+if TYPE_CHECKING:
+    from sqlprism.core.graph import GraphDB
 
 DEFAULT_DB_PATH = Path.home() / ".sqlprism" / "graph.duckdb"
 LEGACY_CONFIG_PATH = Path.home() / ".sqlprism" / "config.json"
@@ -101,105 +107,97 @@ def serve(config_path: str, db_path: str | None, transport: str, port: int):
 @click.option("--repo", "repo_name", type=str, default=None, help="Reindex a specific repo only")
 def reindex(config_path: str, db_path: str | None, repo_name: str | None):
     """Run a manual reindex from the command line."""
-    from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
-
-    config = _cli_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-
-    Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
-
-    graph = GraphDB(effective_db_path)
-    indexer = Indexer(graph)
-
-    # Index SQL repos
-    repos = config.get("repos", {})
-    if repo_name:
-        if repo_name not in repos:
-            click.echo(f"Error: repo '{repo_name}' not in config", err=True)
-            sys.exit(1)
-        repos = {repo_name: repos[repo_name]}
 
     all_parse_errors: list[str] = []
 
-    for name, cfg in repos.items():
-        path, dialect, dialect_overrides = parse_repo_config(cfg, config.get("sql_dialect"))
-        click.echo(f"Indexing {name} ({path}){f' [{dialect}]' if dialect else ''}...")
-        stats = indexer.reindex_repo(
-            name,
-            path,
-            dialect=dialect,
-            dialect_overrides=dialect_overrides,
-        )
-        click.echo(
-            f"  scanned={stats['files_scanned']}, "
-            f"added={stats['files_added']}, "
-            f"changed={stats['files_changed']}, "
-            f"removed={stats['files_removed']}, "
-            f"nodes={stats['nodes_added']}, "
-            f"edges={stats['edges_added']}, "
-            f"column_usage={stats['column_usage_added']}"
-        )
-        if stats.get("parse_errors"):
-            all_parse_errors.extend(stats["parse_errors"])
+    with _open_graph_for_write(config_path, db_path) as (graph, config, _):
+        indexer = Indexer(graph)
 
-    # Also index sqlmesh repos from config
-    sqlmesh_repos = config.get("sqlmesh_repos", {})
-    if repo_name:
-        if repo_name in sqlmesh_repos:
-            sqlmesh_repos = {repo_name: sqlmesh_repos[repo_name]}
-        else:
-            sqlmesh_repos = {}
+        # Index SQL repos
+        repos = config.get("repos", {})
+        if repo_name:
+            if repo_name not in repos:
+                click.echo(f"Error: repo '{repo_name}' not in config", err=True)
+                sys.exit(1)
+            repos = {repo_name: repos[repo_name]}
 
-    for name, sm_config in sqlmesh_repos.items():
-        if name.startswith("#"):
-            continue
-        click.echo(f"Indexing sqlmesh project {name} ({sm_config['project_path']})...")
-        variables: dict[str, str | int] = sm_config.get("variables", {})
-        stats = indexer.reindex_sqlmesh(
-            repo_name=name,
-            project_path=sm_config["project_path"],
-            env_file=sm_config.get("env_file"),
-            variables=variables,
-            dialect=sm_config.get("dialect", "athena"),
-            sqlmesh_command=sm_config.get("sqlmesh_command", "uv run python"),
-        )
-        click.echo(
-            f"  models={stats['models_rendered']}, "
-            f"nodes={stats['nodes_added']}, "
-            f"edges={stats['edges_added']}, "
-            f"column_usage={stats['column_usage_added']}"
-        )
+        for name, cfg in repos.items():
+            path, dialect, dialect_overrides = parse_repo_config(cfg, config.get("sql_dialect"))
+            click.echo(f"Indexing {name} ({path}){f' [{dialect}]' if dialect else ''}...")
+            stats = indexer.reindex_repo(
+                name,
+                path,
+                dialect=dialect,
+                dialect_overrides=dialect_overrides,
+            )
+            click.echo(
+                f"  scanned={stats['files_scanned']}, "
+                f"added={stats['files_added']}, "
+                f"changed={stats['files_changed']}, "
+                f"removed={stats['files_removed']}, "
+                f"nodes={stats['nodes_added']}, "
+                f"edges={stats['edges_added']}, "
+                f"column_usage={stats['column_usage_added']}"
+            )
+            if stats.get("parse_errors"):
+                all_parse_errors.extend(stats["parse_errors"])
 
-    # Also index dbt repos from config
-    dbt_repos = config.get("dbt_repos", {})
-    if repo_name:
-        if repo_name in dbt_repos:
-            dbt_repos = {repo_name: dbt_repos[repo_name]}
-        else:
-            dbt_repos = {}
+        # Also index sqlmesh repos from config
+        sqlmesh_repos = config.get("sqlmesh_repos", {})
+        if repo_name:
+            if repo_name in sqlmesh_repos:
+                sqlmesh_repos = {repo_name: sqlmesh_repos[repo_name]}
+            else:
+                sqlmesh_repos = {}
 
-    for name, dbt_config in dbt_repos.items():
-        if name.startswith("#"):
-            continue
-        click.echo(f"Indexing dbt project {name} ({dbt_config['project_path']})...")
-        stats = indexer.reindex_dbt(
-            repo_name=name,
-            project_path=dbt_config["project_path"],
-            profiles_dir=dbt_config.get("profiles_dir"),
-            env_file=dbt_config.get("env_file"),
-            target=dbt_config.get("target"),
-            dbt_command=dbt_config.get("dbt_command", "uv run dbt"),
-            dialect=dbt_config.get("dialect"),
-        )
-        click.echo(
-            f"  models={stats['models_compiled']}, "
-            f"nodes={stats['nodes_added']}, "
-            f"edges={stats['edges_added']}, "
-            f"column_usage={stats['column_usage_added']}"
-        )
+        for name, sm_config in sqlmesh_repos.items():
+            if name.startswith("#"):
+                continue
+            click.echo(f"Indexing sqlmesh project {name} ({sm_config['project_path']})...")
+            variables: dict[str, str | int] = sm_config.get("variables", {})
+            stats = indexer.reindex_sqlmesh(
+                repo_name=name,
+                project_path=sm_config["project_path"],
+                env_file=sm_config.get("env_file"),
+                variables=variables,
+                dialect=sm_config.get("dialect", "athena"),
+                sqlmesh_command=sm_config.get("sqlmesh_command", "uv run python"),
+            )
+            click.echo(
+                f"  models={stats['models_rendered']}, "
+                f"nodes={stats['nodes_added']}, "
+                f"edges={stats['edges_added']}, "
+                f"column_usage={stats['column_usage_added']}"
+            )
 
-    graph.close()
+        # Also index dbt repos from config
+        dbt_repos = config.get("dbt_repos", {})
+        if repo_name:
+            if repo_name in dbt_repos:
+                dbt_repos = {repo_name: dbt_repos[repo_name]}
+            else:
+                dbt_repos = {}
+
+        for name, dbt_config in dbt_repos.items():
+            if name.startswith("#"):
+                continue
+            click.echo(f"Indexing dbt project {name} ({dbt_config['project_path']})...")
+            stats = indexer.reindex_dbt(
+                repo_name=name,
+                project_path=dbt_config["project_path"],
+                profiles_dir=dbt_config.get("profiles_dir"),
+                env_file=dbt_config.get("env_file"),
+                target=dbt_config.get("target"),
+                dbt_command=dbt_config.get("dbt_command", "uv run dbt"),
+                dialect=dbt_config.get("dialect"),
+            )
+            click.echo(
+                f"  models={stats['models_compiled']}, "
+                f"nodes={stats['nodes_added']}, "
+                f"edges={stats['edges_added']}, "
+                f"column_usage={stats['column_usage_added']}"
+            )
 
     if all_parse_errors:
         click.echo(f"\n{len(all_parse_errors)} parse error(s):", err=True)
@@ -224,17 +222,10 @@ def reindex_file(paths, config_path, db_path):
     For editors without MCP integration:
       vim: autocmd BufWritePost *.sql silent !sqlprism reindex-file %:p
     """
-    from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = _cli_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-
-    Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
-
-    repo_configs = _build_repo_configs(config)
-
-    with GraphDB(effective_db_path) as graph:
+    with _open_graph_for_write(config_path, db_path) as (graph, config, _):
+        repo_configs = _build_repo_configs(config)
         indexer = Indexer(graph)
 
         # Register repos so reindex_files can resolve paths
@@ -299,15 +290,7 @@ def reindex_sqlmesh(
     sqlmesh_command: str,
 ):
     """Index a sqlmesh project by rendering all models."""
-    from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
-
-    config = _cli_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-    Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
-
-    graph = GraphDB(effective_db_path)
-    indexer = Indexer(graph)
 
     # Convert --var pairs to dict, auto-cast numeric values
     var_dict: dict[str, str | int] = {}
@@ -317,29 +300,30 @@ def reindex_sqlmesh(
         except ValueError:
             var_dict[k] = v
 
-    click.echo(f"Rendering sqlmesh models from {project_path}...")
-    stats = indexer.reindex_sqlmesh(
-        repo_name=repo_name,
-        project_path=project_path,
-        env_file=env_file,
-        variables=var_dict,
-        dialect=dialect,
-        sqlmesh_command=sqlmesh_command,
-    )
-    skipped = stats.get('models_skipped', 0)
-    removed = stats.get('models_removed', 0)
-    cached = stats.get('render_cached', False)
-    skip_info = f", skipped={skipped}" if skipped else ""
-    remove_info = f", removed={removed}" if removed else ""
-    cache_info = " (render cached)" if cached else ""
-    click.echo(
-        f"  models={stats['models_rendered']}{skip_info}{remove_info}{cache_info}, "
-        f"nodes={stats['nodes_added']}, "
-        f"edges={stats['edges_added']}, "
-        f"column_usage={stats['column_usage_added']}"
-    )
+    with _open_graph_for_write(config_path, db_path) as (graph, _, _):
+        indexer = Indexer(graph)
+        click.echo(f"Rendering sqlmesh models from {project_path}...")
+        stats = indexer.reindex_sqlmesh(
+            repo_name=repo_name,
+            project_path=project_path,
+            env_file=env_file,
+            variables=var_dict,
+            dialect=dialect,
+            sqlmesh_command=sqlmesh_command,
+        )
+        skipped = stats.get('models_skipped', 0)
+        removed = stats.get('models_removed', 0)
+        cached = stats.get('render_cached', False)
+        skip_info = f", skipped={skipped}" if skipped else ""
+        remove_info = f", removed={removed}" if removed else ""
+        cache_info = " (render cached)" if cached else ""
+        click.echo(
+            f"  models={stats['models_rendered']}{skip_info}{remove_info}{cache_info}, "
+            f"nodes={stats['nodes_added']}, "
+            f"edges={stats['edges_added']}, "
+            f"column_usage={stats['column_usage_added']}"
+        )
 
-    graph.close()
     click.echo("Done.")
 
 
@@ -391,34 +375,27 @@ def reindex_dbt_cmd(
     dialect: str | None,
 ):
     """Index a dbt project by compiling all models."""
-    from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    config = _cli_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-    Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
+    with _open_graph_for_write(config_path, db_path) as (graph, _, _):
+        indexer = Indexer(graph)
+        click.echo(f"Compiling dbt models from {project_path}...")
+        stats = indexer.reindex_dbt(
+            repo_name=repo_name,
+            project_path=project_path,
+            profiles_dir=profiles_dir,
+            env_file=env_file,
+            target=target,
+            dbt_command=dbt_command,
+            dialect=dialect,
+        )
+        click.echo(
+            f"  models={stats['models_compiled']}, "
+            f"nodes={stats['nodes_added']}, "
+            f"edges={stats['edges_added']}, "
+            f"column_usage={stats['column_usage_added']}"
+        )
 
-    graph = GraphDB(effective_db_path)
-    indexer = Indexer(graph)
-
-    click.echo(f"Compiling dbt models from {project_path}...")
-    stats = indexer.reindex_dbt(
-        repo_name=repo_name,
-        project_path=project_path,
-        profiles_dir=profiles_dir,
-        env_file=env_file,
-        target=target,
-        dbt_command=dbt_command,
-        dialect=dialect,
-    )
-    click.echo(
-        f"  models={stats['models_compiled']}, "
-        f"nodes={stats['nodes_added']}, "
-        f"edges={stats['edges_added']}, "
-        f"column_usage={stats['column_usage_added']}"
-    )
-
-    graph.close()
     click.echo("Done.")
 
 
@@ -426,20 +403,6 @@ def reindex_dbt_cmd(
 def query():
     """Query the knowledge graph."""
     pass
-
-
-def _open_graph(config_path: str, db_path: str | None):
-    """Load config, resolve db_path, and return a GraphDB instance."""
-    from sqlprism.core.graph import GraphDB
-
-    config = _cli_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-
-    if not Path(effective_db_path).exists():
-        click.echo("No index found. Run 'sqlprism reindex' first.", err=True)
-        sys.exit(1)
-
-    return GraphDB(effective_db_path)
 
 
 @query.command("search")
@@ -460,16 +423,15 @@ def query_search(
     limit: int,
 ):
     """Search nodes by name pattern."""
-    graph = _open_graph(config_path, db_path)
-    result = graph.query_search(
-        pattern=pattern,
-        kind=kind,
-        schema=schema,
-        repo=repo,
-        limit=limit,
-        include_snippets=False,
-    )
-    graph.close()
+    with _open_graph_for_read(config_path, db_path) as (graph, _, _):
+        result = graph.query_search(
+            pattern=pattern,
+            kind=kind,
+            schema=schema,
+            repo=repo,
+            limit=limit,
+            include_snippets=False,
+        )
     click.echo(json.dumps(result, indent=2, default=str))
 
 
@@ -496,16 +458,15 @@ def query_references(
     direction: str,
 ):
     """Find all references to/from a named entity."""
-    graph = _open_graph(config_path, db_path)
-    result = graph.query_references(
-        name=name,
-        kind=kind,
-        schema=schema,
-        repo=repo,
-        direction=direction,
-        include_snippets=False,
-    )
-    graph.close()
+    with _open_graph_for_read(config_path, db_path) as (graph, _, _):
+        result = graph.query_references(
+            name=name,
+            kind=kind,
+            schema=schema,
+            repo=repo,
+            direction=direction,
+            include_snippets=False,
+        )
     click.echo(json.dumps(result, indent=2, default=str))
 
 
@@ -525,14 +486,13 @@ def query_column_usage(
     repo: str | None,
 ):
     """Find column usage for a table."""
-    graph = _open_graph(config_path, db_path)
-    result = graph.query_column_usage(
-        table=table,
-        column=column,
-        usage_type=usage_type,
-        repo=repo,
-    )
-    graph.close()
+    with _open_graph_for_read(config_path, db_path) as (graph, _, _):
+        result = graph.query_column_usage(
+            table=table,
+            column=column,
+            usage_type=usage_type,
+            repo=repo,
+        )
     click.echo(json.dumps(result, indent=2, default=str))
 
 
@@ -559,16 +519,15 @@ def query_trace(
     repo: str | None,
 ):
     """Trace multi-hop dependency chains from a named entity."""
-    graph = _open_graph(config_path, db_path)
-    result = graph.query_trace(
-        name=name,
-        kind=kind,
-        direction=direction,
-        max_depth=max_depth,
-        repo=repo,
-        include_snippets=False,
-    )
-    graph.close()
+    with _open_graph_for_read(config_path, db_path) as (graph, _, _):
+        result = graph.query_trace(
+            name=name,
+            kind=kind,
+            direction=direction,
+            max_depth=max_depth,
+            repo=repo,
+            include_snippets=False,
+        )
     click.echo(json.dumps(result, indent=2, default=str))
 
 
@@ -588,14 +547,13 @@ def query_lineage(
     repo: str | None,
 ):
     """Query column lineage chains."""
-    graph = _open_graph(config_path, db_path)
-    result = graph.query_column_lineage(
-        table=table,
-        column=column,
-        output_node=output_node,
-        repo=repo,
-    )
-    graph.close()
+    with _open_graph_for_read(config_path, db_path) as (graph, _, _):
+        result = graph.query_column_lineage(
+            table=table,
+            column=column,
+            output_node=output_node,
+            repo=repo,
+        )
     click.echo(json.dumps(result, indent=2, default=str))
 
 
@@ -604,19 +562,8 @@ def query_lineage(
 @click.option("--db", "db_path", type=click.Path(), default=None)
 def status(config_path: str, db_path: str | None):
     """Show current index status."""
-    from sqlprism.core.graph import GraphDB
-
-    config = _cli_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-
-    if not Path(effective_db_path).exists():
-        click.echo("No index found. Run 'sqlprism reindex' first.")
-        sys.exit(1)
-
-    graph = GraphDB(effective_db_path)
-    info = graph.get_index_status()
-    graph.close()
-
+    with _open_graph_for_read(config_path, db_path, missing_on_stderr=False) as (graph, _, _):
+        info = graph.get_index_status()
     click.echo(json.dumps(info, indent=2, default=str))
 
 
@@ -637,14 +584,6 @@ def conventions_init(config_path: str, db_path: str | None, force: bool):
     Review and adjust the file, then re-run reindex to apply overrides.
     """
     from sqlprism.core.conventions import ConventionEngine
-    from sqlprism.core.graph import GraphDB
-
-    config = _try_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-
-    if not Path(effective_db_path).exists():
-        click.echo("No index found. Run 'sqlprism reindex' first.")
-        sys.exit(1)
 
     output_path = Path("sqlprism.conventions.yml")
     if output_path.exists() and not force:
@@ -653,8 +592,12 @@ def conventions_init(config_path: str, db_path: str | None, force: bool):
         )
         sys.exit(1)
 
-    graph = GraphDB(effective_db_path)
-    try:
+    with _open_graph_for_read(
+        config_path,
+        db_path,
+        config_loader=_try_load_config,
+        missing_on_stderr=False,
+    ) as (graph, _, _):
         # Find all repos and run inference for each
         repos = graph._execute_read("SELECT repo_id FROM repos").fetchall()
         if not repos:
@@ -674,8 +617,6 @@ def conventions_init(config_path: str, db_path: str | None, force: bool):
         yaml_content = engine.generate_yaml()
         output_path.write_text(yaml_content)
         click.echo(f"Wrote {output_path}")
-    finally:
-        graph.close()
 
 
 @conventions.command("refresh")
@@ -688,17 +629,13 @@ def conventions_refresh(config_path: str, db_path: str | None):
     Useful after reindex to see how conventions changed.
     """
     from sqlprism.core.conventions import ConventionEngine
-    from sqlprism.core.graph import GraphDB
 
-    config = _try_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-
-    if not Path(effective_db_path).exists():
-        click.echo("No index found. Run 'sqlprism reindex' first.")
-        sys.exit(1)
-
-    graph = GraphDB(effective_db_path)
-    try:
+    with _open_graph_for_read(
+        config_path,
+        db_path,
+        config_loader=_try_load_config,
+        missing_on_stderr=False,
+    ) as (graph, _, _):
         repos = graph._execute_read("SELECT repo_id FROM repos").fetchall()
         if not repos:
             click.echo("No repos indexed.")
@@ -711,8 +648,6 @@ def conventions_refresh(config_path: str, db_path: str | None):
                 f"Repo {repo_id}: {result['layers_detected']} layers, "
                 f"{result['conventions_stored']} conventions stored"
             )
-    finally:
-        graph.close()
 
     click.echo("Done.")
 
@@ -733,17 +668,13 @@ def conventions_diff(config_path: str, db_path: str | None, yaml_file: str):
     Compares current conventions in the database against the YAML file.
     """
     from sqlprism.core.conventions import ConventionEngine
-    from sqlprism.core.graph import GraphDB
 
-    config = _try_load_config(config_path)
-    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
-
-    if not Path(effective_db_path).exists():
-        click.echo("No index found. Run 'sqlprism reindex' first.")
-        sys.exit(1)
-
-    graph = GraphDB(effective_db_path)
-    try:
+    with _open_graph_for_read(
+        config_path,
+        db_path,
+        config_loader=_try_load_config,
+        missing_on_stderr=False,
+    ) as (graph, _, _):
         repos = graph._execute_read("SELECT repo_id FROM repos").fetchall()
         if not repos:
             click.echo("No repos indexed.")
@@ -758,8 +689,6 @@ def conventions_diff(config_path: str, db_path: str | None, yaml_file: str):
         engine = ConventionEngine(graph, repo_id)
         diff_output = engine.get_diff(yaml_file)
         click.echo(diff_output)
-    finally:
-        graph.close()
 
 
 @cli.command("init")
@@ -871,6 +800,53 @@ def _cli_load_config(path: str | None) -> dict:
         return load_config(path)
     except FileNotFoundError as e:
         raise click.ClickException(str(e)) from e
+
+
+@contextmanager
+def _open_graph_for_write(
+    config_path: str | None,
+    db_path: str | None,
+) -> Iterator[tuple["GraphDB", dict, str]]:
+    """Load config, ensure DB parent dir exists, open GraphDB for a write command.
+
+    Yields ``(graph, config, effective_db_path)`` and closes the graph on exit.
+    """
+    from sqlprism.core.graph import GraphDB
+
+    config = _cli_load_config(config_path)
+    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
+    Path(effective_db_path).parent.mkdir(parents=True, exist_ok=True)
+    with GraphDB(effective_db_path) as graph:
+        yield graph, config, effective_db_path
+
+
+@contextmanager
+def _open_graph_for_read(
+    config_path: str | None,
+    db_path: str | None,
+    *,
+    config_loader: Callable[[str | None], dict] | None = None,
+    missing_on_stderr: bool = True,
+) -> Iterator[tuple["GraphDB", dict, str]]:
+    """Load config, verify DB exists, open GraphDB for a read-only command.
+
+    Yields ``(graph, config, effective_db_path)`` and closes the graph on exit.
+    Exits with code 1 when the DB does not exist. ``missing_on_stderr=False``
+    preserves legacy commands that wrote the message to stdout.
+    """
+    from sqlprism.core.graph import GraphDB
+
+    loader = config_loader or _cli_load_config
+    config = loader(config_path)
+    effective_db_path = db_path or config.get("db_path", str(DEFAULT_DB_PATH))
+    if not Path(effective_db_path).exists():
+        click.echo(
+            "No index found. Run 'sqlprism reindex' first.",
+            err=missing_on_stderr,
+        )
+        sys.exit(1)
+    with GraphDB(effective_db_path) as graph:
+        yield graph, config, effective_db_path
 
 
 def load_config(path: str | None = None) -> dict:
