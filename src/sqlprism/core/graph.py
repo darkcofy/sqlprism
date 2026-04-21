@@ -1700,13 +1700,20 @@ class GraphDB:
         node_ids = [r[0] for r in node_rows]
         placeholders = ", ".join("?" for _ in node_ids)
 
-        # Fetch downstream models via edges, excluding the model itself
+        # Fetch downstream models via edges, excluding the model itself.
+        # The explicit non-dataflow filter makes the exclusion robust to
+        # callers that resolve node_rows by kind (e.g. only 'table'): the
+        # file-stem query node is no longer in node_ids, so the existing
+        # NOT IN clause would otherwise let defines/inserts_into self-loop
+        # edges surface as phantom downstream consumers (#127).
         ds_rows = self._execute_read(
             "SELECT DISTINCT n2.name, n2.kind "
             "FROM edges e "
             "JOIN nodes n2 ON e.source_id = n2.node_id "
+            "JOIN nodes nt ON nt.node_id = e.target_id "
             f"WHERE e.target_id IN ({placeholders}) "
-            f"AND e.source_id NOT IN ({placeholders})",
+            f"AND e.source_id NOT IN ({placeholders}) "
+            f"AND {self._non_dataflow_edge_filter('e', 'n2', 'nt')}",
             node_ids + node_ids,
         ).fetchall()
         all_downstream = [{"name": r[0], "kind": r[1]} for r in ds_rows]
@@ -1870,9 +1877,13 @@ class GraphDB:
 
         from_id, to_id = from_row[0], to_row[0]
 
-        # Step 1: Find shortest path length via PGQ ANY SHORTEST
-        # DuckPGQ does not support bind parameters inside GRAPH_TABLE,
-        # so we interpolate integer node_ids (safe, no escaping needed).
+        # Step 1: Reachability probe via PGQ ANY SHORTEST.
+        # DuckPGQ does not support bind parameters inside GRAPH_TABLE, so
+        # integer node_ids are interpolated (safe, no escaping needed).
+        # PGQ's quantified edge binding does not accept a per-edge WHERE
+        # predicate — so this probe walks non-dataflow edges too. It is
+        # used only as a "is there *any* path within max_hops?" hint; the
+        # true shortest dataflow path is computed by the BFS below (#127).
         try:
             rows = self._execute_read(
                 f"FROM GRAPH_TABLE (sqlprism_graph "
@@ -1895,10 +1906,11 @@ class GraphDB:
                 "length": 0,
             }
 
-        path_length = int(rows[0][0])
-
-        # Step 2: Recover intermediate nodes via BFS CTE
-        # No file_id filter — BFS must traverse the same topology as PGQ
+        # Step 2: BFS up to max_hops, filtered to dataflow edges only.
+        # Returns the shortest dataflow path. If PGQ reported a path whose
+        # shortest form used a defines/inserts_into self-loop, the BFS may
+        # find a strictly longer dataflow path — or none. Either way the
+        # answer here is correct and the PGQ-reported length is ignored.
         path_cte = f"""
         WITH RECURSIVE path_bfs AS (
             SELECT n.node_id, n.name, 0 as depth,
@@ -1909,13 +1921,16 @@ class GraphDB:
             SELECT n2.node_id, n2.name, pb.depth + 1,
                    array_append(pb.path_names, n2.name)
             FROM edges e
+            JOIN nodes ns ON ns.node_id = e.source_id
             JOIN nodes n2 ON e.target_id = n2.node_id
             JOIN path_bfs pb ON e.source_id = pb.node_id
-            WHERE pb.depth < {path_length}
+            WHERE pb.depth < {max_hops}
             AND NOT array_contains(pb.path_names, n2.name)
+            AND {self._non_dataflow_edge_filter('e', 'ns', 'n2')}
         )
-        SELECT path_names FROM path_bfs
-        WHERE node_id = ? AND depth = {path_length}
+        SELECT path_names, depth FROM path_bfs
+        WHERE node_id = ?
+        ORDER BY depth
         LIMIT 1
         """
         path_rows = self._execute_read(
@@ -1924,16 +1939,17 @@ class GraphDB:
 
         if path_rows:
             path_names = list(path_rows[0][0])
+            length = int(path_rows[0][1])
         else:
-            # BFS could not reconstruct — report as not found
             path_names = []
+            length = 0
 
         return {
             "from": from_model,
             "to": to_model,
             "path_found": bool(path_names),
             "path": path_names,
-            "length": path_length if path_names else 0,
+            "length": length,
         }
 
     def query_find_critical_models(
@@ -2294,25 +2310,33 @@ class GraphDB:
         repo_where = "AND r.name = ? " if repo else ""
         params: list = [repo] if repo else []
 
-        # e_dep: edges where other nodes depend on n (n is the target)
-        #        → COUNT = downstream dependents
-        # upstream CTE: edges where n depends on other nodes (n is the source)
-        #               → COUNT = upstream dependencies
+        # Fan-in / fan-out counts exclude non-dataflow edges (defines and
+        # inserts_into self-loops) via a shared CTE — otherwise every
+        # indexed model's fan-in is +1 too high via its own file-stem query
+        # node (#127). A single `dataflow_edges` CTE centralises the filter
+        # so the upstream and downstream counts can't drift.
         fan_sql = (
-            "WITH upstream_counts AS ("
+            "WITH dataflow_edges AS ("
+            "SELECT e.source_id, e.target_id "
+            "FROM edges e "
+            "JOIN nodes ns ON ns.node_id = e.source_id "
+            "JOIN nodes nt ON nt.node_id = e.target_id "
+            f"WHERE {self._non_dataflow_edge_filter('e', 'ns', 'nt')}"
+            "), "
+            "upstream_counts AS ("
             "SELECT source_id, COUNT(DISTINCT target_id) AS upstream "
-            "FROM edges GROUP BY source_id"
+            "FROM dataflow_edges GROUP BY source_id"
             ") "
             "SELECT n.node_id, n.name, n.kind, "
-            "COUNT(DISTINCT e_dep.source_id) AS downstream, "
+            "COUNT(DISTINCT de.source_id) AS downstream, "
             "COALESCE(uc.upstream, 0) AS upstream "
             "FROM nodes n "
-            "LEFT JOIN edges e_dep ON e_dep.target_id = n.node_id "
+            "LEFT JOIN dataflow_edges de ON de.target_id = n.node_id "
             "LEFT JOIN upstream_counts uc ON uc.source_id = n.node_id "
             f"{repo_join}"
             f"WHERE n.file_id IS NOT NULL {repo_where}"
             "GROUP BY n.node_id, n.name, n.kind, uc.upstream "
-            f"HAVING COUNT(DISTINCT e_dep.source_id) >= ? "
+            f"HAVING COUNT(DISTINCT de.source_id) >= ? "
             "ORDER BY downstream DESC"
         )
         params.append(min_downstream)
@@ -2619,10 +2643,11 @@ class GraphDB:
                 f"f2.path, r2.name as repo_name, n2.line_start, n2.line_end "
                 f"FROM edges e "
                 f"JOIN nodes n2 ON e.source_id = n2.node_id "
+                f"JOIN nodes nt ON nt.node_id = e.target_id "
                 f"LEFT JOIN files f2 ON n2.file_id = f2.file_id "
                 f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
                 f"WHERE e.target_id IN ({placeholders}) "
-                f"AND e.relationship <> 'defines' "
+                f"AND {self._non_dataflow_edge_filter('e', 'n2', 'nt')} "
                 f"LIMIT ? OFFSET ?"
             )
             for r in self._execute_read(inbound_sql, node_ids + [limit, offset]).fetchall():
@@ -2647,11 +2672,12 @@ class GraphDB:
                 f"SELECT n2.name, n2.kind, e.relationship, e.context, "
                 f"f2.path, r2.name as repo_name, n2.line_start, n2.line_end "
                 f"FROM edges e "
+                f"JOIN nodes ns ON ns.node_id = e.source_id "
                 f"JOIN nodes n2 ON e.target_id = n2.node_id "
                 f"LEFT JOIN files f2 ON n2.file_id = f2.file_id "
                 f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
                 f"WHERE e.source_id IN ({placeholders}) "
-                f"AND e.relationship <> 'defines' "
+                f"AND {self._non_dataflow_edge_filter('e', 'ns', 'n2')} "
                 f"LIMIT ? OFFSET ?"
             )
             for r in self._execute_read(outbound_sql, node_ids + [limit, offset]).fetchall():
@@ -2985,6 +3011,30 @@ class GraphDB:
         }
 
     @staticmethod
+    def _non_dataflow_edge_filter(edge_alias: str, src_alias: str, tgt_alias: str) -> str:
+        """SQL predicate that drops edges which are not dataflow.
+
+        Assumes the caller has already joined ``nodes`` twice — once for the
+        edge's source (``src_alias``) and once for its target (``tgt_alias``).
+
+        Excludes:
+        - ``defines`` edges unconditionally — they encode CREATE-statement
+          identity (file-stem query node -> the table/view it declares).
+        - ``inserts_into`` edges only when the shape is the file-stem
+          self-loop (``source.kind='query' AND target.kind='table' AND
+          source.name=target.name``). Legitimate cross-table INSERT
+          dataflow (where the file stem differs from the target) still
+          traverses. See issues #122 and #127.
+        """
+        return (
+            f"{edge_alias}.relationship <> 'defines' "
+            f"AND NOT ({edge_alias}.relationship = 'inserts_into' "
+            f"AND {src_alias}.kind = 'query' "
+            f"AND {tgt_alias}.kind = 'table' "
+            f"AND {src_alias}.name = {tgt_alias}.name)"
+        )
+
+    @staticmethod
     def _is_noise_node(path_entry: dict) -> bool:
         """Return True for nodes that should be excluded from trace results.
 
@@ -3032,12 +3082,10 @@ class GraphDB:
                 pairs_sql = ", ".join(f"({s}, {t})" for s, t in excluded_id_pairs)
                 exclude_clause = f"AND (e.source_id, e.target_id) NOT IN (VALUES {pairs_sql})"
 
-        # defines edges represent CREATE-statement identity (file_stem query
-        # node -> table/view it defines), not dataflow. Excluding them from
-        # traversal prevents a model from appearing in its own trace when a
-        # start node shares a name with a node that was defined by that
-        # model's file (see issue #122).
-        defines_clause = "AND e.relationship <> 'defines'"
+        # Non-dataflow edges (see _non_dataflow_edge_filter) must be dropped
+        # from traversal or a model appears in its own trace when its name
+        # collides with a node authored by the same file (issues #122, #127).
+        dataflow_clause = f"AND {self._non_dataflow_edge_filter('e', 'ns', 'nt')}"
 
         recursive_sql = f"""
         WITH RECURSIVE trace AS (
@@ -3048,8 +3096,10 @@ class GraphDB:
                 1 as depth,
                 ARRAY[e.{source_col}] as path
             FROM edges e
+            JOIN nodes ns ON ns.node_id = e.source_id
+            JOIN nodes nt ON nt.node_id = e.target_id
             WHERE e.{source_col} = ?
-            {defines_clause}
+            {dataflow_clause}
             {exclude_clause}
 
             UNION ALL
@@ -3061,10 +3111,12 @@ class GraphDB:
                 t.depth + 1,
                 array_append(t.path, e.{source_col})
             FROM edges e
+            JOIN nodes ns ON ns.node_id = e.source_id
+            JOIN nodes nt ON nt.node_id = e.target_id
             JOIN trace t ON e.{source_col} = t.node_id
             WHERE t.depth < ?
             AND NOT array_contains(t.path, e.{target_col})
-            {defines_clause}
+            {dataflow_clause}
             {exclude_clause}
         )
         SELECT DISTINCT

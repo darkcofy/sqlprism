@@ -1780,3 +1780,98 @@ def test_resolve_node_fallback_respects_schema_filter():
     )
     db.close()
 
+
+def test_inserts_into_file_stem_collision_no_self_loop():
+    """#127: ``INSERT INTO target SELECT FROM src`` in a file whose stem
+    collides with ``target`` does NOT resurrect the self-loop class bug #122
+    fixed for the ``defines`` edge.
+
+    The SQL parser emits ``file_stem (query) -[inserts_into]-> target (table)``
+    for INSERT statements (src/sqlprism/languages/sql.py:410). When the file
+    stem equals the target, both endpoints share the same name — the same
+    shape that bit ``defines`` before #126. Exploratory coverage confirmed
+    the bug resurfaced via ``inserts_into``, so ``_trace_cte`` and
+    ``query_references`` widen the filter: ``inserts_into`` is dropped from
+    traversal when source.name == target.name. The filter is narrow on
+    purpose — legitimate cross-table INSERT dataflow (where the file stem
+    and the target differ) is still traversed.
+    """
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("inserts-collide-repo", "/tmp/inserts-collide")
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "inserts-123")
+
+        orders_query = db.insert_node(file_id, "query", "orders", "sql")
+        orders_table = db.insert_node(file_id, "table", "orders", "sql")
+        raw_orders = db.insert_node(file_id, "table", "raw_orders", "sql")
+
+        # Mirrors what SqlParser emits for `INSERT INTO orders SELECT * FROM raw_orders`
+        # in a file named orders.sql.
+        db.insert_edge(orders_query, orders_table, "inserts_into")
+        db.insert_edge(orders_query, raw_orders, "inserts_into")
+
+        # Cover every direction — the filter lives in both CTE arms of
+        # _trace_cte and both branches of query_references, so regressions
+        # could surface in any of them.
+        up = db.query_trace("orders", direction="upstream", max_depth=5)
+        down = db.query_trace("orders", direction="downstream", max_depth=5)
+        both = db.query_trace("orders", direction="both", max_depth=5)
+
+        for label, paths in (
+            ("upstream", up["paths"]),
+            ("downstream", down["paths"]),
+            ("both.downstream", both["downstream"]),
+            ("both.upstream", both["upstream"]),
+        ):
+            names = {p["name"] for p in paths}
+            assert "orders" not in names, (
+                f"inserts_into self-loop leaked into {label} trace: {names}"
+            )
+
+        # query_references outbound — the sibling filter site. Resolving
+        # 'orders' by kind='query' makes the outbound edges the self-loop
+        # (to orders(table)) and the real cross-table (to raw_orders).
+        refs = db.query_references("orders", kind="query", include_snippets=False)
+        out_names = {e["name"] for e in refs["outbound"]}
+        assert "orders" not in out_names, (
+            f"inserts_into self-loop leaked into outbound references: {out_names}"
+        )
+        assert "raw_orders" in out_names, "real cross-table inserts_into missing"
+    finally:
+        db.close()
+
+
+def test_inserts_into_cross_table_dataflow_still_traced():
+    """Complementary to the narrow ``inserts_into`` filter: when the file stem
+    does NOT collide with the INSERT target, the ``inserts_into`` edge still
+    participates in both ``query_references`` and ``_trace_cte`` — the filter
+    only drops the self-loop shape, not legitimate cross-table dataflow.
+    """
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("inserts-ok-repo", "/tmp/inserts-ok")
+        file_id = db.insert_file(repo_id, "build_orders.sql", "sql", "inserts-ok-1")
+
+        # Source kind is 'query' (not file-stem-colliding with the target).
+        builder_query = db.insert_node(file_id, "query", "build_orders", "sql")
+        target_table = db.insert_node(file_id, "table", "dim_orders", "sql")
+
+        db.insert_edge(builder_query, target_table, "inserts_into")
+
+        # query_references path
+        refs = db.query_references("dim_orders", kind="table", include_snippets=False)
+        inbound_names = {e["name"] for e in refs["inbound"]}
+        assert "build_orders" in inbound_names, (
+            "non-colliding inserts_into must still surface via references; "
+            "the filter is intentionally narrow to the self-loop shape only"
+        )
+
+        # _trace_cte path (upstream from the table — builder_query should appear)
+        trace = db.query_trace("dim_orders", direction="upstream", max_depth=3)
+        trace_names = {p["name"] for p in trace["paths"]}
+        assert "build_orders" in trace_names, (
+            "non-colliding inserts_into must still surface via trace"
+        )
+    finally:
+        db.close()
+
