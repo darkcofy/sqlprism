@@ -1774,6 +1774,47 @@ def test_check_impact_nonexistent_model():
     db.close()
 
 
+def test_check_impact_ignores_defines_edge_when_kind_filter():
+    """#127: downstream discovery must exclude the file-stem `query` node
+    that defines the target table, regardless of whether node_rows happens
+    to include that query.
+
+    Today node_rows includes every node sharing the model name, so the
+    defining query node is hidden by the NOT IN clause. When the file stem
+    and the target table don't share a name (e.g. a ``build_orders.sql``
+    whose CREATE target is ``staging.orders``), node_rows only contains
+    the table — and without the explicit defines filter the defining
+    query node surfaces as a phantom downstream consumer.
+    """
+    from sqlprism.core.graph import GraphDB
+
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "build_orders.sql", "sql", "abc")
+        target_id = db.insert_node(file_id, "table", "staging.orders", "sql")
+        definer_id = db.insert_node(file_id, "query", "build_orders", "sql")
+        real_consumer_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+        db.insert_edge(definer_id, target_id, "defines", "CREATE statement")
+        db.insert_edge(real_consumer_id, target_id, "references")
+        db.insert_column_usage(real_consumer_id, "staging.orders", "amount", "select", file_id)
+
+    result = db.query_check_impact(
+        "staging.orders",
+        [{"action": "add_column", "column": "new_field"}],
+    )
+
+    # add_column classifies every downstream as safe — so the full list of
+    # downstream consumers surfaces there. The defining query must not appear.
+    safe_models = {s["model"] for s in result["impacts"][0]["safe"]}
+    assert "build_orders" not in safe_models, (
+        f"defining query node leaked into downstream consumers: {safe_models}"
+    )
+    assert "marts.revenue" in safe_models
+
+    db.close()
+
+
 def test_check_impact_column_change_validation():
     """ColumnChange validator rejects missing required fields."""
     import pytest

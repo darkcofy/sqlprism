@@ -756,3 +756,109 @@ def test_find_bottlenecks_empty_graph():
         assert result["total_analyzed"] == 0
     finally:
         db.close()
+
+
+# ── #127: defines-edge filter regression ──
+
+
+def _build_defines_self_collision_graph():
+    """Mirror the #127 fixture: a file-stem `query` node with a `defines`
+    edge to a same-named `table` node, plus a real `references` edge.
+
+    orders (query)      -[defines]->    orders (table)
+    orders (query)      -[references]-> stg_orders (table)
+    downstream (query)  -[references]-> orders (table)
+    """
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    orders_file = db.insert_file(repo_id, "orders.sql", "sql", "orders-abc")
+    downstream_file = db.insert_file(repo_id, "downstream.sql", "sql", "downstream-abc")
+
+    orders_query = db.insert_node(orders_file, "query", "orders", "sql")
+    orders_table = db.insert_node(orders_file, "table", "orders", "sql")
+    stg_orders = db.insert_node(orders_file, "table", "stg_orders", "sql")
+    downstream_query = db.insert_node(downstream_file, "query", "downstream", "sql")
+
+    db.insert_edge(orders_query, orders_table, "defines", "CREATE statement")
+    db.insert_edge(orders_query, stg_orders, "references")
+    db.insert_edge(downstream_query, orders_table, "references")
+
+    if db.has_pgq:
+        db.refresh_property_graph()
+    return db
+
+
+def test_find_path_excludes_self_via_defines_edge():
+    """#127 BDD: find_path('orders', 'orders') does not return a length-1
+    self-path via the `defines` edge between the file-stem query node and
+    the table it declares.
+    """
+    db = _build_defines_self_collision_graph()
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not installed")
+    try:
+        result = db.query_find_path("orders", "orders")
+        assert result["path_found"] is False
+        assert result["path"] == []
+        assert result["length"] == 0
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_ignores_defines_edge():
+    """#127: `defines` edges must not contribute to downstream_count.
+
+    Without the filter the `orders (table)` node would report downstream=2
+    (real `downstream` consumer + the `orders (query)` defines edge); with
+    the filter downstream=1 (only the real consumer).
+    """
+    db = _build_defines_self_collision_graph()
+    try:
+        result = db.query_find_bottlenecks(min_downstream=1)
+        by_name_kind = {(b["name"], b["kind"]): b for b in result["bottlenecks"]}
+        orders_table = by_name_kind.get(("orders", "table"))
+        assert orders_table is not None, "orders (table) should appear as a bottleneck"
+        assert orders_table["downstream"] == 1, (
+            f"defines edge leaked into downstream count: {orders_table}"
+        )
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_upstream_count_ignores_defines_edge():
+    """#127: `defines` edges must not contribute to upstream count either.
+
+    Covers the symmetric half of the fix — the `upstream_counts` CTE must
+    apply the same filter as the fan-in join. A query node with N real
+    outbound references plus one `defines` edge should report upstream=N.
+    """
+    db = GraphDB()
+    try:
+        repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+        file_id = db.insert_file(repo_id, "m.sql", "sql", "m-abc")
+        consumer_file = db.insert_file(repo_id, "consumer.sql", "sql", "c-abc")
+
+        m_query = db.insert_node(file_id, "query", "m", "sql")
+        m_table = db.insert_node(file_id, "table", "m", "sql")
+        src_a = db.insert_node(file_id, "table", "src_a", "sql")
+        src_b = db.insert_node(file_id, "table", "src_b", "sql")
+        consumer = db.insert_node(consumer_file, "query", "consumer", "sql")
+
+        db.insert_edge(m_query, m_table, "defines")      # identity, not dataflow
+        db.insert_edge(m_query, src_a, "references")     # real upstream #1
+        db.insert_edge(m_query, src_b, "references")     # real upstream #2
+        db.insert_edge(consumer, m_query, "references")  # gives m_query 1 inbound
+
+        if db.has_pgq:
+            db.refresh_property_graph()
+
+        result = db.query_find_bottlenecks(min_downstream=1)
+        by_name_kind = {(b["name"], b["kind"]): b for b in result["bottlenecks"]}
+        m_query_stats = by_name_kind.get(("m", "query"))
+        assert m_query_stats is not None, "m (query) should qualify"
+        assert m_query_stats["upstream"] == 2, (
+            f"defines edge leaked into upstream count: {m_query_stats}"
+        )
+    finally:
+        db.close()
