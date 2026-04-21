@@ -1742,3 +1742,45 @@ def test_snowflake_dialect_normalize_file_stem():
     # File stem 'stg_orders' normalized to 'STG_ORDERS' should match the CREATE name
     file_nodes = [n for n in result.nodes if (n.metadata or {}).get("file_node")]
     assert len(file_nodes) == 0  # No file node because normalized names match
+
+
+def test_parser_emits_column_defs_for_ctas_projection():
+    """CREATE TABLE ... AS SELECT must emit ColumnDefResult entries mirroring
+    the projection order — dbt compiles every model through a CTAS wrap, so
+    without this the columns table stays empty for dbt-indexed projects."""
+    parser = SqlParser()
+    result = parser.parse(
+        "staging/orders.sql",
+        'CREATE TABLE "staging"."orders" AS '
+        "SELECT customer_id, order_id FROM raw.orders",
+    )
+
+    orders = [c for c in result.columns if c.node_name == "orders"]
+    assert [c.column_name for c in orders] == ["customer_id", "order_id"], \
+        f"unexpected columns: {orders}"
+    assert all(c.source == "inferred" for c in orders), orders
+    assert [c.position for c in orders] == [0, 1], orders
+    # Inferred rows carry names only — a regression that started emitting
+    # "TEXT" here would silently shadow better-typed schema.yml overrides.
+    assert [c.data_type for c in orders] == [None, None], orders
+
+
+def test_parser_ctas_inferred_columns_do_not_shadow_explicit_definition():
+    """Explicit schema-clause columns keep their `definition` entries;
+    inferred projection entries must dedup against them so a typed `a INT`
+    isn't overwritten by a name-only inferred duplicate."""
+    parser = SqlParser()
+    result = parser.parse(
+        "t.sql",
+        "CREATE TABLE t (a INT) AS SELECT a, b FROM src",
+    )
+
+    cols_for_t = [c for c in result.columns if c.node_name == "t"]
+    # `a` is defined, `b` is inferred — no double-entry for `a`.
+    a_rows = [c for c in cols_for_t if c.column_name == "a"]
+    assert len(a_rows) == 1, a_rows
+    assert a_rows[0].source == "definition"
+    assert a_rows[0].data_type == "INT"
+    b_rows = [c for c in cols_for_t if c.column_name == "b"]
+    assert len(b_rows) == 1, b_rows
+    assert b_rows[0].source == "inferred"

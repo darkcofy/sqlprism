@@ -397,6 +397,16 @@ class Indexer:
             "lineage_chains": 0,
         }
 
+        # Clear any prior synthetic schema.yml sources file even when this
+        # run produces no sources — otherwise stale rows persist after a
+        # user removes a `sources:` entry, because the synthetic key
+        # wouldn't appear in `rendered` this run to trigger its own
+        # delete_file_data pass.
+        with self.graph.write_transaction():
+            self.graph.delete_file_data(
+                repo_id, self.dbt_renderer._SCHEMA_YML_SOURCES_PATH,
+            )
+
         for model_path, result in rendered.items():
             # Wrap delete + insert per model in a transaction for atomicity
             with self.graph.write_transaction():
@@ -664,6 +674,14 @@ class Indexer:
                 stats["errors"].append(f"{f.stem}: dbt compile failed: {e}")
                 stats["details"].append({"path": str(f), "status": "error", "reason": str(e)})
             return
+
+        # Same stale-source guard as the full reindex — every dbt render
+        # pass regenerates the synthetic schema.yml source file from the
+        # current YAML, so wipe the prior copy before re-insertion.
+        with self.graph.write_transaction():
+            self.graph.delete_file_data(
+                repo_id, self.dbt_renderer._SCHEMA_YML_SOURCES_PATH,
+            )
 
         # Insert rendered results
         for model_path, result in rendered.items():

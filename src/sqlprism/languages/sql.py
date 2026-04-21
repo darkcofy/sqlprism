@@ -277,24 +277,44 @@ class SqlParser:
                         )
                     )
 
-        # Infer output columns from CREATE VIEW AS SELECT
-        if node_kind == "view" and stmt.expression:
-            select_expr = stmt.expression
-            if isinstance(select_expr, exp.Select) or isinstance(select_expr, exp.Query):
-                self._extract_inferred_columns(select_expr, name, columns)
+        # Infer output columns from CREATE ... AS SELECT for both views and
+        # tables (CTAS). dbt compiled SQL wraps every model as
+        # `CREATE TABLE "schema"."name" AS <SELECT>` — without inferring here,
+        # the columns table stays empty for dbt regardless of schema.yml.
+        if stmt.expression and node_kind in ("table", "view") and (
+            isinstance(stmt.expression, exp.Query)
+        ):
+            # Skip names already recorded from the explicit schema clause
+            # (e.g. `CREATE TABLE t (a INT) AS SELECT a, b ...`) so the
+            # declared type isn't shadowed by an `inferred` duplicate.
+            declared = {
+                c.column_name for c in columns
+                if c.node_name == name and c.source == "definition"
+            }
+            inferred = self._build_inferred_columns(stmt.expression, name)
+            columns.extend(
+                c for c in inferred if c.column_name not in declared
+            )
 
-    def _extract_inferred_columns(
+    def _build_inferred_columns(
         self,
         select_expr: exp.Expression,
         node_name: str,
-        columns: list[ColumnDefResult],
-    ) -> None:
-        """Infer output column names from a SELECT expression."""
+    ) -> list[ColumnDefResult]:
+        """Infer output column rows from a SELECT expression.
+
+        Returns the newly-built rows instead of mutating a caller-supplied
+        list so the caller can filter them (e.g. drop names already covered
+        by an explicit schema clause) before committing. Mutating in-place
+        and then slicing on ``len(columns)`` was fragile — any future change
+        that also touched earlier entries would silently break dedup.
+        """
         # Find the outermost SELECT
         select = select_expr.find(exp.Select) if not isinstance(select_expr, exp.Select) else select_expr
         if not select or not select.expressions:
-            return
+            return []
 
+        rows: list[ColumnDefResult] = []
         for i, sel_col in enumerate(select.expressions):
             # Use alias if present, otherwise try to get column name
             if isinstance(sel_col, exp.Alias):
@@ -308,7 +328,7 @@ class SqlParser:
                 col_name = sel_col.alias_or_name if hasattr(sel_col, "alias_or_name") else None
 
             if col_name and col_name != "*":
-                columns.append(
+                rows.append(
                     ColumnDefResult(
                         node_name=node_name,
                         column_name=col_name,
@@ -316,6 +336,7 @@ class SqlParser:
                         source="inferred",
                     )
                 )
+        return rows
 
     def _extract_table_references(
         self,
