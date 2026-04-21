@@ -304,7 +304,15 @@ def test_trace_dependencies_downstream(tmp_path):
 
 
 def test_trace_dependencies_upstream(tmp_path):
-    """trace_dependencies follows upstream references."""
+    """trace_dependencies follows upstream references and skips defines edges.
+
+    Exercises two MCP-integration invariants in one repo:
+      * A regular `references` edge (summary(query) -> orders(table)) surfaces
+        upstream from `orders`.
+      * The `defines` edge (summary(query) -> order_summary(view)) does NOT
+        surface upstream from `order_summary`, directly guarding the fix for
+        issue #122 at the MCP tool layer.
+    """
     repo_dir = tmp_path / "trace_up_repo"
     repo_dir.mkdir()
     (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
@@ -320,15 +328,28 @@ def test_trace_dependencies_upstream(tmp_path):
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    # Edge: summary(query) -[defines]-> order_summary(view)
-    # Upstream from order_summary finds the defining query node.
+    # Upstream from orders (table) traverses the real references edge:
+    # summary(query) -[references]-> orders(table).
     result = asyncio.run(
-        trace_dependencies(TraceDependenciesInput(name="order_summary", direction="upstream", max_depth=3))
+        trace_dependencies(TraceDependenciesInput(name="orders", direction="upstream", max_depth=3))
     )
     assert result["root"] is not None
     assert len(result["paths"]) >= 1
     upstream_names = {p["name"] for p in result["paths"]}
     assert "summary" in upstream_names
+    assert all(p["relationship"] != "defines" for p in result["paths"])
+
+    # Upstream from order_summary (view) would previously surface summary(query)
+    # via the defines edge. With the #122 fix that edge is filtered, so no
+    # path should appear via that relationship.
+    result_view = asyncio.run(
+        trace_dependencies(
+            TraceDependenciesInput(name="order_summary", direction="upstream", max_depth=3)
+        )
+    )
+    assert all(p["relationship"] != "defines" for p in result_view["paths"])
+    view_upstream_names = {p["name"] for p in result_view["paths"]}
+    assert "summary" not in view_upstream_names
 
 
 def test_trace_dependencies_not_found(tmp_path):
