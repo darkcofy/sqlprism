@@ -1774,17 +1774,18 @@ def test_check_impact_nonexistent_model():
     db.close()
 
 
-def test_check_impact_ignores_defines_edge_when_kind_filter():
+def test_check_impact_excludes_defining_query_when_file_stem_differs():
     """#127: downstream discovery must exclude the file-stem `query` node
-    that defines the target table, regardless of whether node_rows happens
-    to include that query.
+    that defines the target table even when it has a different name.
 
-    Today node_rows includes every node sharing the model name, so the
-    defining query node is hidden by the NOT IN clause. When the file stem
-    and the target table don't share a name (e.g. a ``build_orders.sql``
-    whose CREATE target is ``staging.orders``), node_rows only contains
-    the table — and without the explicit defines filter the defining
-    query node surfaces as a phantom downstream consumer.
+    Today ``query_check_impact`` resolves ``node_rows`` by name only, so a
+    colliding file stem hides the ``defines`` edge via the NOT IN clause
+    by accident. When the file stem and the target table differ (e.g. a
+    ``build_orders.sql`` whose CREATE target is ``staging.orders``),
+    ``node_rows`` only contains the table — and without the explicit
+    defines filter the defining query surfaces as a phantom consumer. The
+    filter also covers every ``remove_column`` / ``rename_column`` change
+    bucket, not just ``add_column``.
     """
     from sqlprism.core.graph import GraphDB
 
@@ -1799,20 +1800,33 @@ def test_check_impact_ignores_defines_edge_when_kind_filter():
         db.insert_edge(real_consumer_id, target_id, "references")
         db.insert_column_usage(real_consumer_id, "staging.orders", "amount", "select", file_id)
 
-    result = db.query_check_impact(
-        "staging.orders",
-        [{"action": "add_column", "column": "new_field"}],
-    )
+    try:
+        # add_column: every downstream surfaces in safe — definer must not
+        add_result = db.query_check_impact(
+            "staging.orders",
+            [{"action": "add_column", "column": "new_field"}],
+        )
+        safe_models = {s["model"] for s in add_result["impacts"][0]["safe"]}
+        assert "build_orders" not in safe_models, (
+            f"defining query node leaked into safe consumers: {safe_models}"
+        )
+        assert "marts.revenue" in safe_models
 
-    # add_column classifies every downstream as safe — so the full list of
-    # downstream consumers surfaces there. The defining query must not appear.
-    safe_models = {s["model"] for s in result["impacts"][0]["safe"]}
-    assert "build_orders" not in safe_models, (
-        f"defining query node leaked into downstream consumers: {safe_models}"
-    )
-    assert "marts.revenue" in safe_models
-
-    db.close()
+        # remove_column: breaking classification must also exclude the definer
+        # (a regression where the filter only applied to the add_column branch
+        # would pass the assertion above but fail here).
+        rm_result = db.query_check_impact(
+            "staging.orders",
+            [{"action": "remove_column", "column": "amount"}],
+        )
+        impact = rm_result["impacts"][0]
+        surfaced = {x["model"] for x in impact["breaking"] + impact["warnings"] + impact["safe"]}
+        assert "build_orders" not in surfaced, (
+            f"defining query leaked into remove_column impact: {surfaced}"
+        )
+        assert "marts.revenue" in {b["model"] for b in impact["breaking"]}
+    finally:
+        db.close()
 
 
 def test_check_impact_column_change_validation():

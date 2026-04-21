@@ -811,7 +811,9 @@ def test_find_bottlenecks_ignores_defines_edge():
 
     Without the filter the `orders (table)` node would report downstream=2
     (real `downstream` consumer + the `orders (query)` defines edge); with
-    the filter downstream=1 (only the real consumer).
+    the filter downstream=1 (only the real consumer). Also asserts the
+    real consumer's own downstream/upstream still register, so a future
+    over-eager filter that drops *all* edges would fail.
     """
     db = _build_defines_self_collision_graph()
     try:
@@ -821,6 +823,16 @@ def test_find_bottlenecks_ignores_defines_edge():
         assert orders_table is not None, "orders (table) should appear as a bottleneck"
         assert orders_table["downstream"] == 1, (
             f"defines edge leaked into downstream count: {orders_table}"
+        )
+        # `stg_orders` has one inbound real `references` edge from
+        # orders(query) — its downstream must be 1. This is a stronger
+        # check than `orders(table).downstream == 1`: it proves the filter
+        # is narrow, not an over-eager drop of all edges touching the
+        # file-stem query node.
+        stg_orders = by_name_kind.get(("stg_orders", "table"))
+        assert stg_orders is not None, "stg_orders (real consumer target) missing"
+        assert stg_orders["downstream"] == 1, (
+            f"real references edge dropped: {stg_orders}"
         )
     finally:
         db.close()
@@ -860,5 +872,133 @@ def test_find_bottlenecks_upstream_count_ignores_defines_edge():
         assert m_query_stats["upstream"] == 2, (
             f"defines edge leaked into upstream count: {m_query_stats}"
         )
+    finally:
+        db.close()
+
+
+# ── #127: inserts_into self-loop filter regression ──
+
+
+def _build_inserts_into_self_collision_graph():
+    """Mirror the #127 inserts_into self-loop fixture.
+
+    Emulates ``orders.sql`` with ``INSERT INTO orders SELECT * FROM raw_orders``
+    — the SQL parser (sql.py:410) emits both ``inserts_into`` edges from the
+    file-stem query. When the file stem collides with the INSERT target, the
+    source/target share a name — the same self-loop shape as the ``defines``
+    bug fixed for trace/references in PR #126.
+
+      orders (query)      -[inserts_into]-> orders (table)       # self-loop
+      orders (query)      -[inserts_into]-> raw_orders (table)   # cross-table
+      downstream (query)  -[references]->   orders (table)
+    """
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    orders_file = db.insert_file(repo_id, "orders.sql", "sql", "orders-abc")
+    downstream_file = db.insert_file(repo_id, "downstream.sql", "sql", "downstream-abc")
+
+    orders_query = db.insert_node(orders_file, "query", "orders", "sql")
+    orders_table = db.insert_node(orders_file, "table", "orders", "sql")
+    raw_orders = db.insert_node(orders_file, "table", "raw_orders", "sql")
+    downstream_query = db.insert_node(downstream_file, "query", "downstream", "sql")
+
+    db.insert_edge(orders_query, orders_table, "inserts_into")
+    db.insert_edge(orders_query, raw_orders, "inserts_into")
+    db.insert_edge(downstream_query, orders_table, "references")
+
+    if db.has_pgq:
+        db.refresh_property_graph()
+    return db
+
+
+def test_find_path_excludes_self_via_inserts_into_edge():
+    """#127: find_path('orders', 'orders') does not return a length-1 self-path
+    via an `inserts_into` edge between the file-stem query and same-named target.
+    """
+    db = _build_inserts_into_self_collision_graph()
+    if not db.has_pgq:
+        db.close()
+        pytest.skip("DuckPGQ not installed")
+    try:
+        result = db.query_find_path("orders", "orders")
+        assert result["path_found"] is False
+        assert result["path"] == []
+        assert result["length"] == 0
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_ignores_inserts_into_self_loop():
+    """#127: inserts_into self-loop must not contribute to downstream_count.
+
+    Without the filter `orders (table)` reports downstream=2 (real `downstream`
+    consumer + the `orders (query)` inserts_into self-loop). With the filter
+    downstream=1 — the real consumer only.
+    """
+    db = _build_inserts_into_self_collision_graph()
+    try:
+        result = db.query_find_bottlenecks(min_downstream=1)
+        by_name_kind = {(b["name"], b["kind"]): b for b in result["bottlenecks"]}
+        orders_table = by_name_kind.get(("orders", "table"))
+        assert orders_table is not None, "orders (table) should appear as a bottleneck"
+        assert orders_table["downstream"] == 1, (
+            f"inserts_into self-loop leaked into downstream count: {orders_table}"
+        )
+    finally:
+        db.close()
+
+
+def test_find_bottlenecks_upstream_count_ignores_inserts_into_self_loop():
+    """Symmetric upstream-count regression: the file-stem query's own
+    inserts_into edge to a same-named target must not inflate its upstream.
+    The cross-table inserts_into edge (to raw_orders) still counts.
+    """
+    db = _build_inserts_into_self_collision_graph()
+    try:
+        # orders_query has two outbound inserts_into edges — one self-loop to
+        # orders(table), one real to raw_orders(table). After filtering only
+        # the real edge counts. orders_query has 0 inbound so min_downstream=1
+        # would drop it; drop min_downstream to 0 to admit it into the result.
+        result = db.query_find_bottlenecks(min_downstream=1)
+        by_name_kind = {(b["name"], b["kind"]): b for b in result["bottlenecks"]}
+        # Assert the self-loop did not inflate the declared table's upstream.
+        # orders(table) has 0 outbound real edges — upstream should be 0.
+        orders_table = by_name_kind.get(("orders", "table"))
+        assert orders_table is not None
+        assert orders_table["upstream"] == 0, (
+            f"unexpected upstream for orders(table): {orders_table}"
+        )
+    finally:
+        db.close()
+
+
+def test_check_impact_ignores_inserts_into_self_loop():
+    """#127: check_impact downstream discovery must exclude the file-stem query
+    node that inserts into a same-named target, not just the one that defines it.
+    """
+    db = GraphDB()
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sql")
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "orders.sql", "sql", "abc")
+        orders_table = db.insert_node(file_id, "table", "orders", "sql")
+        orders_query = db.insert_node(file_id, "query", "orders", "sql")
+        consumer_id = db.insert_node(file_id, "query", "marts.revenue", "sql")
+
+        db.insert_edge(orders_query, orders_table, "inserts_into")   # self-loop
+        db.insert_edge(consumer_id, orders_table, "references")      # real consumer
+        db.insert_column_usage(consumer_id, "orders", "amount", "select", file_id)
+
+    try:
+        result = db.query_check_impact(
+            "orders",
+            [{"action": "add_column", "column": "new_field"}],
+        )
+        safe_models = {s["model"] for s in result["impacts"][0]["safe"]}
+        # The file-stem query's inserts_into self-loop must not surface as a
+        # downstream consumer — only the real references-based consumer does.
+        assert "orders" not in safe_models, (
+            f"inserts_into self-loop leaked into downstream consumers: {safe_models}"
+        )
+        assert "marts.revenue" in safe_models
     finally:
         db.close()

@@ -93,6 +93,30 @@ def test_multiple_statements():
     assert "users" in table_names
 
 
+def test_insert_into_file_stem_collision_emits_self_loop_edge():
+    """#127: when a file's stem collides with an INSERT target, the parser
+    emits ``file_stem (query) -[inserts_into]-> same-named table`` — the
+    exact self-loop shape the graph-level filter drops. Ensures that the
+    regression fixtures in test_graph.py / test_graph_tools.py mirror real
+    parser output: if sql.py:410 ever stops emitting this edge, the graph
+    tests could silently pass against stale assumptions.
+    """
+    sql = "INSERT INTO orders SELECT * FROM raw_orders;"
+    parser = SqlParser()
+    result = parser.parse("orders.sql", sql)
+
+    self_loop = [
+        e for e in result.edges
+        if e.source_name == "orders"
+        and e.target_name == "orders"
+        and e.relationship == "inserts_into"
+    ]
+    assert self_loop, (
+        "parser no longer emits the inserts_into self-loop; update the "
+        "graph-level regression fixtures accordingly"
+    )
+
+
 def test_invalid_sql_returns_empty():
     parser = SqlParser()
     result = parser.parse("bad.sql", "THIS IS NOT SQL AT ALL ???")
