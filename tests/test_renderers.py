@@ -1753,3 +1753,175 @@ def test_sqlmesh_render_failed_to_spawn_error(tmp_path, monkeypatch):
             sqlmesh_command="uv run sqlmesh",
             model_filter=[],
         )
+
+
+# ── Issue #120: schema catalog for SELECT * lineage ──
+
+
+def test_merge_column_schemas_overlay_wins():
+    """Fresh column_schemas override base entries at the column level."""
+    from sqlprism.languages.sqlmesh import _merge_column_schemas
+
+    base = {"orders": {"id": "TEXT", "total": "INT"}, "customers": {"name": "TEXT"}}
+    overlay = {"orders": {"id": "BIGINT", "status": "TEXT"}}
+    merged = _merge_column_schemas(base, overlay)
+    assert merged["orders"]["id"] == "BIGINT"      # overlay wins
+    assert merged["orders"]["total"] == "INT"      # base preserved
+    assert merged["orders"]["status"] == "TEXT"    # overlay added
+    assert merged["customers"] == {"name": "TEXT"} # untouched sibling table
+
+
+def test_merge_column_schemas_exposes_qualified_and_base_keys():
+    """Quoted sqlmesh-style model names are exposed under base and full keys."""
+    from sqlprism.languages.sqlmesh import _merge_column_schemas
+
+    merged = _merge_column_schemas(None, {'"demo"."orders"': {"id": "INT"}})
+    assert merged["orders"] == {"id": "INT"}
+    assert merged["demo.orders"] == {"id": "INT"}
+
+
+def test_merge_column_schemas_skips_empty_column_dicts():
+    """Model entries with no columns don't pollute the catalog.
+
+    sqlglot's qualify_columns drops lineage if it sees a known table with an
+    empty column list, so empty entries must be discarded.
+    """
+    from sqlprism.languages.sqlmesh import _merge_column_schemas
+
+    merged = _merge_column_schemas(None, {'"demo"."orders"': {}})
+    assert merged == {}
+
+
+def test_dbt_extract_manifest_columns(tmp_path):
+    """Manifest node columns flatten into {normalized_name: {col: type}}."""
+    import json
+
+    (tmp_path / "dbt_project.yml").write_text("name: demo\nversion: '1.0.0'\n")
+    target = tmp_path / "target"
+    target.mkdir()
+    manifest = {
+        "nodes": {
+            "model.demo.orders": {
+                "resource_type": "model",
+                "name": "orders",
+                "columns": {
+                    "id": {"name": "id", "data_type": "BIGINT"},
+                    "total": {"name": "total", "data_type": None},
+                },
+            },
+            "test.demo.not_null_orders_id": {
+                "resource_type": "test",
+                "name": "not_null_orders_id",
+                "columns": {"ignored": {"data_type": "TEXT"}},
+            },
+        },
+        "sources": {
+            "source.demo.raw.customers": {
+                "name": "customers",
+                "identifier": "customers_v2",
+                "columns": {"customer_id": {"data_type": "INT"}},
+            }
+        },
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest))
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    cols = renderer._extract_manifest_columns(tmp_path, SqlParser())
+    assert cols["orders"] == {"id": "BIGINT", "total": "TEXT"}
+    assert cols["customers_v2"] == {"customer_id": "INT"}  # source identifier
+    assert "not_null_orders_id" not in cols  # tests excluded
+
+
+def test_dbt_schema_yml_columns_flat(tmp_path):
+    """schema.yml columns flatten into a flat catalog with default TEXT type."""
+    models_dir = tmp_path / "models"
+    _write_yaml(
+        models_dir / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: orders
+    columns:
+      - name: id
+        data_type: bigint
+      - name: status
+""",
+    )
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    cols = renderer._schema_yml_columns(tmp_path, SqlParser())
+    assert cols["orders"]["id"] == "bigint"
+    assert cols["orders"]["status"] == "TEXT"
+
+
+def test_dbt_build_effective_schema_layers(tmp_path):
+    """Effective schema merges graph catalog with manifest + schema.yml."""
+    import json
+
+    (tmp_path / "dbt_project.yml").write_text("name: demo\nversion: '1.0.0'\n")
+    target = tmp_path / "target"
+    target.mkdir()
+    manifest = {
+        "nodes": {
+            "model.demo.orders": {
+                "resource_type": "model",
+                "name": "orders",
+                "columns": {"id": {"data_type": "BIGINT"}},
+            }
+        },
+        "sources": {},
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest))
+    _write_yaml(
+        tmp_path / "models" / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: orders
+    columns:
+      - name: status
+""",
+    )
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    base = {"other_repo_table": {"col": "TEXT"}, "orders": {"legacy_col": "TEXT"}}
+    merged = renderer._build_effective_schema(tmp_path, SqlParser(), base)
+    # Manifest-authoritative types, schema.yml adds status, base preserves legacy + siblings
+    assert merged["orders"]["id"] == "BIGINT"
+    assert merged["orders"]["status"] == "TEXT"
+    assert merged["orders"]["legacy_col"] == "TEXT"
+    assert merged["other_repo_table"] == {"col": "TEXT"}
+
+
+def test_sqlmesh_parse_merges_fresh_column_schemas(tmp_path):
+    """_parse_models_sequential merges column_schemas into schema before parsing.
+
+    Confirms SELECT * through a CTE resolves against freshly-rendered model
+    columns on the very first index, before any graph columns exist.
+    """
+    from sqlprism.languages.sqlmesh import SqlMeshRenderer
+
+    renderer = SqlMeshRenderer()
+    models = {
+        "downstream": (
+            "WITH wrapped AS (SELECT * FROM upstream) "
+            "SELECT customer_id FROM wrapped"
+        ),
+    }
+    column_schemas = {"upstream": {"customer_id": "INT", "name": "TEXT"}}
+
+    results = renderer._parse_models_sequential(models, column_schemas, None)
+
+    lineage = results["downstream"].column_lineage
+    customer_id_chains = [cl for cl in lineage if cl.output_column == "customer_id"]
+    assert customer_id_chains, "customer_id should have lineage"
+    tables_seen = {h.table for cl in customer_id_chains for h in cl.chain}
+    assert "upstream" in tables_seen, f"expected upstream in chain, got {tables_seen}"

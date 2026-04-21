@@ -2553,3 +2553,123 @@ def test_reindex_repo_bigquery_dialect(tmp_path):
     assert stats["nodes_added"] >= 2
     assert stats["edges_added"] >= 1
     assert len(stats["parse_errors"]) == 0
+
+
+# ── Issue #120: cross-repo schema catalog & SELECT * lineage ──
+
+
+def test_get_cross_repo_columns_merges_other_repos(tmp_path):
+    """Cross-repo catalog layers current repo on top of sibling-repo columns.
+
+    Ensures that when indexing repo B, schema lookups can resolve a table
+    defined in already-indexed repo A — without clobbering anything in B.
+    """
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    repo_a = tmp_path / "repo_a"
+    repo_a.mkdir()
+    (repo_a / "upstream.sql").write_text(
+        "CREATE TABLE upstream (customer_id INT, status VARCHAR(20))"
+    )
+    indexer.reindex_repo("repo_a", str(repo_a))
+
+    repo_b = tmp_path / "repo_b"
+    repo_b.mkdir()
+    (repo_b / "local.sql").write_text(
+        "CREATE TABLE local_t (id INT)"
+    )
+    indexer.reindex_repo("repo_b", str(repo_b))
+
+    b_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["repo_b"]
+    ).fetchone()[0]
+
+    catalog = db.get_cross_repo_columns(b_id)
+    assert "upstream" in catalog, "upstream from sibling repo should be visible"
+    assert "customer_id" in catalog["upstream"]
+    assert "local_t" in catalog, "current repo columns remain present"
+
+
+def test_reindex_sqlmesh_select_star_lineage_single_repo(tmp_path):
+    """SELECT * through a CTE resolves on a fresh index using column_schemas."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    raw_models = {
+        '"demo"."stg_orders"': "SELECT customer_id, order_id FROM raw.orders",
+        '"demo"."orders"': (
+            "WITH wrapped AS (SELECT * FROM stg_orders) "
+            "SELECT customer_id FROM wrapped"
+        ),
+    }
+    column_schemas = {
+        '"demo"."stg_orders"': {"customer_id": "INT", "order_id": "INT"},
+    }
+
+    with _mock_render_raw(indexer, raw_models, column_schemas):
+        indexer.reindex_sqlmesh("demo", tmp_path)
+
+    # Pull column_lineage for the orders model: it should trace customer_id
+    # back to stg_orders via the wrapped CTE.
+    rows = db._execute_read(
+        "SELECT DISTINCT hop_table "
+        "FROM column_lineage cl "
+        "JOIN files f ON cl.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? AND cl.output_node = ? AND cl.output_column = ?",
+        ["demo", "orders", "customer_id"],
+    ).fetchall()
+    tables = {r[0] for r in rows}
+    assert "stg_orders" in tables, f"expected stg_orders in chain, got {tables}"
+
+
+def test_reindex_sqlmesh_cross_repo_select_star_lineage(tmp_path):
+    """Downstream repo resolves SELECT * through an upstream sibling repo.
+
+    Mirrors the jaffle-mesh acceptance criterion: index platform first, then
+    finance; tracing customer_id on the finance model should hop back to the
+    platform-owned stg_orders.
+    """
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    # --- upstream repo (platform) — plain SQL with explicit CREATE TABLE ---
+    upstream_path = tmp_path / "platform"
+    upstream_path.mkdir()
+    (upstream_path / "stg_orders.sql").write_text(
+        "CREATE TABLE stg_orders (customer_id INT, order_id INT)"
+    )
+    indexer.reindex_repo("platform", str(upstream_path))
+
+    # --- downstream repo (finance) — refers to stg_orders via SELECT * CTE ---
+    downstream_path = tmp_path / "finance"
+    downstream_path.mkdir()
+    downstream_models = {
+        '"finance"."orders"': (
+            "WITH orders AS (SELECT * FROM stg_orders) "
+            "SELECT customer_id FROM orders"
+        ),
+    }
+    with _mock_render_raw(indexer, downstream_models, {}):
+        indexer.reindex_sqlmesh("finance", downstream_path)
+
+    rows = db._execute_read(
+        "SELECT DISTINCT hop_table "
+        "FROM column_lineage cl "
+        "JOIN files f ON cl.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? AND cl.output_node = ? AND cl.output_column = ?",
+        ["finance", "orders", "customer_id"],
+    ).fetchall()
+    tables = {r[0] for r in rows}
+    assert "stg_orders" in tables, f"expected stg_orders in chain, got {tables}"
