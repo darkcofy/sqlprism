@@ -113,91 +113,22 @@ def reindex(config_path: str, db_path: str | None, repo_name: str | None):
 
     with _open_graph_for_write(config_path, db_path) as (graph, config, _):
         indexer = Indexer(graph)
+        all_repos = _build_repo_configs(config)
 
-        # Index SQL repos
-        repos = config.get("repos", {})
         if repo_name:
-            if repo_name not in repos:
+            if repo_name not in all_repos:
                 click.echo(f"Error: repo '{repo_name}' not in config", err=True)
                 sys.exit(1)
-            repos = {repo_name: repos[repo_name]}
+            all_repos = {repo_name: all_repos[repo_name]}
 
-        for name, cfg in repos.items():
-            path, dialect, dialect_overrides = parse_repo_config(cfg, config.get("sql_dialect"))
-            click.echo(f"Indexing {name} ({path}){f' [{dialect}]' if dialect else ''}...")
-            stats = indexer.reindex_repo(
-                name,
-                path,
-                dialect=dialect,
-                dialect_overrides=dialect_overrides,
-            )
-            click.echo(
-                f"  scanned={stats['files_scanned']}, "
-                f"added={stats['files_added']}, "
-                f"changed={stats['files_changed']}, "
-                f"removed={stats['files_removed']}, "
-                f"nodes={stats['nodes_added']}, "
-                f"edges={stats['edges_added']}, "
-                f"column_usage={stats['column_usage_added']}"
-            )
-            if stats.get("parse_errors"):
-                all_parse_errors.extend(stats["parse_errors"])
-
-        # Also index sqlmesh repos from config
-        sqlmesh_repos = config.get("sqlmesh_repos", {})
-        if repo_name:
-            if repo_name in sqlmesh_repos:
-                sqlmesh_repos = {repo_name: sqlmesh_repos[repo_name]}
-            else:
-                sqlmesh_repos = {}
-
-        for name, sm_config in sqlmesh_repos.items():
-            if name.startswith("#"):
+        sql_dialect = config.get("sql_dialect")
+        for name, cfg in all_repos.items():
+            repo_type = cfg["repo_type"]
+            # Skip commented-out dbt/sqlmesh entries from the YAML template
+            if repo_type in ("dbt", "sqlmesh") and name.startswith("#"):
                 continue
-            click.echo(f"Indexing sqlmesh project {name} ({sm_config['project_path']})...")
-            variables: dict[str, str | int] = sm_config.get("variables", {})
-            stats = indexer.reindex_sqlmesh(
-                repo_name=name,
-                project_path=sm_config["project_path"],
-                env_file=sm_config.get("env_file"),
-                variables=variables,
-                dialect=sm_config.get("dialect", "athena"),
-                sqlmesh_command=sm_config.get("sqlmesh_command", "uv run python"),
-            )
-            click.echo(
-                f"  models={stats['models_rendered']}, "
-                f"nodes={stats['nodes_added']}, "
-                f"edges={stats['edges_added']}, "
-                f"column_usage={stats['column_usage_added']}"
-            )
-
-        # Also index dbt repos from config
-        dbt_repos = config.get("dbt_repos", {})
-        if repo_name:
-            if repo_name in dbt_repos:
-                dbt_repos = {repo_name: dbt_repos[repo_name]}
-            else:
-                dbt_repos = {}
-
-        for name, dbt_config in dbt_repos.items():
-            if name.startswith("#"):
-                continue
-            click.echo(f"Indexing dbt project {name} ({dbt_config['project_path']})...")
-            stats = indexer.reindex_dbt(
-                repo_name=name,
-                project_path=dbt_config["project_path"],
-                profiles_dir=dbt_config.get("profiles_dir"),
-                env_file=dbt_config.get("env_file"),
-                target=dbt_config.get("target"),
-                dbt_command=dbt_config.get("dbt_command", "uv run dbt"),
-                dialect=dbt_config.get("dialect"),
-            )
-            click.echo(
-                f"  models={stats['models_compiled']}, "
-                f"nodes={stats['nodes_added']}, "
-                f"edges={stats['edges_added']}, "
-                f"column_usage={stats['column_usage_added']}"
-            )
+            handler = _REINDEX_HANDLERS[repo_type]
+            all_parse_errors.extend(handler(indexer, name, cfg, sql_dialect))
 
     if all_parse_errors:
         click.echo(f"\n{len(all_parse_errors)} parse error(s):", err=True)
@@ -753,6 +684,74 @@ def init_config(fmt: str):
         config_file.write_text(json.dumps(default_config, indent=2))
     click.echo(f"Created config at {config_file}")
     click.echo("Edit it to add your repos, then run: sqlprism reindex")
+
+
+def _reindex_sql_repo(indexer, name: str, cfg: dict, sql_dialect: str | None) -> list[str]:
+    path, dialect, dialect_overrides = parse_repo_config(cfg, sql_dialect)
+    click.echo(f"Indexing {name} ({path}){f' [{dialect}]' if dialect else ''}...")
+    stats = indexer.reindex_repo(
+        name,
+        path,
+        dialect=dialect,
+        dialect_overrides=dialect_overrides,
+    )
+    click.echo(
+        f"  scanned={stats['files_scanned']}, "
+        f"added={stats['files_added']}, "
+        f"changed={stats['files_changed']}, "
+        f"removed={stats['files_removed']}, "
+        f"nodes={stats['nodes_added']}, "
+        f"edges={stats['edges_added']}, "
+        f"column_usage={stats['column_usage_added']}"
+    )
+    return stats.get("parse_errors") or []
+
+
+def _reindex_sqlmesh_repo(indexer, name: str, cfg: dict, _sql_dialect: str | None) -> list[str]:
+    click.echo(f"Indexing sqlmesh project {name} ({cfg['project_path']})...")
+    variables: dict[str, str | int] = cfg.get("variables", {})
+    stats = indexer.reindex_sqlmesh(
+        repo_name=name,
+        project_path=cfg["project_path"],
+        env_file=cfg.get("env_file"),
+        variables=variables,
+        dialect=cfg.get("dialect", "athena"),
+        sqlmesh_command=cfg.get("sqlmesh_command", "uv run python"),
+    )
+    click.echo(
+        f"  models={stats['models_rendered']}, "
+        f"nodes={stats['nodes_added']}, "
+        f"edges={stats['edges_added']}, "
+        f"column_usage={stats['column_usage_added']}"
+    )
+    return []
+
+
+def _reindex_dbt_repo(indexer, name: str, cfg: dict, _sql_dialect: str | None) -> list[str]:
+    click.echo(f"Indexing dbt project {name} ({cfg['project_path']})...")
+    stats = indexer.reindex_dbt(
+        repo_name=name,
+        project_path=cfg["project_path"],
+        profiles_dir=cfg.get("profiles_dir"),
+        env_file=cfg.get("env_file"),
+        target=cfg.get("target"),
+        dbt_command=cfg.get("dbt_command", "uv run dbt"),
+        dialect=cfg.get("dialect"),
+    )
+    click.echo(
+        f"  models={stats['models_compiled']}, "
+        f"nodes={stats['nodes_added']}, "
+        f"edges={stats['edges_added']}, "
+        f"column_usage={stats['column_usage_added']}"
+    )
+    return []
+
+
+_REINDEX_HANDLERS: dict[str, Callable[..., list[str]]] = {
+    "sql": _reindex_sql_repo,
+    "sqlmesh": _reindex_sqlmesh_repo,
+    "dbt": _reindex_dbt_repo,
+}
 
 
 def _build_repo_configs(config: dict) -> dict:
