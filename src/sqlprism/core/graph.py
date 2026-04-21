@@ -2634,6 +2634,10 @@ class GraphDB:
         }
 
         if direction in ("both", "inbound"):
+            # `inserts_into` between a file-stem query and a same-named target
+            # table is a file-authoring edge, not dataflow — filtering when
+            # source.name = target.name drops the self-loop without hiding
+            # legitimate cross-table INSERT dataflow (#127).
             inbound_sql = (
                 f"SELECT n2.name, n2.kind, e.relationship, e.context, "
                 f"f2.path, r2.name as repo_name, n2.line_start, n2.line_end "
@@ -2643,6 +2647,11 @@ class GraphDB:
                 f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
                 f"WHERE e.target_id IN ({placeholders}) "
                 f"AND e.relationship <> 'defines' "
+                f"AND NOT (e.relationship = 'inserts_into' AND EXISTS ("
+                f"  SELECT 1 FROM nodes ns, nodes nt "
+                f"  WHERE ns.node_id = e.source_id AND nt.node_id = e.target_id "
+                f"  AND ns.name = nt.name"
+                f")) "
                 f"LIMIT ? OFFSET ?"
             )
             for r in self._execute_read(inbound_sql, node_ids + [limit, offset]).fetchall():
@@ -2672,6 +2681,11 @@ class GraphDB:
                 f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
                 f"WHERE e.source_id IN ({placeholders}) "
                 f"AND e.relationship <> 'defines' "
+                f"AND NOT (e.relationship = 'inserts_into' AND EXISTS ("
+                f"  SELECT 1 FROM nodes ns, nodes nt "
+                f"  WHERE ns.node_id = e.source_id AND nt.node_id = e.target_id "
+                f"  AND ns.name = nt.name"
+                f")) "
                 f"LIMIT ? OFFSET ?"
             )
             for r in self._execute_read(outbound_sql, node_ids + [limit, offset]).fetchall():
@@ -3057,7 +3071,18 @@ class GraphDB:
         # traversal prevents a model from appearing in its own trace when a
         # start node shares a name with a node that was defined by that
         # model's file (see issue #122).
-        defines_clause = "AND e.relationship <> 'defines'"
+        # inserts_into edges are filtered only when source.name = target.name
+        # — that's the same self-loop class of bug, emitted by the SQL
+        # parser when a file stem collides with the INSERT target. Narrow
+        # filter preserves real cross-table INSERT dataflow (#127).
+        defines_clause = (
+            "AND e.relationship <> 'defines' "
+            "AND NOT (e.relationship = 'inserts_into' AND EXISTS ("
+            "  SELECT 1 FROM nodes ns, nodes nt "
+            "  WHERE ns.node_id = e.source_id AND nt.node_id = e.target_id "
+            "  AND ns.name = nt.name"
+            "))"
+        )
 
         recursive_sql = f"""
         WITH RECURSIVE trace AS (
