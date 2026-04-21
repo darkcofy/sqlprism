@@ -206,6 +206,11 @@ class DbtRenderer:
         # typically multi-MB on real projects.
         manifest = self._load_manifest(project_path)
 
+        # Walk schema.yml once per compile. Shared by the SELECT * catalog
+        # and the post-parse merge that persists `source='schema_yml'`
+        # columns into the graph.
+        schema_yml_per_model = self.extract_schema_yml(project_path)
+
         # Build an effective schema catalog that layers dbt-sourced columns
         # (manifest + schema.yml) over the graph-derived catalog. Needed so
         # SELECT * through CTEs can expand on a fresh index — before any
@@ -218,6 +223,7 @@ class DbtRenderer:
         # schema.yml metadata, not via mid-run in-graph writes.
         effective_schema = self._build_effective_schema(
             project_path, parser, schema_catalog, manifest=manifest,
+            schema_yml_per_model=schema_yml_per_model,
         )
 
         # Only read files for selected models when filtering
@@ -285,6 +291,16 @@ class DbtRenderer:
                 if key not in existing:
                     pr.edges.append(edge)
                     existing.add(key)
+
+        # Merge schema.yml column defs into matching ParseResults so the
+        # `columns` table carries real types (`source='schema_yml'`),
+        # winning over the inferred projection entries the parser emitted
+        # from the CTAS wrap. Source entries that don't align with any
+        # compiled model land in a synthetic ParseResult whose columns
+        # attach to source table nodes created by referencing models.
+        self._merge_schema_yml_into_results(
+            results, schema_yml_per_model, parser,
+        )
 
         return results
 
@@ -488,6 +504,7 @@ class DbtRenderer:
         parser: SqlParser,
         schema_catalog: dict | None,
         manifest: dict | None = None,
+        schema_yml_per_model: dict[str, list[ColumnDefResult]] | None = None,
     ) -> dict[str, dict[str, str]]:
         """Merge dbt-sourced column schemas on top of the graph schema catalog.
 
@@ -502,8 +519,13 @@ class DbtRenderer:
           when the manifest's type is concrete — a ``None`` manifest type
           never clobbers a typed ``schema.yml`` entry. Manifest-only columns
           are added as ``"TEXT"`` so ``SELECT *`` expansion can see them.
+
+        ``schema_yml_per_model`` may be passed pre-parsed to avoid a second
+        disk walk when the caller already ran ``extract_schema_yml``.
         """
-        yml_overlay = self._schema_yml_columns(project_path, parser)
+        yml_overlay = self._schema_yml_columns(
+            project_path, parser, schema_yml_per_model=schema_yml_per_model,
+        )
         manifest_overlay = self._extract_manifest_columns(
             project_path, parser, manifest=manifest,
         )
@@ -619,6 +641,7 @@ class DbtRenderer:
         self,
         project_path: Path,
         parser: SqlParser,
+        schema_yml_per_model: dict[str, list[ColumnDefResult]] | None = None,
     ) -> dict[str, dict[str, str]]:
         """Column schemas from ``schema.yml`` files as a flat catalog.
 
@@ -627,7 +650,11 @@ class DbtRenderer:
         Entries with no columns are dropped so they can't short-circuit the
         ``if not overlays`` guard in ``_build_effective_schema``.
         """
-        per_model = self.extract_schema_yml(project_path)
+        per_model = (
+            schema_yml_per_model
+            if schema_yml_per_model is not None
+            else self.extract_schema_yml(project_path)
+        )
         out: dict[str, dict[str, str]] = {}
         for name, col_defs in per_model.items():
             if not col_defs:
@@ -637,6 +664,107 @@ class DbtRenderer:
             for c in col_defs:
                 bucket[c.column_name] = c.data_type or "TEXT"
         return out
+
+    # Synthetic ParseResult path that carries schema.yml `sources:` column
+    # defs into the graph. A stable key lets `delete_file_data` clean it up
+    # between reindex runs the same way it does for real compiled files.
+    _SCHEMA_YML_SOURCES_PATH = "__schema_yml_sources__.sql"
+
+    def _merge_schema_yml_into_results(
+        self,
+        results: dict[str, ParseResult],
+        schema_yml_per_model: dict[str, list[ColumnDefResult]],
+        parser: SqlParser,
+    ) -> None:
+        """Fold schema.yml ``ColumnDefResult`` entries into the render output.
+
+        For each compiled model, schema.yml entries win per ``column_name``
+        over the inferred projection the parser emitted — concrete types and
+        descriptions replace name-only ``inferred`` rows. Schema.yml source
+        entries (keyed ``source_name.table_name``) get collected into one
+        synthetic ParseResult so their columns persist via the graph
+        fallback in ``Indexer._resolve_column_def_node`` (which resolves to
+        the source table node any referencing model has already created).
+        """
+        if not schema_yml_per_model:
+            return
+
+        # Index compiled results by normalized file stem so schema.yml model
+        # keys (the raw model name) line up with the CTAS-wrapped node the
+        # parser stored.
+        stem_to_result: dict[str, tuple[str, ParseResult]] = {}
+        for rel_path, pr in results.items():
+            stem = Path(rel_path).stem
+            stem_to_result[parser._normalize_identifier(stem)] = (rel_path, pr)
+
+        source_col_defs: list[ColumnDefResult] = []
+
+        for raw_name, col_defs in schema_yml_per_model.items():
+            if not col_defs:
+                continue
+            normalized = parser._normalize_identifier(raw_name)
+
+            match = stem_to_result.get(normalized)
+            if match is not None:
+                _rel, pr = match
+                self._apply_schema_yml_to_parse_result(
+                    pr, node_name=normalized, col_defs=col_defs,
+                )
+                continue
+
+            # Not a compiled model — treat as a source entry. The
+            # extract_schema_yml walker encodes sources as
+            # ``source_name.table_name``; use the table segment as the
+            # physical node name (the parser stored source references
+            # under the identifier, not the source family name).
+            table_name = raw_name.rsplit(".", 1)[-1]
+            node_name = parser._normalize_identifier(table_name)
+            for c in col_defs:
+                source_col_defs.append(
+                    ColumnDefResult(
+                        node_name=node_name,
+                        column_name=c.column_name,
+                        data_type=c.data_type,
+                        position=c.position,
+                        source="schema_yml",
+                        description=c.description,
+                    )
+                )
+
+        if source_col_defs:
+            results[self._SCHEMA_YML_SOURCES_PATH] = ParseResult(
+                language="sql",
+                columns=source_col_defs,
+            )
+
+    @staticmethod
+    def _apply_schema_yml_to_parse_result(
+        pr: ParseResult,
+        node_name: str,
+        col_defs: list[ColumnDefResult],
+    ) -> None:
+        """Replace existing columns on ``node_name`` that collide with schema.yml.
+
+        Schema.yml wins over ``inferred`` rows — a documented type must not
+        be shadowed by a name-only entry the parser emitted from the CTAS
+        projection. Non-colliding entries from either side are preserved.
+        """
+        incoming = {c.column_name for c in col_defs}
+        pr.columns = [
+            c for c in pr.columns
+            if not (c.node_name == node_name and c.column_name in incoming)
+        ]
+        for c in col_defs:
+            pr.columns.append(
+                ColumnDefResult(
+                    node_name=node_name,
+                    column_name=c.column_name,
+                    data_type=c.data_type,
+                    position=c.position,
+                    source="schema_yml",
+                    description=c.description,
+                )
+            )
 
     def _run_dbt_compile(
         self,

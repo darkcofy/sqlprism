@@ -3056,3 +3056,237 @@ def test_insert_parse_result_strips_qualified_column_def_names():
     assert stats["columns_added"] == 1
 
     db.close()
+
+
+# ── #125: dbt ColumnDefResult persistence ──
+
+
+def _build_minimal_dbt_project(
+    repo_dir,
+    *,
+    manifest_nodes: dict | None = None,
+    manifest_sources: dict | None = None,
+    compiled_models: dict[str, str] | None = None,
+    schema_yml_models: str | None = None,
+    schema_yml_sources: str | None = None,
+):
+    """Scaffold a fake compiled dbt project so reindex_dbt can run end-to-end
+    without a real dbt install. Returns the repo_dir."""
+    import json
+
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "dbt_project.yml").write_text("name: my_proj\n")
+    (repo_dir / ".venv").mkdir(exist_ok=True)
+
+    compiled = repo_dir / "target" / "compiled" / "my_proj" / "models"
+    compiled.mkdir(parents=True, exist_ok=True)
+    for rel, sql in (compiled_models or {}).items():
+        target = compiled / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(sql)
+
+    manifest = {
+        "nodes": manifest_nodes or {},
+        "sources": manifest_sources or {},
+    }
+    (repo_dir / "target" / "manifest.json").write_text(json.dumps(manifest))
+
+    models_dir = repo_dir / "models"
+    models_dir.mkdir(exist_ok=True)
+    if schema_yml_models:
+        (models_dir / "schema.yml").write_text(schema_yml_models)
+    if schema_yml_sources:
+        (models_dir / "sources.yml").write_text(schema_yml_sources)
+
+    return repo_dir
+
+
+def test_reindex_dbt_persists_schema_yml_columns(tmp_path):
+    """schema.yml types and descriptions land in the `columns` table for
+    dbt-indexed models, beating the inferred projection emitted by the CTAS
+    wrap so documented types don't get shadowed."""
+    from unittest.mock import MagicMock, patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = _build_minimal_dbt_project(
+        tmp_path / "proj",
+        compiled_models={
+            "staging/orders.sql": "SELECT customer_id, order_id FROM raw.orders",
+        },
+        manifest_nodes={
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "staging/orders.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        schema_yml_models=(
+            "version: 2\n"
+            "models:\n"
+            "  - name: orders\n"
+            "    columns:\n"
+            "      - name: customer_id\n"
+            "        data_type: bigint\n"
+            "        description: The customer reference\n"
+            "      - name: order_id\n"
+            "        data_type: bigint\n"
+        ),
+    )
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        indexer.reindex_dbt(
+            repo_name="proj", project_path=str(repo_dir), dialect="duckdb",
+        )
+
+    rows = db._execute_read(
+        "SELECT n.name, c.column_name, c.data_type, c.source, c.description "
+        "FROM columns c JOIN nodes n ON c.node_id = n.node_id "
+        "JOIN files f ON n.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? AND n.name = ? "
+        "ORDER BY c.column_name",
+        ["proj", "orders"],
+    ).fetchall()
+
+    assert rows == [
+        ("orders", "customer_id", "bigint", "schema_yml", "The customer reference"),
+        ("orders", "order_id", "bigint", "schema_yml", None),
+    ], rows
+
+    db.close()
+
+
+def test_dbt_columns_visible_in_schema_catalog(tmp_path):
+    """GraphDB.get_table_columns returns real schema.yml types for dbt
+    models; CTAS-only columns still appear, but with the `TEXT` fallback
+    since no schema.yml documents them."""
+    from unittest.mock import MagicMock, patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = _build_minimal_dbt_project(
+        tmp_path / "proj",
+        compiled_models={
+            "staging/orders.sql": "SELECT customer_id, order_id FROM raw.orders",
+            "staging/plain.sql": "SELECT only_col FROM raw.foo",
+        },
+        manifest_nodes={
+            "model.my_proj.orders": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "orders",
+                "path": "staging/orders.sql",
+                "depends_on": {"nodes": []},
+            },
+            "model.my_proj.plain": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "plain",
+                "path": "staging/plain.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        schema_yml_models=(
+            "version: 2\n"
+            "models:\n"
+            "  - name: orders\n"
+            "    columns:\n"
+            "      - name: customer_id\n"
+            "        data_type: bigint\n"
+        ),
+    )
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        indexer.reindex_dbt(
+            repo_name="proj", project_path=str(repo_dir), dialect="duckdb",
+        )
+
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["proj"]
+    ).fetchone()[0]
+    catalog = db.get_table_columns(repo_id)
+
+    assert catalog.get("orders", {}).get("customer_id") == "bigint", catalog
+    # CTAS-only column without schema.yml docs falls back to TEXT in the
+    # catalog, but must still be present — inferred emits name-only rows.
+    assert "only_col" in catalog.get("plain", {}), catalog
+    db.close()
+
+
+def test_reindex_dbt_captures_source_columns(tmp_path):
+    """schema.yml source entries attach to the source table node a model
+    references — even without compiled SQL for the source itself, the
+    `columns` table carries its documented columns under source='schema_yml'."""
+    from unittest.mock import MagicMock, patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    repo_dir = _build_minimal_dbt_project(
+        tmp_path / "proj",
+        compiled_models={
+            # A model that references the raw.customers source — gives the
+            # parser a table node the source column defs can attach to.
+            "staging/stg_customers.sql": 'SELECT id FROM "raw"."customers"',
+        },
+        manifest_nodes={
+            "model.my_proj.stg_customers": {
+                "resource_type": "model",
+                "package_name": "my_proj",
+                "name": "stg_customers",
+                "path": "staging/stg_customers.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        schema_yml_sources=(
+            "version: 2\n"
+            "sources:\n"
+            "  - name: raw\n"
+            "    tables:\n"
+            "      - name: customers\n"
+            "        columns:\n"
+            "          - name: id\n"
+            "            data_type: bigint\n"
+            "          - name: email\n"
+            "            data_type: varchar\n"
+        ),
+    )
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        indexer.reindex_dbt(
+            repo_name="proj", project_path=str(repo_dir), dialect="duckdb",
+        )
+
+    rows = db._execute_read(
+        "SELECT c.column_name, c.data_type, c.source "
+        "FROM columns c JOIN nodes n ON c.node_id = n.node_id "
+        "JOIN files f ON n.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? AND n.name = ? "
+        "ORDER BY c.column_name",
+        ["proj", "customers"],
+    ).fetchall()
+
+    assert rows == [
+        ("email", "varchar", "schema_yml"),
+        ("id", "bigint", "schema_yml"),
+    ], rows
+
+    db.close()
