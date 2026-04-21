@@ -1836,7 +1836,7 @@ def test_tag_storage_upsert():
             ("customer_health", "stg_users"),
         ]
 
-        repo_id, name_to_id = _setup_models_with_edges(db, models, edges)
+        repo_id, _name_to_id = _setup_models_with_edges(db, models, edges)
         engine = ConventionEngine(db, repo_id)
         tags = engine.infer_semantic_tags(threshold=0.5)
         assert len(tags) > 0, "Expected at least one tag assignment"
@@ -2079,7 +2079,7 @@ def test_search_by_tag_ranked():
         confidences = [m["confidence"] for m in result["models"]]
         expected = [0.90, 0.85, 0.70, 0.65]
         assert len(confidences) == len(expected)
-        for actual, exp in zip(confidences, expected):
+        for actual, exp in zip(confidences, expected, strict=False):
             assert abs(actual - exp) < 0.01, f"Expected ~{exp}, got {actual}"
 
         for m in result["models"]:

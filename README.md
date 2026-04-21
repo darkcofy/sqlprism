@@ -213,7 +213,7 @@ Full reference: [CLI guide](https://darkcofy.github.io/sqlprism/guide/cli/)
 
 Full reference: [MCP tools guide](https://darkcofy.github.io/sqlprism/guide/mcp-tools/)
 
-When running as an MCP server (`sqlprism serve`), 24 tools are exposed:
+When running as an MCP server (`sqlprism serve`), the following tools are exposed:
 
 | Tool | Description |
 |---|---|
@@ -256,7 +256,7 @@ src/sqlprism/
   core/
     graph.py            <- DuckDB storage layer (MVCC), queries, snippets, repo_type tracking
     indexer.py          <- Orchestrator: scan -> checksum -> parse -> store; file-level reindex with repo-type dispatch
-    mcp_tools.py        <- FastMCP tool definitions (24 tools, non-blocking reindex, per-repo debounce)
+    mcp_tools.py        <- FastMCP tool definitions (non-blocking reindex, per-repo debounce)
     conventions.py      <- Convention inference engine: layers, naming, references, tags, overrides
   cli.py                <- Click CLI: serve, reindex, reindex-file, reindex-sqlmesh, reindex-dbt, conventions, status, init
 ```

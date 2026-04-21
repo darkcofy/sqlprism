@@ -522,7 +522,7 @@ class SqlParser:
             return
 
         seen_scopes = set()
-        for scope in [root_scope] + list(root_scope.traverse()):
+        for scope in [root_scope, *list(root_scope.traverse())]:
             scope_id = id(scope)
             if scope_id in seen_scopes:
                 continue
@@ -1019,7 +1019,7 @@ class SqlParser:
             expression=expr_str if expr_str and expr_str != hop_column else None,
         )
 
-        new_chain = current_chain + [hop]
+        new_chain = [*current_chain, hop]
 
         downstream = node.downstream if hasattr(node, "downstream") else []
         if not downstream:

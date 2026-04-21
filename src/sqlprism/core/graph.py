@@ -34,7 +34,7 @@ import duckdb
 
 logger = logging.getLogger(__name__)
 
-_MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB – skip snippets for oversized files
+_MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB - skip snippets for oversized files
 _EXTEND_SUGGESTION_THRESHOLD = 0.8
 
 # Kinds that are query-local aliases — never a standalone entity a user would
@@ -71,7 +71,8 @@ def _read_file_lines(path: str) -> tuple[str, ...] | None:
         if p.stat().st_size > _MAX_FILE_SIZE:
             return None
         return tuple(p.read_text(errors="replace").splitlines())
-    except Exception:
+    except OSError as e:
+        logger.debug("Could not read %s for snippet extraction: %s", path, e)
         return None
 
 
@@ -873,7 +874,7 @@ class GraphDB:
                 "SELECT n.node_id FROM nodes n "
                 "JOIN files f ON n.file_id = f.file_id "
                 "WHERE n.name = ? AND n.kind = ? AND f.repo_id = ?" + schema_clause + " LIMIT 1",
-                [name, kind, repo_id] + schema_params,
+                [name, kind, repo_id, *schema_params],
             ).fetchone()
             if row:
                 return row[0]
@@ -882,7 +883,7 @@ class GraphDB:
             # 2. Exact kind match cross-repo
             row = self._execute_read(
                 "SELECT n.node_id FROM nodes n WHERE n.name = ? AND n.kind = ?" + schema_clause + " LIMIT 1",
-                [name, kind] + schema_params,
+                [name, kind, *schema_params],
             ).fetchone()
             if row:
                 return row[0]
@@ -899,7 +900,7 @@ class GraphDB:
                 "JOIN files f ON n.file_id = f.file_id "
                 "WHERE n.name = ? AND f.repo_id = ?" + schema_clause
                 + f" ORDER BY (n.kind = ?) DESC, {kind_rank} ASC, n.node_id ASC LIMIT 1",
-                [name, repo_id] + schema_params + [kind],
+                [name, repo_id, *schema_params, kind],
             ).fetchone()
             if row:
                 return row[0]
@@ -912,7 +913,7 @@ class GraphDB:
             "SELECT n.node_id FROM nodes n "
             "WHERE n.name = ? AND n.file_id IS NOT NULL" + schema_clause
             + f" ORDER BY (n.kind = ?) DESC, {kind_rank} ASC, n.node_id ASC LIMIT 1",
-            [name] + schema_params + [kind],
+            [name, *schema_params, kind],
         ).fetchone()
         return row[0] if row else None
 
@@ -1387,7 +1388,7 @@ class GraphDB:
 
         # params duplicated: once for inner subquery, once not needed for outer
         # (outer filters via the IN subquery)
-        rows = self._execute_read(sql, params + [limit, offset]).fetchall()
+        rows = self._execute_read(sql, [*params, limit, offset]).fetchall()
 
         # Group by (output_node, output_column, chain_index) into chains
         chains: dict[tuple[str, str, int], dict] = {}
@@ -1749,7 +1750,7 @@ class GraphDB:
             f"WHERE e.target_id IN ({placeholders}) "
             "AND n2.name <> ? "
             f"AND {self._non_dataflow_edge_filter('e', 'n2', 'nt')}",
-            target_ids + [model],
+            [*target_ids, model],
         ).fetchall()
         all_downstream = [{"name": r[0], "kind": r[1]} for r in ds_rows]
 
@@ -2165,7 +2166,7 @@ class GraphDB:
             seen_cycles.add(canonical)
 
             # Resolve names
-            full_path_ids = node_list + [start_node]
+            full_path_ids = [*node_list, start_node]
             placeholders = ",".join("?" for _ in full_path_ids)
             name_rows = self._execute_read(
                 f"SELECT node_id, name FROM nodes WHERE node_id IN ({placeholders})",
@@ -2322,7 +2323,7 @@ class GraphDB:
 
         Args:
             min_downstream: Minimum downstream (dependents) count to include
-                a node (default 5, clamped 1–100).
+                a node (default 5, clamped 1-100).
             repo: Optional repo name filter.
 
         Returns:
@@ -2680,7 +2681,7 @@ class GraphDB:
                 f"AND {self._non_dataflow_edge_filter('e', 'n2', 'nt')} "
                 f"LIMIT ? OFFSET ?"
             )
-            for r in self._execute_read(inbound_sql, node_ids + [limit, offset]).fetchall():
+            for r in self._execute_read(inbound_sql, [*node_ids, limit, offset]).fetchall():
                 entry = {
                     "name": r[0],
                     "kind": r[1],
@@ -2710,7 +2711,7 @@ class GraphDB:
                 f"AND {self._non_dataflow_edge_filter('e', 'ns', 'n2')} "
                 f"LIMIT ? OFFSET ?"
             )
-            for r in self._execute_read(outbound_sql, node_ids + [limit, offset]).fetchall():
+            for r in self._execute_read(outbound_sql, [*node_ids, limit, offset]).fetchall():
                 entry = {
                     "name": r[0],
                     "kind": r[1],
@@ -2783,7 +2784,7 @@ class GraphDB:
             f"LIMIT ? OFFSET ?"
         )
 
-        rows = self._execute_read(sql, params + [limit, offset]).fetchall()
+        rows = self._execute_read(sql, [*params, limit, offset]).fetchall()
 
         usage = []
         for r in rows:
@@ -2871,7 +2872,7 @@ class GraphDB:
             f"ORDER BY n.name "
             f"LIMIT ? OFFSET ?"
         )
-        rows = self._execute_read(sql, params + [limit, offset]).fetchall()
+        rows = self._execute_read(sql, [*params, limit, offset]).fetchall()
 
         matches = []
         for r in rows:
@@ -3262,7 +3263,7 @@ class GraphDB:
         LIMIT ?
         """
 
-        params: list = [start_name] + seed_kind_params + [max_depth, limit]
+        params: list = [start_name, *seed_kind_params, max_depth, limit]
         rows = self._execute_read(recursive_sql, params).fetchall()
 
         paths: list[dict] = []

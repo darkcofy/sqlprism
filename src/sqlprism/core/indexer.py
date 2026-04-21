@@ -891,7 +891,7 @@ class Indexer:
                 for node in result.nodes
             ]
             node_ids = self.graph.insert_nodes_batch(node_rows)
-            for node, nid in zip(result.nodes, node_ids):
+            for node, nid in zip(result.nodes, node_ids, strict=False):
                 schema = (node.metadata or {}).get("schema") if node.metadata else None
                 node_id_map[(node.name, node.kind, schema)] = nid
             stats["nodes_added"] += len(result.nodes)

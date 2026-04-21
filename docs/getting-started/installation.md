@@ -8,7 +8,7 @@
 ## Install from Source
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/darkcofy/sqlprism.git
 cd sqlprism
 uv sync
 ```

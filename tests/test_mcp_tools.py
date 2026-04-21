@@ -5,6 +5,7 @@ import subprocess
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 import sqlprism.core.mcp_tools as _mcp_mod
 from sqlprism.core.mcp_tools import (
@@ -100,13 +101,13 @@ def test_configure_sets_repo_type_from_config(tmp_path):
 
 def test_search_input_validation_limit_too_low():
     """SearchInput rejects limit < 1."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         SearchInput(pattern="x", limit=0)
 
 
 def test_search_input_validation_limit_too_high():
     """SearchInput rejects limit > 100."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         SearchInput(pattern="x", limit=200)
 
 
@@ -120,17 +121,17 @@ def test_search_input_validation_limit_boundary():
 
 def test_find_references_input_validation_limit():
     """FindReferencesInput rejects limit out of range."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         FindReferencesInput(name="x", limit=0)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         FindReferencesInput(name="x", limit=501)
 
 
 def test_find_column_usage_input_validation_limit():
     """FindColumnUsageInput rejects limit out of range."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         FindColumnUsageInput(table="x", limit=0)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         FindColumnUsageInput(table="x", limit=501)
 
 
@@ -369,9 +370,9 @@ def test_trace_dependencies_not_found(tmp_path):
 
 def test_trace_dependencies_input_validation():
     """TraceDependenciesInput validates max_depth range."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         TraceDependenciesInput(name="x", max_depth=0)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         TraceDependenciesInput(name="x", max_depth=7)
     # Boundary values are accepted
     inp = TraceDependenciesInput(name="x", max_depth=1)
@@ -909,19 +910,19 @@ def test_pr_impact_delta_mode_includes_note(git_repo):
 
 def test_compare_mode_rejects_invalid():
     """PrImpactInput rejects invalid compare_mode values (1.6a)."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         PrImpactInput(base_commit="HEAD", compare_mode="relative")  # type: ignore[invalid-argument-type]
 
 
 def test_find_references_direction_rejects_invalid():
     """FindReferencesInput rejects invalid direction values (1.6b)."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         FindReferencesInput(name="x", direction="upstream")  # type: ignore[invalid-argument-type]
 
 
 def test_trace_dependencies_direction_rejects_invalid():
     """TraceDependenciesInput rejects invalid direction values (1.6c)."""
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         TraceDependenciesInput(name="x", direction="inbound")  # type: ignore[invalid-argument-type]
 
 

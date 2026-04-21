@@ -1,6 +1,6 @@
 # MCP Tools
 
-When running as an MCP server (`sqlprism serve`), 24 tools are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
+When running as an MCP server (`sqlprism serve`), the tools below are exposed. Any MCP client (Claude Code, Claude Desktop, Cursor, Continue.dev) can call these.
 
 ## Query Tools
 

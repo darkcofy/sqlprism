@@ -717,7 +717,7 @@ class ConventionEngine:
         stripped = []
         matching_prefix = 0
         exceptions = []
-        for name, tokens in zip(model_names, tokenized):
+        for name, tokens in zip(model_names, tokenized, strict=False):
             if prefix_tokens and tokens[: len(prefix_tokens)] == prefix_tokens:
                 stripped.append(tokens[len(prefix_tokens) :])
                 matching_prefix += 1
@@ -758,7 +758,7 @@ class ConventionEngine:
             # Models not matching the dominant structure are exceptions
             exceptions = [
                 name
-                for name, tokens in zip(model_names, tokenized)
+                for name, tokens in zip(model_names, tokenized, strict=False)
                 if len(tokens) != most_common_len
             ]
 
@@ -1254,7 +1254,7 @@ class ConventionEngine:
 
         assignments: list[TagAssignment] = []
         for cluster in clusters:
-            tag_name, label_confidence = self._label_cluster(cluster)
+            tag_name, _label_confidence = self._label_cluster(cluster)
             if not tag_name:
                 continue
 
