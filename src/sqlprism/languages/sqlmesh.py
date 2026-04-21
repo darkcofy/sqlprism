@@ -115,6 +115,44 @@ def _split_into_batches(items: list, num_batches: int) -> list[list]:
     return batches
 
 
+def _model_table_keys(model_name: str) -> list[str]:
+    """Schema-catalog keys for a sqlmesh model name.
+
+    Model names arrive quoted (``"demo"."orders"``) or dotted (``demo.orders``).
+    Downstream SQL may reference either the fully-qualified form or the bare
+    base name, so populate both so ``qualify_columns`` resolves in either case.
+    """
+    stripped = model_name.replace('"."', ".").strip('"')
+    base = stripped.rsplit(".", 1)[-1]
+    return [stripped] if stripped == base else [stripped, base]
+
+
+def _merge_column_schemas(
+    base_catalog: dict | None,
+    column_schemas: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    """Layer fresh ``column_schemas`` on top of a base schema catalog.
+
+    Fresh columns win per-column but leave unrelated tables untouched, so
+    ``SELECT *`` expansion sees the current rendered model's columns without
+    forgetting sibling tables already in the graph. Uses copy-on-write so
+    unmodified sibling tables aren't cloned; a warm cross-repo catalog can
+    carry tens of thousands of columns and allocating per render cycle adds up.
+    """
+    if not column_schemas:
+        return dict(base_catalog) if base_catalog else {}
+    out: dict[str, dict[str, str]] = dict(base_catalog) if base_catalog else {}
+    for model_name, cols in column_schemas.items():
+        # A known table with an empty column list confuses
+        # ``sqlglot.optimizer.qualify_columns`` enough to drop lineage entirely.
+        if not cols:
+            continue
+        for key in _model_table_keys(model_name):
+            existing = out.get(key)
+            out[key] = {**existing, **cols} if existing else dict(cols)
+    return out
+
+
 def _parse_model_worker(args: tuple) -> tuple[str, ParseResult]:
     """Worker function for parallel parsing. Must be top-level for pickling."""
     model_name, rendered_sql, dialect, schema_catalog = args
@@ -440,10 +478,11 @@ class SqlMeshRenderer:
         schema_catalog: dict | None,
     ) -> dict[str, ParseResult]:
         """Parse rendered models sequentially (baseline / fallback)."""
+        effective_schema = _merge_column_schemas(schema_catalog, column_schemas)
         results: dict[str, ParseResult] = {}
         for model_name, rendered_sql in models.items():
             clean_name = model_name.strip('"').replace('"."', "/")
-            result = self.sql_parser.parse(clean_name + ".sql", rendered_sql, schema=schema_catalog)
+            result = self.sql_parser.parse(clean_name + ".sql", rendered_sql, schema=effective_schema)
             enrich_nodes(result, "sqlmesh_model", model_name)
 
             if model_name in column_schemas:
@@ -467,9 +506,10 @@ class SqlMeshRenderer:
         """Parse rendered models in parallel using ProcessPoolExecutor."""
         max_workers = min(os.cpu_count() or 1, 8)
         dialect = self.sql_parser.dialect
+        effective_schema = _merge_column_schemas(schema_catalog, column_schemas)
 
         work_items = [
-            (model_name, rendered_sql, dialect, schema_catalog)
+            (model_name, rendered_sql, dialect, effective_schema)
             for model_name, rendered_sql in models.items()
         ]
 
