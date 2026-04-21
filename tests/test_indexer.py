@@ -2766,15 +2766,9 @@ def test_reindex_sqlmesh_cross_repo_select_star_lineage_true_mesh(tmp_path):
         f"expected INT type to survive, got {catalog.get('stg_orders')}"
 
 
-@pytest.mark.xfail(
-    reason="Blocked by #125 — reindex_dbt never produces ColumnDefResult from "
-           "schema.yml / catalog.json, so upstream dbt types can't feed a "
-           "downstream sibling repo's schema catalog. Preserves the dbt-mesh "
-           "regression signal the original #124/#125 xfail carried.",
-    strict=True,
-)
 def test_reindex_dbt_cross_repo_select_star_lineage_true_mesh(tmp_path):
-    """True dbt→sqlmesh mesh — pinned as xfail until #125 persists dbt columns."""
+    """True dbt→sqlmesh mesh — upstream dbt column names reach the downstream
+    schema catalog, so SELECT * through a CTE expands and lineage resolves."""
     import json
     from unittest.mock import MagicMock, patch
 

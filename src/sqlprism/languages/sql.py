@@ -277,11 +277,26 @@ class SqlParser:
                         )
                     )
 
-        # Infer output columns from CREATE VIEW AS SELECT
-        if node_kind == "view" and stmt.expression:
+        # Infer output columns from CREATE ... AS SELECT for both views and
+        # tables (CTAS). dbt compiled SQL wraps every model as
+        # `CREATE TABLE "schema"."name" AS <SELECT>` — without inferring here,
+        # the columns table stays empty for dbt regardless of schema.yml.
+        if stmt.expression and node_kind in ("table", "view"):
             select_expr = stmt.expression
-            if isinstance(select_expr, exp.Select) or isinstance(select_expr, exp.Query):
+            if isinstance(select_expr, (exp.Select, exp.Query)):
+                # Skip names already recorded from the explicit schema clause
+                # (e.g. `CREATE TABLE t (a INT) AS SELECT a, b ...`) so the
+                # declared type isn't shadowed by an `inferred` duplicate.
+                declared = {
+                    c.column_name for c in columns
+                    if c.node_name == name and c.source == "definition"
+                }
+                before = len(columns)
                 self._extract_inferred_columns(select_expr, name, columns)
+                if declared:
+                    columns[before:] = [
+                        c for c in columns[before:] if c.column_name not in declared
+                    ]
 
     def _extract_inferred_columns(
         self,
