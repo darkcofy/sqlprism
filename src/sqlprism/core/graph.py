@@ -856,13 +856,25 @@ class GraphDB:
         if row:
             return row[0]
 
-        # 3. Kind-relaxed: match by name only, prefer real nodes (file_id IS NOT NULL)
+        # 3. Kind-relaxed: match by name only, prefer real nodes (file_id IS NOT NULL).
+        # Secondary rank (when requested kind doesn't match): table > view > query
+        # > source > cte. CTEs are query-local aliases and must never win over a
+        # real node when a user looks up a name without a kind filter.
+        kind_rank_sql = (
+            "CASE n.kind "
+            "WHEN 'table' THEN 0 "
+            "WHEN 'view' THEN 1 "
+            "WHEN 'query' THEN 2 "
+            "WHEN 'source' THEN 3 "
+            "WHEN 'cte' THEN 99 "
+            "ELSE 10 END"
+        )
         if repo_id:
             row = self._execute_read(
                 "SELECT n.node_id FROM nodes n "
                 "JOIN files f ON n.file_id = f.file_id "
                 "WHERE n.name = ? AND f.repo_id = ?" + schema_clause
-                + " ORDER BY (n.kind = ?) DESC LIMIT 1",
+                + f" ORDER BY (n.kind = ?) DESC, {kind_rank_sql} ASC LIMIT 1",
                 [name, repo_id] + schema_params + [kind],
             ).fetchone()
             if row:
@@ -872,7 +884,7 @@ class GraphDB:
         row = self._execute_read(
             "SELECT n.node_id FROM nodes n "
             "WHERE n.name = ? AND n.file_id IS NOT NULL" + schema_clause
-            + " ORDER BY (n.kind = ?) DESC LIMIT 1",
+            + f" ORDER BY (n.kind = ?) DESC, {kind_rank_sql} ASC LIMIT 1",
             [name] + schema_params + [kind],
         ).fetchone()
         return row[0] if row else None
@@ -2575,6 +2587,7 @@ class GraphDB:
                 f"LEFT JOIN files f2 ON n2.file_id = f2.file_id "
                 f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
                 f"WHERE e.target_id IN ({placeholders}) "
+                f"AND e.relationship <> 'defines' "
                 f"LIMIT ? OFFSET ?"
             )
             for r in self._execute_read(inbound_sql, node_ids + [limit, offset]).fetchall():
@@ -2603,6 +2616,7 @@ class GraphDB:
                 f"LEFT JOIN files f2 ON n2.file_id = f2.file_id "
                 f"LEFT JOIN repos r2 ON f2.repo_id = r2.repo_id "
                 f"WHERE e.source_id IN ({placeholders}) "
+                f"AND e.relationship <> 'defines' "
                 f"LIMIT ? OFFSET ?"
             )
             for r in self._execute_read(outbound_sql, node_ids + [limit, offset]).fetchall():
@@ -2825,15 +2839,26 @@ class GraphDB:
             and ``"upstream"`` keys instead of a single ``"paths"``.
         """
         max_depth = max(min(max_depth, 10), 1)
-        # Find starting node(s)
+        # Find starting node(s). When kind is unspecified, drop CTE matches so a
+        # query-local alias never wins over a real model of the same name, and
+        # rank remaining kinds table > view > query > source so the reported
+        # root matches what a user would expect to trace.
         where = ["name = ?"]
         params: list = [name]
         if kind:
             where.append("kind = ?")
             params.append(kind)
+        else:
+            where.append("kind <> 'cte'")
 
         start_nodes = self._execute_read(
-            f"SELECT node_id, name, kind FROM nodes WHERE {' AND '.join(where)}",
+            f"SELECT node_id, name, kind FROM nodes WHERE {' AND '.join(where)} "
+            "ORDER BY CASE kind "
+            "WHEN 'table' THEN 0 "
+            "WHEN 'view' THEN 1 "
+            "WHEN 'query' THEN 2 "
+            "WHEN 'source' THEN 3 "
+            "ELSE 10 END ASC",
             params,
         ).fetchall()
 
@@ -2950,6 +2975,13 @@ class GraphDB:
                 pairs_sql = ", ".join(f"({s}, {t})" for s, t in excluded_id_pairs)
                 exclude_clause = f"AND (e.source_id, e.target_id) NOT IN (VALUES {pairs_sql})"
 
+        # defines edges represent CREATE-statement identity (file_stem query
+        # node -> table/view it defines), not dataflow. Excluding them from
+        # traversal prevents a model from appearing in its own trace when a
+        # start node shares a name with a node that was defined by that
+        # model's file (see issue #122).
+        defines_clause = "AND e.relationship <> 'defines'"
+
         recursive_sql = f"""
         WITH RECURSIVE trace AS (
             SELECT
@@ -2960,6 +2992,7 @@ class GraphDB:
                 ARRAY[e.{source_col}] as path
             FROM edges e
             WHERE e.{source_col} = ?
+            {defines_clause}
             {exclude_clause}
 
             UNION ALL
@@ -2974,6 +3007,7 @@ class GraphDB:
             JOIN trace t ON e.{source_col} = t.node_id
             WHERE t.depth < ?
             AND NOT array_contains(t.path, e.{target_col})
+            {defines_clause}
             {exclude_clause}
         )
         SELECT DISTINCT

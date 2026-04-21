@@ -304,7 +304,7 @@ def test_trace_dependencies_downstream(tmp_path):
 
 
 def test_trace_dependencies_upstream(tmp_path):
-    """trace_dependencies follows upstream references."""
+    """trace_dependencies follows upstream references (non-defines edges)."""
     repo_dir = tmp_path / "trace_up_repo"
     repo_dir.mkdir()
     (repo_dir / "orders.sql").write_text("CREATE TABLE orders (id INT, amount DECIMAL)")
@@ -320,10 +320,11 @@ def test_trace_dependencies_upstream(tmp_path):
     indexer = _get_indexer()
     indexer.reindex_repo("test", str(repo_dir))
 
-    # Edge: summary(query) -[defines]-> order_summary(view)
-    # Upstream from order_summary finds the defining query node.
+    # Upstream from orders (table) traverses the real references edge:
+    # summary(query) -[references]-> orders(table). The defines edge from
+    # summary(query) -> order_summary(view) is intentionally excluded per #122.
     result = asyncio.run(
-        trace_dependencies(TraceDependenciesInput(name="order_summary", direction="upstream", max_depth=3))
+        trace_dependencies(TraceDependenciesInput(name="orders", direction="upstream", max_depth=3))
     )
     assert result["root"] is not None
     assert len(result["paths"]) >= 1

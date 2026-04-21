@@ -1523,3 +1523,124 @@ def test_trace_max_depth_boundary():
     db.close()
 
 
+def _build_cte_alias_graph():
+    """Simulate a dbt-compiled model whose file stem is also a CTE alias.
+
+    Mirrors jaffle-mesh finance/orders.sql where ``orders`` exists as:
+      - query (file stem, the CREATE wrapper)
+      - table (the CREATEd target)
+      - cte (the first CTE in the WITH clause that reads from stg_orders)
+
+    Edges mirror the SQL parser's convention
+    (``source_name = file_stem``, ``target_name = referenced_table``):
+
+      orders (query)      -[defines]->        orders (table)       # CREATE wrap
+      orders (query)      -[references]->     stg_orders (table)   # orders.sql FROM stg_orders
+      orders (cte)        -[cte_references]-> stg_orders (table)
+      order_items (query) -[references]->     orders (table)       # a separate model reads orders
+    """
+    db = GraphDB()
+    repo_id = db.upsert_repo("cte-alias-repo", "/tmp/cte-alias")
+    orders_file = db.insert_file(repo_id, "orders.sql", "sql", "cte-alias-123")
+    items_file = db.insert_file(repo_id, "order_items.sql", "sql", "items-456")
+
+    orders_query = db.insert_node(orders_file, "query", "orders", "sql")
+    orders_table = db.insert_node(orders_file, "table", "orders", "sql")
+    orders_cte = db.insert_node(orders_file, "cte", "orders", "sql")
+    stg_orders = db.insert_node(orders_file, "table", "stg_orders", "sql")
+    items_query = db.insert_node(items_file, "query", "order_items", "sql")
+
+    db.insert_edge(orders_query, orders_table, "defines", "CREATE statement")
+    db.insert_edge(orders_query, stg_orders, "references")
+    db.insert_edge(orders_cte, stg_orders, "cte_references")
+    db.insert_edge(items_query, orders_table, "references")
+    return db
+
+
+def test_trace_prefers_table_root_over_cte():
+    """Issue #122: query_trace without kind picks table as root, not cte."""
+    db = _build_cte_alias_graph()
+
+    result = db.query_trace("orders", direction="downstream", max_depth=3)
+
+    _assert_trace_structure(result)
+    assert result["root"] == {"name": "orders", "kind": "table"}
+    db.close()
+
+
+def test_trace_excludes_self_via_defines_edge():
+    """Issue #122: orders (model) does not appear in its own downstream trace."""
+    db = _build_cte_alias_graph()
+
+    result = db.query_trace("orders", direction="downstream", max_depth=5)
+
+    names = {p["name"] for p in result["paths"]}
+    # orders itself must not appear — the defines edge is identity, not dataflow,
+    # and a query-local CTE alias must not pull the CREATE target back in.
+    assert "orders" not in names
+    db.close()
+
+
+def test_trace_upstream_excludes_self_via_defines_edge():
+    """Issue #122: upstream trace also filters the defines edge."""
+    db = _build_cte_alias_graph()
+
+    result = db.query_trace("orders", direction="upstream", max_depth=5)
+
+    names = {p["name"] for p in result["paths"]}
+    assert "orders" not in names
+    db.close()
+
+
+def test_references_excludes_defines_edge():
+    """Issue #122: query_references skips defines edges in both directions."""
+    db = _build_cte_alias_graph()
+
+    result = db.query_references("orders", kind="table", include_snippets=False)
+
+    inbound_rels = {e["relationship"] for e in result["inbound"]}
+    outbound_rels = {e["relationship"] for e in result["outbound"]}
+    assert "defines" not in inbound_rels
+    assert "defines" not in outbound_rels
+    # Non-defines inbound references still surface (order_items model reads orders)
+    inbound_names = {e["name"] for e in result["inbound"]}
+    assert "order_items" in inbound_names
+    db.close()
+
+
+def test_trace_explicit_cte_kind_still_works():
+    """Asking for kind='cte' explicitly traces from the CTE node."""
+    db = _build_cte_alias_graph()
+
+    result = db.query_trace("orders", kind="cte", direction="downstream", max_depth=3)
+
+    _assert_trace_structure(result)
+    assert result["root"] == {"name": "orders", "kind": "cte"}
+    # The CTE references stg_orders via cte_references — still surfaces.
+    names = {p["name"] for p in result["paths"]}
+    assert "stg_orders" in names
+    db.close()
+
+
+def test_resolve_node_fallback_prefers_table_over_cte():
+    """Issue #122: kind-relaxed fallback ranks table > view > query > cte."""
+    db = GraphDB()
+    repo_id = db.upsert_repo("rank-repo", "/tmp/rank")
+    file_id = db.insert_file(repo_id, "orders.sql", "sql", "rank-123")
+
+    # Insert cte first to prove ordering is not insertion-order dependent.
+    db.insert_node(file_id, "cte", "orders", "sql")
+    query_id = db.insert_node(file_id, "query", "orders", "sql")
+    view_id = db.insert_node(file_id, "view", "orders", "sql")
+    table_id = db.insert_node(file_id, "table", "orders", "sql")
+
+    # Requested kind 'source' doesn't exist here, forcing the kind-relaxed
+    # secondary rank to decide: table > view > query > cte.
+    assert db.resolve_node("orders", "source", repo_id) == table_id
+    # Cross-repo fallback path (no repo_id) follows the same ordering.
+    assert db.resolve_node("orders", "source") == table_id
+    # Requested kind takes precedence over the secondary rank.
+    assert db.resolve_node("orders", "view", repo_id) == view_id
+    assert db.resolve_node("orders", "query", repo_id) == query_id
+    db.close()
+
