@@ -37,6 +37,27 @@ logger = logging.getLogger(__name__)
 _MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB – skip snippets for oversized files
 _EXTEND_SUGGESTION_THRESHOLD = 0.8
 
+# Kinds that are query-local aliases — never a standalone entity a user would
+# trace or resolve. When `kind` is unspecified, these are excluded from trace
+# start-nodes and ranked last in `resolve_node`'s kind-relaxed fallback.
+_QUERY_LOCAL_KINDS = ("cte", "subquery")
+
+# Rank expression applied to a kind column to prefer real models over
+# query-local aliases. Lower rank wins in ``ORDER BY ... ASC``. Used by both
+# ``resolve_node`` and ``query_trace`` so the policy lives in one place. The
+# caller supplies the column reference (e.g. ``"n.kind"`` or ``"kind"``) so the
+# fragment composes with any query shape.
+def _kind_rank_sql(col: str) -> str:
+    return (
+        f"CASE {col} "
+        "WHEN 'table' THEN 0 "
+        "WHEN 'view' THEN 1 "
+        "WHEN 'query' THEN 2 "
+        "WHEN 'cte' THEN 99 "
+        "WHEN 'subquery' THEN 99 "
+        "ELSE 10 END"
+    )
+
 
 @lru_cache(maxsize=128)
 def _read_file_lines(path: str) -> tuple[str, ...] | None:
@@ -819,6 +840,10 @@ class GraphDB:
         The kind-relaxed fallback handles the common case where a SQL
         reference uses ``target_kind="table"`` but the actual node was
         indexed as ``"query"`` or ``"view"`` (e.g. sqlmesh/dbt models).
+        Within the fallback, non-matching kinds are ranked
+        ``table > view > query`` and query-local aliases (``cte``,
+        ``subquery``) are placed last so a real node always beats an alias
+        sharing the same name.
 
         Args:
             name: Unqualified entity name.
@@ -857,24 +882,17 @@ class GraphDB:
             return row[0]
 
         # 3. Kind-relaxed: match by name only, prefer real nodes (file_id IS NOT NULL).
-        # Secondary rank (when requested kind doesn't match): table > view > query
-        # > source > cte. CTEs are query-local aliases and must never win over a
-        # real node when a user looks up a name without a kind filter.
-        kind_rank_sql = (
-            "CASE n.kind "
-            "WHEN 'table' THEN 0 "
-            "WHEN 'view' THEN 1 "
-            "WHEN 'query' THEN 2 "
-            "WHEN 'source' THEN 3 "
-            "WHEN 'cte' THEN 99 "
-            "ELSE 10 END"
-        )
+        # Secondary rank (when requested kind doesn't match): table > view > query;
+        # CTEs and subqueries are query-local aliases and must never win over a
+        # real node when a user looks up a name without a kind filter. A final
+        # node_id tiebreaker keeps ordering deterministic across runs.
+        kind_rank = _kind_rank_sql("n.kind")
         if repo_id:
             row = self._execute_read(
                 "SELECT n.node_id FROM nodes n "
                 "JOIN files f ON n.file_id = f.file_id "
                 "WHERE n.name = ? AND f.repo_id = ?" + schema_clause
-                + f" ORDER BY (n.kind = ?) DESC, {kind_rank_sql} ASC LIMIT 1",
+                + f" ORDER BY (n.kind = ?) DESC, {kind_rank} ASC, n.node_id ASC LIMIT 1",
                 [name, repo_id] + schema_params + [kind],
             ).fetchone()
             if row:
@@ -884,7 +902,7 @@ class GraphDB:
         row = self._execute_read(
             "SELECT n.node_id FROM nodes n "
             "WHERE n.name = ? AND n.file_id IS NOT NULL" + schema_clause
-            + f" ORDER BY (n.kind = ?) DESC, {kind_rank_sql} ASC LIMIT 1",
+            + f" ORDER BY (n.kind = ?) DESC, {kind_rank} ASC, n.node_id ASC LIMIT 1",
             [name] + schema_params + [kind],
         ).fetchone()
         return row[0] if row else None
@@ -2535,6 +2553,14 @@ class GraphDB:
     ) -> dict:
         """Find all references to/from a named entity.
 
+        ``defines`` edges are never surfaced in either direction — they
+        represent CREATE-statement identity (the file-stem query node
+        paired with the table/view it declares), not a real reference.
+        Treating them as references would make a model appear to
+        "reference itself" via its own CREATE wrapper (issue #122).
+        Callers that need to locate the defining file should query the
+        edges table directly.
+
         Args:
             name: Entity name to look up.
             kind: Optional node kind filter.
@@ -2801,6 +2827,41 @@ class GraphDB:
 
         return {"matches": matches, "total_count": total}
 
+    def _find_trace_start_nodes(self, name: str, kind: str | None) -> list:
+        """Resolve trace start nodes for ``name``, ordered by kind preference.
+
+        When ``kind`` is specified, only nodes of that kind match. When it
+        is unspecified, query-local aliases (``cte``, ``subquery``) are
+        excluded so a real model always becomes the reported root. If the
+        filtered query returns nothing, the call falls back to matching
+        aliases so a user tracing a CTE-only name still gets a result.
+        Rows are ordered by ``_kind_rank_sql`` then ``node_id`` for
+        determinism.
+
+        Returns ``(node_id, name, kind)`` rows in preference order.
+        """
+        rank = _kind_rank_sql("kind")
+        base_sql = (
+            f"SELECT node_id, name, kind FROM nodes WHERE name = ? {{extra}} "
+            f"ORDER BY {rank} ASC, node_id ASC"
+        )
+        if kind:
+            return self._execute_read(
+                base_sql.format(extra="AND kind = ?"), [name, kind]
+            ).fetchall()
+
+        placeholders = ",".join("?" * len(_QUERY_LOCAL_KINDS))
+        rows = self._execute_read(
+            base_sql.format(extra=f"AND kind NOT IN ({placeholders})"),
+            [name, *_QUERY_LOCAL_KINDS],
+        ).fetchall()
+        if rows:
+            return rows
+
+        # Fallback: name matches only query-local aliases. Return them so the
+        # user still gets a trace from what exists rather than a silent empty.
+        return self._execute_read(base_sql.format(extra=""), [name]).fetchall()
+
     def query_trace(
         self,
         name: str,
@@ -2813,6 +2874,15 @@ class GraphDB:
         exclude_edges: set[tuple[str, str]] | None = None,
     ) -> dict:
         """Trace multi-hop dependency chains via DuckPGQ or recursive CTE.
+
+        When ``kind`` is unspecified, query-local aliases (``cte``,
+        ``subquery``) are excluded from start-node candidates so a
+        within-query alias never becomes the reported root. If the name
+        only resolves to such aliases (no real table/view/query exists),
+        the call falls back to the alias match so the user still gets a
+        trace. ``defines`` edges are never followed — they represent
+        CREATE identity, not dataflow, and would otherwise pull a
+        model's own file-stem query back into its trace (issue #122).
 
         Args:
             name: Starting entity name.
@@ -2839,29 +2909,7 @@ class GraphDB:
             and ``"upstream"`` keys instead of a single ``"paths"``.
         """
         max_depth = max(min(max_depth, 10), 1)
-        # Find starting node(s). When kind is unspecified, drop CTE matches so a
-        # query-local alias never wins over a real model of the same name, and
-        # rank remaining kinds table > view > query > source so the reported
-        # root matches what a user would expect to trace.
-        where = ["name = ?"]
-        params: list = [name]
-        if kind:
-            where.append("kind = ?")
-            params.append(kind)
-        else:
-            where.append("kind <> 'cte'")
-
-        start_nodes = self._execute_read(
-            f"SELECT node_id, name, kind FROM nodes WHERE {' AND '.join(where)} "
-            "ORDER BY CASE kind "
-            "WHEN 'table' THEN 0 "
-            "WHEN 'view' THEN 1 "
-            "WHEN 'query' THEN 2 "
-            "WHEN 'source' THEN 3 "
-            "ELSE 10 END ASC",
-            params,
-        ).fetchall()
-
+        start_nodes = self._find_trace_start_nodes(name, kind)
         if not start_nodes:
             return {"root": None, "paths": [], "depth_summary": {}, "repos_affected": []}
 
