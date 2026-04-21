@@ -974,21 +974,33 @@ class Indexer:
 
         # ── Batch insert column definitions ──
         if result.columns:
+            # sqlmesh emits fully-qualified quoted names like
+            # '"platform"."stg_orders"', but the parser stores the bare base
+            # name. Normalise so both forms resolve to the same node.
+            # ``query`` is included because rendered sqlmesh models are bare
+            # ``SELECT`` statements — the file-level node ends up as kind=query.
+            allowed_kinds = ("table", "view", "source", "query")
             col_rows = []
             for col_def in result.columns:
-                # Try to resolve node_id from local map (table/view only, matching kind)
+                raw_name = col_def.node_name
+                base_name = raw_name.replace('"."', ".").strip('"').rsplit(".", 1)[-1]
+                candidates = [base_name] if base_name == raw_name else [base_name, raw_name]
                 node_id = None
-                for key, nid in node_id_map.items():
-                    if key[0] == col_def.node_name and key[1] in ("table", "view", "source"):
-                        node_id = nid
+                for name in candidates:
+                    for key, nid in node_id_map.items():
+                        if key[0] == name and key[1] in allowed_kinds:
+                            node_id = nid
+                            break
+                    if node_id:
                         break
-                # Fall back to graph resolution
                 if not node_id:
-                    node_id = self.graph.resolve_node(col_def.node_name, "table", repo_id)
-                if not node_id:
-                    node_id = self.graph.resolve_node(col_def.node_name, "view", repo_id)
-                if not node_id:
-                    node_id = self.graph.resolve_node(col_def.node_name, "source", repo_id)
+                    for name in candidates:
+                        for kind in allowed_kinds:
+                            node_id = self.graph.resolve_node(name, kind, repo_id)
+                            if node_id:
+                                break
+                        if node_id:
+                            break
                 if not node_id:
                     logger.warning(
                         "Column def skipped: cannot resolve node '%s' for column '%s'",
