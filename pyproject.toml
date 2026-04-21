@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqlprism"
-version = "1.2.1"
+version = "1.2.2"
 description = "SQL codebase indexer with column-level lineage, impact analysis, and MCP server support"
 license = "Apache-2.0"
 requires-python = ">=3.11"

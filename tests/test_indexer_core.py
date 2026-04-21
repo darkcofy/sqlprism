@@ -16,9 +16,9 @@ from sqlprism.types import (
 
 
 def test_version_string():
-    """Verify package version is 1.2.1."""
+    """Verify package version is 1.2.2."""
     version = importlib.metadata.version("sqlprism")
-    assert version == "1.2.1"
+    assert version == "1.2.2"
 
 
 def test_resolve_dialect_no_overrides():
