@@ -126,6 +126,104 @@ def test_cross_repo_pr_impact():
         db.close()
 
 
+def _build_jaffle_mesh_graph():
+    """Simulate a dbt-mesh graph where each consumer file holds a local *shadow*
+    node for every cross-project ref it emits — reproducing the on-disk state
+    produced by indexing jaffle-mesh (issue #131).
+
+    Topology:
+        platform.stg_order_items     ← real producer
+        finance.order_items.sql      defines order_items, refs stg_order_items (shadow in finance)
+        finance.orders.sql           defines orders, refs order_items (shadow in finance)
+        marketing.customers.sql      defines customers, refs orders AND order_items (shadows in marketing)
+
+    Each consumer file stores a local node for the ref target; the edge from
+    that file's file-level query node points at the *local* shadow, never at
+    the defining node in another repo. Pre-fix, trace from the producer
+    terminates inside finance and never reaches marketing.
+    """
+    db = GraphDB()
+    platform = db.upsert_repo("platform", "/tmp/platform", repo_type="dbt")
+    finance = db.upsert_repo("finance", "/tmp/finance", repo_type="dbt")
+    marketing = db.upsert_repo("marketing", "/tmp/marketing", repo_type="dbt")
+
+    # platform: the real producer. File-level query node whose stem matches.
+    platform_file = db.insert_file(platform, "models/stg_order_items.sql", "sql", "h1")
+    db.insert_node(platform_file, "query", "stg_order_items", "sql")
+
+    # finance/order_items.sql → refs stg_order_items (local shadow)
+    fin_oi_file = db.insert_file(finance, "models/order_items.sql", "sql", "h2")
+    fin_oi = db.insert_node(fin_oi_file, "query", "order_items", "sql")
+    fin_stg_shadow = db.insert_node(fin_oi_file, "table", "stg_order_items", "sql")
+    db.insert_edge(fin_oi, fin_stg_shadow, "references")
+
+    # finance/orders.sql → refs order_items (local shadow)
+    fin_o_file = db.insert_file(finance, "models/orders.sql", "sql", "h3")
+    fin_o = db.insert_node(fin_o_file, "query", "orders", "sql")
+    fin_oi_shadow = db.insert_node(fin_o_file, "table", "order_items", "sql")
+    db.insert_edge(fin_o, fin_oi_shadow, "references")
+
+    # marketing/customers.sql → refs orders + order_items (both shadows,
+    # lifting the cross-project deps into the marketing graph only)
+    mkt_c_file = db.insert_file(marketing, "models/customers.sql", "sql", "h4")
+    mkt_c = db.insert_node(mkt_c_file, "query", "customers", "sql")
+    mkt_o_shadow = db.insert_node(mkt_c_file, "table", "orders", "sql")
+    mkt_oi_shadow = db.insert_node(mkt_c_file, "table", "order_items", "sql")
+    db.insert_edge(mkt_c, mkt_o_shadow, "references")
+    db.insert_edge(mkt_c, mkt_oi_shadow, "references")
+
+    return db
+
+
+def test_cross_repo_trace_through_shadow_nodes():
+    """Upstream trace from a producer must walk through consumer-repo shadows.
+
+    Regression for #131: marketing/customers.sql references finance.orders via
+    a local shadow node `orders` in marketing. Pre-fix, the walk from
+    stg_order_items stopped inside finance. Post-fix, same-name shadows
+    teleport the walk into marketing so customers shows up.
+    """
+    db = _build_jaffle_mesh_graph()
+    try:
+        result = db.query_trace("stg_order_items", direction="upstream", max_depth=5)
+
+        path_names = [step["name"] for step in result["paths"]]
+        assert "order_items" in path_names
+        assert "orders" in path_names
+        assert "customers" in path_names, (
+            f"expected marketing.customers to surface via shadow hop, got {path_names}"
+        )
+
+        assert "finance" in result["repos_affected"]
+        assert "marketing" in result["repos_affected"]
+    finally:
+        db.close()
+
+
+def test_cross_repo_check_impact_finds_shadow_consumers():
+    """check_impact on a producer must report consumers that only touch a shadow.
+
+    Finance's order_items references stg_order_items via a local shadow; marketing's
+    customers references orders via a local shadow. Pre-fix, filtering by the
+    producer's repo (platform) missed downstream consumers entirely.
+    """
+    db = _build_jaffle_mesh_graph()
+    try:
+        result = db.query_check_impact(
+            "stg_order_items",
+            [{"action": "add_column", "column": "new_col"}],
+            repo="platform",
+        )
+
+        assert result["model_found"] is True
+        safe_names = {entry["model"] for entry in result["impacts"][0]["safe"]}
+        assert "order_items" in safe_names, (
+            f"expected finance.order_items to appear via shadow edge, got {safe_names}"
+        )
+    finally:
+        db.close()
+
+
 def test_single_repo_no_cross_repo_edges():
     """Single-repo graph has zero cross-repo edges and no name collisions."""
     db = GraphDB()
