@@ -2594,6 +2594,42 @@ def test_get_cross_repo_columns_merges_other_repos(tmp_path):
     assert "local_t" in catalog, "current repo columns remain present"
 
 
+def test_get_cross_repo_columns_current_repo_wins(tmp_path):
+    """When two repos define the same table, the *current* repo's type wins.
+
+    The docstring promises local definitions take precedence over cross-repo
+    siblings; pin that guarantee so a future refactor can't silently invert
+    the overlay order.
+    """
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    (sibling / "shared.sql").write_text(
+        "CREATE TABLE shared_t (id VARCHAR(64))"  # sibling has VARCHAR
+    )
+    indexer.reindex_repo("sibling", str(sibling))
+
+    current = tmp_path / "current"
+    current.mkdir()
+    (current / "shared.sql").write_text(
+        "CREATE TABLE shared_t (id BIGINT)"  # current has BIGINT
+    )
+    indexer.reindex_repo("current", str(current))
+
+    current_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["current"]
+    ).fetchone()[0]
+
+    catalog = db.get_cross_repo_columns(current_id)
+    assert "BIGINT" in catalog["shared_t"]["id"].upper(), \
+        f"current repo's BIGINT should win over sibling's VARCHAR, got {catalog['shared_t']}"
+
+
 def test_reindex_sqlmesh_select_star_lineage_single_repo(tmp_path):
     """SELECT * through a CTE resolves on a fresh index using column_schemas."""
     from sqlprism.core.graph import GraphDB
@@ -2617,25 +2653,28 @@ def test_reindex_sqlmesh_select_star_lineage_single_repo(tmp_path):
         indexer.reindex_sqlmesh("demo", tmp_path)
 
     # Pull column_lineage for the orders model: it should trace customer_id
-    # back to stg_orders via the wrapped CTE.
+    # back to stg_orders.customer_id (not just the table, but the exact column
+    # — a regression resolving to ``*`` would otherwise pass).
     rows = db._execute_read(
-        "SELECT DISTINCT hop_table "
+        "SELECT DISTINCT hop_table, hop_column "
         "FROM column_lineage cl "
         "JOIN files f ON cl.file_id = f.file_id "
         "JOIN repos r ON f.repo_id = r.repo_id "
         "WHERE r.name = ? AND cl.output_node = ? AND cl.output_column = ?",
         ["demo", "orders", "customer_id"],
     ).fetchall()
-    tables = {r[0] for r in rows}
-    assert "stg_orders" in tables, f"expected stg_orders in chain, got {tables}"
+    hops = {(r[0], r[1]) for r in rows}
+    assert ("stg_orders", "customer_id") in hops, \
+        f"expected (stg_orders, customer_id) in chain, got {hops}"
 
 
-def test_reindex_sqlmesh_cross_repo_select_star_lineage(tmp_path):
-    """Downstream repo resolves SELECT * through an upstream sibling repo.
+def test_reindex_sqlmesh_cross_repo_select_star_lineage_via_sql_upstream(tmp_path):
+    """Downstream sqlmesh repo resolves SELECT * through a plain-SQL sibling.
 
-    Mirrors the jaffle-mesh acceptance criterion: index platform first, then
-    finance; tracing customer_id on the finance model should hop back to the
-    platform-owned stg_orders.
+    Covers the cross-repo catalog plumbing. NOTE: upstream is plain SQL with
+    explicit CREATE TABLE column types — the supported path today. The true
+    dbt→dbt and sqlmesh→sqlmesh mesh shapes require the column-persistence
+    fixes tracked in #124 / #125; an xfail companion below pins that gap.
     """
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
@@ -2643,7 +2682,6 @@ def test_reindex_sqlmesh_cross_repo_select_star_lineage(tmp_path):
     db = GraphDB(":memory:")
     indexer = Indexer(db)
 
-    # --- upstream repo (platform) — plain SQL with explicit CREATE TABLE ---
     upstream_path = tmp_path / "platform"
     upstream_path.mkdir()
     (upstream_path / "stg_orders.sql").write_text(
@@ -2651,7 +2689,6 @@ def test_reindex_sqlmesh_cross_repo_select_star_lineage(tmp_path):
     )
     indexer.reindex_repo("platform", str(upstream_path))
 
-    # --- downstream repo (finance) — refers to stg_orders via SELECT * CTE ---
     downstream_path = tmp_path / "finance"
     downstream_path.mkdir()
     downstream_models = {
@@ -2664,12 +2701,112 @@ def test_reindex_sqlmesh_cross_repo_select_star_lineage(tmp_path):
         indexer.reindex_sqlmesh("finance", downstream_path)
 
     rows = db._execute_read(
-        "SELECT DISTINCT hop_table "
+        "SELECT DISTINCT hop_table, hop_column "
         "FROM column_lineage cl "
         "JOIN files f ON cl.file_id = f.file_id "
         "JOIN repos r ON f.repo_id = r.repo_id "
         "WHERE r.name = ? AND cl.output_node = ? AND cl.output_column = ?",
         ["finance", "orders", "customer_id"],
     ).fetchall()
-    tables = {r[0] for r in rows}
-    assert "stg_orders" in tables, f"expected stg_orders in chain, got {tables}"
+    hops = {(r[0], r[1]) for r in rows}
+    assert ("stg_orders", "customer_id") in hops, \
+        f"expected (stg_orders, customer_id) in chain, got {hops}"
+
+
+@pytest.mark.xfail(
+    reason="Blocked by #124 (sqlmesh column defs dropped on insert) and #125 "
+           "(dbt column defs never produced). The in-parse schema catalog "
+           "doesn't reach a sibling repo through the graph until columns are "
+           "persisted on the upstream side.",
+    strict=True,
+)
+def test_reindex_sqlmesh_cross_repo_select_star_lineage_true_mesh(tmp_path):
+    """True sqlmesh→sqlmesh mesh — pinned as xfail until #124 persists columns."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    upstream_path = tmp_path / "platform"
+    upstream_path.mkdir()
+    upstream_models = {
+        '"platform"."stg_orders"': "SELECT customer_id, order_id FROM raw.orders",
+    }
+    upstream_schemas = {
+        '"platform"."stg_orders"': {"customer_id": "INT", "order_id": "INT"},
+    }
+    with _mock_render_raw(indexer, upstream_models, upstream_schemas):
+        indexer.reindex_sqlmesh("platform", upstream_path)
+
+    downstream_path = tmp_path / "finance"
+    downstream_path.mkdir()
+    downstream_models = {
+        '"finance"."orders"': (
+            "WITH orders AS (SELECT * FROM stg_orders) "
+            "SELECT customer_id FROM orders"
+        ),
+    }
+    with _mock_render_raw(indexer, downstream_models, {}):
+        indexer.reindex_sqlmesh("finance", downstream_path)
+
+    rows = db._execute_read(
+        "SELECT DISTINCT hop_table, hop_column "
+        "FROM column_lineage cl "
+        "JOIN files f ON cl.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? AND cl.output_node = ? AND cl.output_column = ?",
+        ["finance", "orders", "customer_id"],
+    ).fetchall()
+    hops = {(r[0], r[1]) for r in rows}
+    assert ("stg_orders", "customer_id") in hops, \
+        f"expected (stg_orders, customer_id) in chain, got {hops}"
+
+
+async def test_trace_column_lineage_mcp_tool_traverses_select_star(tmp_path):
+    """AC #1: the MCP ``trace_column_lineage`` tool (not just the raw table)
+    returns hops through the SELECT * CTE — exercising the public interface
+    users actually call.
+    """
+    from sqlprism.core import mcp_tools
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+    from sqlprism.core.mcp_tools import TraceColumnLineageInput, trace_column_lineage
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    upstream_path = tmp_path / "platform"
+    upstream_path.mkdir()
+    (upstream_path / "stg_orders.sql").write_text(
+        "CREATE TABLE stg_orders (customer_id INT, order_id INT)"
+    )
+    indexer.reindex_repo("platform", str(upstream_path))
+
+    downstream_path = tmp_path / "finance"
+    downstream_path.mkdir()
+    downstream_models = {
+        '"finance"."orders"': (
+            "WITH orders AS (SELECT * FROM stg_orders) "
+            "SELECT customer_id FROM orders"
+        ),
+    }
+    with _mock_render_raw(indexer, downstream_models, {}):
+        indexer.reindex_sqlmesh("finance", downstream_path)
+
+    # Point the MCP tool at our in-memory graph for this invocation.
+    prior_state = mcp_tools._state
+    mcp_tools._state = mcp_tools._ServerState(graph=db, indexer=indexer, config={})
+    try:
+        result = await trace_column_lineage(TraceColumnLineageInput(
+            table="orders", column="customer_id"
+        ))
+    finally:
+        mcp_tools._state = prior_state
+
+    # Result shape is implementation-defined; just verify it serializes to
+    # something containing the expected upstream column somewhere in the
+    # traversal. Flatten via repr so we're robust to dict/list nesting.
+    payload = repr(result)
+    assert "stg_orders" in payload, f"stg_orders missing from trace: {payload}"
+    assert "customer_id" in payload, f"customer_id missing from trace: {payload}"

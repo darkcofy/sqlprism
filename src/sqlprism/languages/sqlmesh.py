@@ -124,7 +124,7 @@ def _model_table_keys(model_name: str) -> list[str]:
     """
     stripped = model_name.replace('"."', ".").strip('"')
     base = stripped.rsplit(".", 1)[-1]
-    return list({stripped, base})
+    return [stripped] if stripped == base else [stripped, base]
 
 
 def _merge_column_schemas(
@@ -135,16 +135,21 @@ def _merge_column_schemas(
 
     Fresh columns win per-column but leave unrelated tables untouched, so
     ``SELECT *`` expansion sees the current rendered model's columns without
-    forgetting sibling tables already in the graph.
+    forgetting sibling tables already in the graph. Uses copy-on-write so
+    unmodified sibling tables aren't cloned; a warm cross-repo catalog can
+    carry tens of thousands of columns and allocating per render cycle adds up.
     """
-    out: dict[str, dict[str, str]] = {k: dict(v) for k, v in (base_catalog or {}).items()}
+    if not column_schemas:
+        return dict(base_catalog) if base_catalog else {}
+    out: dict[str, dict[str, str]] = dict(base_catalog) if base_catalog else {}
     for model_name, cols in column_schemas.items():
         # A known table with an empty column list confuses
         # ``sqlglot.optimizer.qualify_columns`` enough to drop lineage entirely.
         if not cols:
             continue
         for key in _model_table_keys(model_name):
-            out.setdefault(key, {}).update(cols)
+            existing = out.get(key)
+            out[key] = {**existing, **cols} if existing else dict(cols)
     return out
 
 

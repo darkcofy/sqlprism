@@ -1450,15 +1450,46 @@ class GraphDB:
 
         Upstream mesh refs (e.g. dbt cross-project ``ref()`` or sqlmesh
         multi-project indexing) need column schemas from sibling repos so
-        ``SELECT *`` through CTEs can expand. Merge the current repo's columns
-        on top of every other repo's columns so local definitions always take
-        precedence over cross-repo siblings.
+        ``SELECT *`` through CTEs can expand. Two passes:
+
+        1. Aggregate columns from every *other* repo (``repo_id != current``)
+           into a flat catalog.  Sibling repos with same-named tables collapse
+           into one entry by design — the catalog is name-addressed, not
+           repo-scoped, so later sibling rows naturally layer over earlier ones.
+        2. Overlay the current repo's columns so local definitions win
+           deterministically over any sibling collision.
+
+        The two-query form avoids the non-deterministic ordering that
+        ``get_table_columns(None)`` would produce for same-named tables across
+        repos.
         """
-        other_repos = self.get_table_columns(None)
-        current = self.get_table_columns(current_repo_id)
-        for table, cols in current.items():
-            other_repos[table] = {**other_repos.get(table, {}), **cols}
-        return other_repos
+        schema: dict[str, dict[str, str]] = {}
+
+        sibling_rows = self._execute_read(
+            "SELECT n.name, c.column_name, c.data_type "
+            "FROM columns c "
+            "JOIN nodes n ON c.node_id = n.node_id "
+            "JOIN files f ON n.file_id = f.file_id "
+            "WHERE f.repo_id != ?",
+            [current_repo_id],
+        ).fetchall()
+        for table, col, dtype in sibling_rows:
+            schema.setdefault(table, {})[col] = dtype or "TEXT"
+
+        sibling_usage = self._execute_read(
+            "SELECT DISTINCT cu.table_name, cu.column_name "
+            "FROM column_usage cu "
+            "JOIN files f ON cu.file_id = f.file_id "
+            "WHERE f.repo_id != ? AND cu.column_name != '*'",
+            [current_repo_id],
+        ).fetchall()
+        for table, col in sibling_usage:
+            schema.setdefault(table, {}).setdefault(col, "TEXT")
+
+        # Overlay current repo — local definitions always win.
+        for table, cols in self.get_table_columns(current_repo_id).items():
+            schema[table] = {**schema.get(table, {}), **cols}
+        return schema
 
     def query_schema(
         self,

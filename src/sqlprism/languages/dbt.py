@@ -32,24 +32,26 @@ from sqlprism.types import ColumnDefResult, EdgeResult, ParseResult
 logger = logging.getLogger(__name__)
 
 
-def _manifest_columns_dict(columns: dict | None) -> dict[str, str]:
-    """Flatten a manifest node's ``columns`` field to ``{col: type}``.
+def _manifest_columns_dict(columns: dict | None) -> dict[str, str | None]:
+    """Flatten a manifest node's ``columns`` field to ``{col: type_or_None}``.
 
     dbt manifests store columns as ``{col_name: {data_type, description, ...}}``.
-    Columns without a ``data_type`` still flow through as ``"TEXT"`` so they
-    are visible to ``SELECT *`` expansion even when the user hasn't documented
-    types.
+    ``data_type`` is preserved as ``None`` when undeclared — the caller decides
+    whether to fall back to ``"TEXT"`` or defer to a better-typed source (e.g.
+    a ``schema.yml`` entry for the same column). Coercing to ``"TEXT"`` here
+    would mask real types from ``schema.yml`` when the manifest lists the same
+    column without a declared type.
     """
     if not isinstance(columns, dict):
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, str | None] = {}
     for col_name, meta in columns.items():
         if not col_name:
             continue
         data_type = None
         if isinstance(meta, dict):
             data_type = meta.get("data_type")
-        out[col_name] = data_type or "TEXT"
+        out[col_name] = data_type
     return out
 
 
@@ -199,12 +201,23 @@ class DbtRenderer:
         if not compiled_dir.exists():
             return {}
 
+        # Parse manifest.json once per compile — both the schema catalog
+        # build and the edge extraction below consume it, and the file is
+        # typically multi-MB on real projects.
+        manifest = self._load_manifest(project_path)
+
         # Build an effective schema catalog that layers dbt-sourced columns
         # (manifest + schema.yml) over the graph-derived catalog. Needed so
         # SELECT * through CTEs can expand on a fresh index — before any
         # columns have been inserted into the graph.
+        #
+        # The catalog is a point-in-time snapshot: models parsed later in
+        # this loop do not see columns produced by earlier models in the
+        # same run. Downstream models depending on another model in the
+        # same reindex pass therefore resolve SELECT * only via manifest/
+        # schema.yml metadata, not via mid-run in-graph writes.
         effective_schema = self._build_effective_schema(
-            project_path, parser, schema_catalog
+            project_path, parser, schema_catalog, manifest=manifest,
         )
 
         # Only read files for selected models when filtering
@@ -246,7 +259,7 @@ class DbtRenderer:
         # model→model relationships survive the loss of `ref()` context
         # during compilation (including cross-project mesh refs).
         manifest_edges = self._extract_manifest_edges(
-            project_path, project_name, parser, select=select
+            project_path, project_name, parser, select=select, manifest=manifest,
         )
         for rel_path, extra_edges in manifest_edges.items():
             pr = results.get(rel_path)
@@ -305,12 +318,34 @@ class DbtRenderer:
 
         return project_path / "target"
 
+    def _load_manifest(self, project_path: Path) -> dict | None:
+        """Read and parse ``<target-path>/manifest.json`` once.
+
+        Returns the parsed dict, or ``None`` when the manifest is missing or
+        unreadable. Logs at warning level on parse failure so a silent empty
+        ``columns`` table / missing edges isn't the first signal the user sees.
+        """
+        manifest_path = self._resolve_target_dir(project_path) / "manifest.json"
+        if not manifest_path.exists():
+            return None
+        try:
+            return json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(
+                "Could not parse dbt manifest at %s: %s — schema catalog and "
+                "ref()/source() edges will be incomplete",
+                manifest_path,
+                e,
+            )
+            return None
+
     def _extract_manifest_edges(
         self,
         project_path: Path,
         project_name: str,
         parser: SqlParser,
         select: list[str] | None = None,
+        manifest: dict | None = None,
     ) -> dict[str, list[EdgeResult]]:
         """Read ``<target-path>/manifest.json`` and derive ref/source edges per model.
 
@@ -337,22 +372,15 @@ class DbtRenderer:
             select: If non-empty, only emit edges for models whose name is
                 in this list (matches the ``--select`` behaviour of
                 ``render_models``).
+            manifest: Pre-parsed manifest dict. When provided the file isn't
+                re-read — callers that also need column metadata can share
+                one parse across both helpers.
 
         Returns an empty dict if the manifest is missing or unreadable.
         """
-        manifest_path = self._resolve_target_dir(project_path) / "manifest.json"
-        if not manifest_path.exists():
-            return {}
-
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error(
-                "Cannot read dbt manifest %s: %s — graph lineage will be incomplete "
-                "(ref()/source() edges unavailable)",
-                manifest_path,
-                e,
-            )
+        if manifest is None:
+            manifest = self._load_manifest(project_path)
+        if not manifest:
             return {}
 
         nodes = manifest.get("nodes") or {}
@@ -459,21 +487,40 @@ class DbtRenderer:
         project_path: Path,
         parser: SqlParser,
         schema_catalog: dict | None,
+        manifest: dict | None = None,
     ) -> dict[str, dict[str, str]]:
         """Merge dbt-sourced column schemas on top of the graph schema catalog.
 
-        Reads fresh column metadata from ``manifest.json`` (authoritative, with
-        types when dbt has compiled types) and ``schema.yml`` (fallback). Both
-        are layered onto ``schema_catalog`` so the catalog includes upstream
-        columns for freshly-rendered models even when they've never been
-        indexed before.
+        Reads fresh column metadata from ``manifest.json`` (authoritative when
+        it carries a ``data_type``) and ``schema.yml`` (primary type source
+        when users have documented their models). Layering rules:
+
+        * ``schema.yml`` entries seed the overlay with their declared types,
+          falling back to ``"TEXT"`` for undocumented columns on a documented
+          model.
+        * Manifest entries with a declared type override ``schema.yml`` only
+          when the manifest's type is concrete — a ``None`` manifest type
+          never clobbers a typed ``schema.yml`` entry. Manifest-only columns
+          are added as ``"TEXT"`` so ``SELECT *`` expansion can see them.
         """
-        overlays: dict[str, dict[str, str]] = {}
-        for name, cols in self._schema_yml_columns(project_path, parser).items():
-            overlays.setdefault(name, {}).update(cols)
-        # Manifest comes second so its typed columns win over schema.yml gaps.
-        for name, cols in self._extract_manifest_columns(project_path, parser).items():
-            overlays.setdefault(name, {}).update(cols)
+        yml_overlay = self._schema_yml_columns(project_path, parser)
+        manifest_overlay = self._extract_manifest_columns(
+            project_path, parser, manifest=manifest,
+        )
+
+        overlays: dict[str, dict[str, str]] = {
+            k: dict(v) for k, v in yml_overlay.items()
+        }
+        for name, cols in manifest_overlay.items():
+            bucket = overlays.setdefault(name, {})
+            for col, dtype in cols.items():
+                if dtype is not None:
+                    bucket[col] = dtype
+                else:
+                    # Gap-fill only — never overwrite a typed schema.yml entry
+                    # with the manifest's ``None`` (the critical bug the
+                    # earlier implementation had).
+                    bucket.setdefault(col, "TEXT")
         if not overlays and not schema_catalog:
             return {}
         return _merge_column_schemas(schema_catalog, overlays)
@@ -482,43 +529,91 @@ class DbtRenderer:
         self,
         project_path: Path,
         parser: SqlParser,
-    ) -> dict[str, dict[str, str]]:
+        manifest: dict | None = None,
+    ) -> dict[str, dict[str, str | None]]:
         """Read per-model column schemas from ``manifest.json``.
 
         Each manifest node carries a ``columns`` dict (populated from
         ``schema.yml`` at compile time) keyed by column name. Returns a flat
-        ``{normalized_model_name: {col: type}}`` mapping with dialect-aware
-        identifier normalization so schema lookups match the parser's keys.
+        mapping whose values are ``{col: data_type | None}`` — ``None``
+        signals "column documented but type not declared" so the caller can
+        defer to a better-typed source (``schema.yml``) rather than assuming
+        ``"TEXT"`` unconditionally.
+
+        Keys are dialect-normalized and emitted in multiple forms so lookups
+        resolve against fully-qualified or bare references in compiled SQL:
+
+        * Models/seeds/snapshots use the ``alias`` (if set) else ``name``.
+          dbt models commonly override their physical name via ``alias:`` in
+          ``config``, and compiled ``FROM`` clauses resolve to the alias.
+        * Sources use ``identifier`` (physical table name) if present, else
+          ``name``.
+        * Both emit a bare-name key and, when the manifest provides a
+          ``schema`` field, a ``schema.name`` qualified key so two entities
+          sharing a bare name across different schemas don't collide.
+
+        ``manifest`` may be passed pre-parsed to avoid re-reading the file.
         """
-        manifest_path = self._resolve_target_dir(project_path) / "manifest.json"
-        if not manifest_path.exists():
+        if manifest is None:
+            manifest = self._load_manifest(project_path)
+        if not manifest:
             return {}
 
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return {}
+        out: dict[str, dict[str, str | None]] = {}
 
-        out: dict[str, dict[str, str]] = {}
+        def _layer(key: str, cols: dict[str, str | None]) -> None:
+            bucket = out.setdefault(key, {})
+            for col, dtype in cols.items():
+                if dtype is not None:
+                    bucket[col] = dtype
+                else:
+                    bucket.setdefault(col, None)
+
         # Models + seeds + snapshots — anything downstream refs via ref().
         for node in (manifest.get("nodes") or {}).values():
             if node.get("resource_type") not in ("model", "seed", "snapshot"):
                 continue
-            name = node.get("name")
+            name = node.get("alias") or node.get("name")
             if not name:
                 continue
             cols = _manifest_columns_dict(node.get("columns"))
-            if cols:
-                out[parser._normalize_identifier(name)] = cols
+            if not cols:
+                continue
+            for key in self._catalog_keys(name, node.get("schema"), parser):
+                _layer(key, cols)
         # Sources — referenced by physical identifier, not ref() name.
         for src in (manifest.get("sources") or {}).values():
             identifier = src.get("identifier") or src.get("name")
             if not identifier:
                 continue
             cols = _manifest_columns_dict(src.get("columns"))
-            if cols:
-                out[parser._normalize_identifier(identifier)] = cols
+            if not cols:
+                continue
+            for key in self._catalog_keys(identifier, src.get("schema"), parser):
+                _layer(key, cols)
         return out
+
+    @staticmethod
+    def _catalog_keys(
+        name: str,
+        schema: str | None,
+        parser: SqlParser,
+    ) -> list[str]:
+        """Schema-catalog keys for a dbt model/source.
+
+        Returns ``[base]`` when no schema is known, else ``[base, schema.base]``
+        so downstream references resolve whether the compiled SQL qualifies
+        the reference or not. Two entities sharing a bare ``name`` across
+        different schemas each get a unique qualified key, avoiding silent
+        column clobbering — while the bare key still covers unqualified refs
+        (and collapses same-name collisions by design, matching the existing
+        flat-catalog contract elsewhere).
+        """
+        base = parser._normalize_identifier(name)
+        if not schema:
+            return [base]
+        qualified = f"{parser._normalize_identifier(schema)}.{base}"
+        return [base, qualified]
 
     def _schema_yml_columns(
         self,
@@ -529,14 +624,18 @@ class DbtRenderer:
 
         Reuses the existing ``extract_schema_yml`` walker and flattens each
         ``ColumnDefResult`` into ``{normalized_name: {col: type_or_TEXT}}``.
+        Entries with no columns are dropped so they can't short-circuit the
+        ``if not overlays`` guard in ``_build_effective_schema``.
         """
         per_model = self.extract_schema_yml(project_path)
         out: dict[str, dict[str, str]] = {}
         for name, col_defs in per_model.items():
+            if not col_defs:
+                continue
             key = parser._normalize_identifier(name)
-            out.setdefault(key, {})
+            bucket = out.setdefault(key, {})
             for c in col_defs:
-                out[key][c.column_name] = c.data_type or "TEXT"
+                bucket[c.column_name] = c.data_type or "TEXT"
         return out
 
     def _run_dbt_compile(

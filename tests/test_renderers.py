@@ -361,12 +361,12 @@ def test_dbt_extract_manifest_edges_missing_file(tmp_path):
 
 
 def test_dbt_extract_manifest_edges_malformed_json(tmp_path, caplog):
-    """Malformed manifest.json returns {} and logs an error."""
+    """Malformed manifest.json returns {} and logs a warning."""
     (tmp_path / "target").mkdir()
     (tmp_path / "target" / "manifest.json").write_text("not-json-garbage-{{")
 
     renderer = DbtRenderer()
-    with caplog.at_level("ERROR", logger="sqlprism.languages.dbt"):
+    with caplog.at_level("WARNING", logger="sqlprism.languages.dbt"):
         result = renderer._extract_manifest_edges(
             tmp_path, "my_proj", renderer.sql_parser
         )
@@ -1792,8 +1792,25 @@ def test_merge_column_schemas_skips_empty_column_dicts():
     assert merged == {}
 
 
+def test_merge_column_schemas_empty_overlay_preserves_base():
+    """An empty overlay for a base-present key must not erase its columns."""
+    from sqlprism.languages.sqlmesh import _merge_column_schemas
+
+    base = {"orders": {"id": "INT", "status": "TEXT"}}
+    merged = _merge_column_schemas(base, {"orders": {}})
+    assert merged["orders"] == {"id": "INT", "status": "TEXT"}
+
+
+def test_merge_column_schemas_none_base_empty_overlay():
+    """Both inputs absent returns ``{}`` without raising."""
+    from sqlprism.languages.sqlmesh import _merge_column_schemas
+
+    assert _merge_column_schemas(None, {}) == {}
+    assert _merge_column_schemas({}, {}) == {}
+
+
 def test_dbt_extract_manifest_columns(tmp_path):
-    """Manifest node columns flatten into {normalized_name: {col: type}}."""
+    """Manifest node columns flatten into {name: {col: type_or_None}}."""
     import json
 
     (tmp_path / "dbt_project.yml").write_text("name: demo\nversion: '1.0.0'\n")
@@ -1829,9 +1846,102 @@ def test_dbt_extract_manifest_columns(tmp_path):
 
     renderer = DbtRenderer()
     cols = renderer._extract_manifest_columns(tmp_path, SqlParser())
-    assert cols["orders"] == {"id": "BIGINT", "total": "TEXT"}
+    # data_type=None is preserved so schema.yml can fill it later; see critical
+    # bug fix — the old behaviour coerced this to "TEXT" and clobbered yml types.
+    assert cols["orders"] == {"id": "BIGINT", "total": None}
     assert cols["customers_v2"] == {"customer_id": "INT"}  # source identifier
     assert "not_null_orders_id" not in cols  # tests excluded
+
+
+def test_dbt_extract_manifest_columns_honors_alias(tmp_path):
+    """Models configured with an alias register under the alias, not the stem.
+
+    dbt's compiled SQL resolves refs to the physical table name, which is the
+    alias when one is set. Without this, aliased models miss every downstream
+    lookup — exactly the jaffle-mesh failure mode.
+    """
+    import json
+
+    target = tmp_path / "target"
+    target.mkdir()
+    manifest = {
+        "nodes": {
+            "model.demo.orders": {
+                "resource_type": "model",
+                "name": "orders",       # .sql file stem
+                "alias": "orders_v2",   # physical table
+                "schema": "analytics",
+                "columns": {"id": {"data_type": "BIGINT"}},
+            }
+        },
+        "sources": {},
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest))
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    cols = renderer._extract_manifest_columns(tmp_path, SqlParser())
+    assert "orders_v2" in cols, "alias should be the catalog key, not the stem"
+    # Qualified key populated too, so `FROM analytics.orders_v2` resolves.
+    assert cols["analytics.orders_v2"] == {"id": "BIGINT"}
+    assert "orders" not in cols, "stem must not leak into the catalog"
+
+
+def test_dbt_extract_manifest_columns_schema_qualified_sources(tmp_path):
+    """Two sources with the same bare identifier in different schemas don't clobber.
+
+    Without schema qualification, the second-iterated source silently
+    overwrites the first, dropping columns from the loser.
+    """
+    import json
+
+    target = tmp_path / "target"
+    target.mkdir()
+    manifest = {
+        "nodes": {},
+        "sources": {
+            "source.demo.raw.customers": {
+                "name": "customers",
+                "identifier": "customers",
+                "schema": "raw",
+                "columns": {"customer_id": {"data_type": "INT"}},
+            },
+            "source.demo.legacy.customers": {
+                "name": "customers",
+                "identifier": "customers",
+                "schema": "legacy",
+                "columns": {"legacy_key": {"data_type": "VARCHAR"}},
+            },
+        },
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest))
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    cols = renderer._extract_manifest_columns(tmp_path, SqlParser())
+    assert cols["raw.customers"] == {"customer_id": "INT"}
+    assert cols["legacy.customers"] == {"legacy_key": "VARCHAR"}
+    # Bare key survives as a merged view (last-write collapse by design, matching
+    # the flat-catalog contract elsewhere) — just assert both keys' columns are reachable
+    # via at least one entry so downstream unqualified refs still work.
+    assert "customers" in cols
+
+
+def test_dbt_extract_manifest_columns_malformed_returns_empty(tmp_path, caplog):
+    """A corrupt manifest.json yields {} and logs a warning, not a crash."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text("definitely-{not-}valid-json")
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    with caplog.at_level("WARNING", logger="sqlprism.languages.dbt"):
+        cols = renderer._extract_manifest_columns(tmp_path, SqlParser())
+    assert cols == {}
+    assert any("manifest" in rec.message.lower() for rec in caplog.records)
 
 
 def test_dbt_schema_yml_columns_flat(tmp_path):
@@ -1857,6 +1967,25 @@ models:
     cols = renderer._schema_yml_columns(tmp_path, SqlParser())
     assert cols["orders"]["id"] == "bigint"
     assert cols["orders"]["status"] == "TEXT"
+
+
+def test_dbt_schema_yml_columns_flat_merges_multiple_files(tmp_path):
+    """Same model declared across two schema.yml files merges column-wise."""
+    models_dir = tmp_path / "models"
+    _write_yaml(
+        models_dir / "a" / "schema.yml",
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n      - name: id\n        data_type: bigint\n",
+    )
+    _write_yaml(
+        models_dir / "b" / "schema.yml",
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n      - name: status\n",
+    )
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    cols = renderer._schema_yml_columns(tmp_path, SqlParser())
+    assert cols["orders"] == {"id": "bigint", "status": "TEXT"}
 
 
 def test_dbt_build_effective_schema_layers(tmp_path):
@@ -1901,11 +2030,69 @@ models:
     assert merged["other_repo_table"] == {"col": "TEXT"}
 
 
-def test_sqlmesh_parse_merges_fresh_column_schemas(tmp_path):
-    """_parse_models_sequential merges column_schemas into schema before parsing.
+def test_dbt_build_effective_schema_priority_on_overlapping_columns(tmp_path):
+    """The critical bug: manifest null must not clobber schema.yml real types.
 
-    Confirms SELECT * through a CTE resolves against freshly-rendered model
-    columns on the very first index, before any graph columns exist.
+    Given schema.yml declares ``id: bigint`` and the manifest lists the same
+    column without a data_type, the effective schema must report ``bigint`` —
+    not the manifest's synthesized ``"TEXT"`` fallback. The earlier behaviour
+    coerced manifest ``None`` to ``"TEXT"`` and silently overwrote the typed
+    schema.yml entry.
+    """
+    import json
+
+    target = tmp_path / "target"
+    target.mkdir()
+    manifest = {
+        "nodes": {
+            "model.demo.orders": {
+                "resource_type": "model",
+                "name": "orders",
+                "columns": {
+                    "id": {"data_type": None},       # manifest lists col but no type
+                    "status": {"data_type": "TEXT"}, # manifest typed, wins
+                    "total": {"data_type": None},    # manifest-only gap column
+                },
+            }
+        },
+        "sources": {},
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest))
+    _write_yaml(
+        tmp_path / "models" / "schema.yml",
+        """\
+version: 2
+
+models:
+  - name: orders
+    columns:
+      - name: id
+        data_type: bigint
+      - name: status
+        data_type: varchar
+""",
+    )
+
+    from sqlprism.languages.sql import SqlParser
+
+    renderer = DbtRenderer()
+    merged = renderer._build_effective_schema(tmp_path, SqlParser(), None)
+    assert merged["orders"]["id"] == "bigint", \
+        "schema.yml type must survive manifest's None entry"
+    # Manifest typed value wins when both are typed — its compiler-derived type
+    # is more authoritative than the user's hand-written schema.yml.
+    assert merged["orders"]["status"] == "TEXT"
+    # Manifest-only column gets the TEXT fallback so SELECT * still expands.
+    assert merged["orders"]["total"] == "TEXT"
+
+
+@pytest.mark.parametrize("parse_method", ["_parse_models_sequential", "_parse_models_parallel"])
+def test_sqlmesh_parse_merges_fresh_column_schemas(parse_method):
+    """SELECT * through a CTE resolves against fresh ``column_schemas``.
+
+    Both the sequential and parallel parse entry-points must merge fresh
+    column schemas before parsing — reindex_sqlmesh picks the parallel path
+    for projects with ≥20 models, so regressions in either branch would ship.
     """
     from sqlprism.languages.sqlmesh import SqlMeshRenderer
 
@@ -1918,10 +2105,75 @@ def test_sqlmesh_parse_merges_fresh_column_schemas(tmp_path):
     }
     column_schemas = {"upstream": {"customer_id": "INT", "name": "TEXT"}}
 
-    results = renderer._parse_models_sequential(models, column_schemas, None)
+    results = getattr(renderer, parse_method)(models, column_schemas, None)
 
     lineage = results["downstream"].column_lineage
     customer_id_chains = [cl for cl in lineage if cl.output_column == "customer_id"]
     assert customer_id_chains, "customer_id should have lineage"
-    tables_seen = {h.table for cl in customer_id_chains for h in cl.chain}
-    assert "upstream" in tables_seen, f"expected upstream in chain, got {tables_seen}"
+    # Assert the exact hop column, not just the table — a regression that
+    # resolved to ``*`` would otherwise pass.
+    upstream_hops = [
+        (h.table, h.column) for cl in customer_id_chains for h in cl.chain
+        if h.table == "upstream"
+    ]
+    assert ("upstream", "customer_id") in upstream_hops, \
+        f"expected (upstream, customer_id) in chain, got {upstream_hops}"
+
+
+def test_dbt_compile_and_parse_threads_effective_schema(tmp_path, monkeypatch):
+    """``_compile_and_parse`` wires the manifest-derived catalog into the parser.
+
+    Stubs the ``dbt compile`` subprocess + target-dir resolution so no real
+    dbt invocation occurs. Writes a fixture manifest.json + compiled SQL and
+    asserts the parser receives a ``schema`` argument containing the
+    manifest-declared columns — proving the effective-schema wiring isn't
+    dead code. A revert of the ``schema=effective_schema`` line would fail
+    this test.
+    """
+    import json
+    from unittest.mock import patch
+
+    (tmp_path / "dbt_project.yml").write_text("name: demo\nversion: '1.0.0'\n")
+    target = tmp_path / "target"
+    target.mkdir()
+    manifest = {
+        "nodes": {
+            "model.demo.stg_orders": {
+                "resource_type": "model",
+                "name": "stg_orders",
+                "columns": {"customer_id": {"data_type": "INT"}},
+            }
+        },
+        "sources": {},
+    }
+    (target / "manifest.json").write_text(json.dumps(manifest))
+    compiled_dir = target / "compiled" / "demo" / "models"
+    compiled_dir.mkdir(parents=True)
+    (compiled_dir / "downstream.sql").write_text(
+        "WITH o AS (SELECT * FROM stg_orders) SELECT customer_id FROM o"
+    )
+
+    renderer = DbtRenderer()
+    captured: dict = {}
+    original_parse = renderer.sql_parser.parse
+
+    def spy_parse(*args, **kwargs):
+        captured.setdefault("schema", kwargs.get("schema"))
+        return original_parse(*args, **kwargs)
+
+    with patch.object(renderer, "_run_dbt_compile"), \
+         patch.object(renderer.sql_parser, "parse", side_effect=spy_parse):
+        renderer._compile_and_parse(
+            project_path=tmp_path,
+            profiles_dir=None,
+            env_file=None,
+            target=None,
+            dbt_command="uv run dbt",
+            venv_dir=None,
+            dialect=None,
+            schema_catalog=None,
+        )
+
+    schema = captured.get("schema") or {}
+    assert schema.get("stg_orders") == {"customer_id": "INT"}, \
+        f"effective_schema not threaded into parser.parse; got {schema!r}"
