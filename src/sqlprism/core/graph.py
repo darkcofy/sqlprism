@@ -1649,8 +1649,13 @@ class GraphDB:
         Note: ``add_column`` does not account for ``SELECT *`` usage —
         downstream models using wildcard selects may still be affected.
 
-        The ``repo`` filter restricts both model lookup and downstream
-        consumer discovery to the same repo.
+        The ``repo`` filter restricts the **producer lookup** (which
+        ``model_found`` is based on) — it answers "does this repo define
+        the named model?". Downstream consumer discovery deliberately
+        spans all repos: consumer files in other repos index each
+        cross-project ``ref()`` as a local shadow of the producer's
+        name, and omitting those would hide the headline use case of
+        cross-repo impact analysis (#131).
 
         Args:
             model: The model/table name whose columns are changing.
@@ -1658,7 +1663,7 @@ class GraphDB:
                 - ``{"action": "remove_column", "column": "col"}``
                 - ``{"action": "rename_column", "old": "old", "new": "new"}``
                 - ``{"action": "add_column", "column": "col"}``
-            repo: Optional repo name filter.
+            repo: Optional repo name filter for the producer lookup.
 
         Returns:
             Dict with ``model``, ``model_found``, ``changes_analyzed``,
@@ -1672,9 +1677,11 @@ class GraphDB:
             "partition_by", "window_order", "qualify",
         }
 
-        # Pre-fetch source node IDs — exclude phantoms (file_id IS NULL)
+        # Producer lookup — scoped by repo when provided — establishes
+        # whether the named model exists. Phantoms excluded to avoid
+        # false positives for unresolved refs.
         if repo:
-            node_rows = self._execute_read(
+            producer_rows = self._execute_read(
                 "SELECT n.node_id FROM nodes n "
                 "JOIN files f ON n.file_id = f.file_id "
                 "JOIN repos r ON f.repo_id = r.repo_id "
@@ -1682,13 +1689,13 @@ class GraphDB:
                 [model, repo],
             ).fetchall()
         else:
-            node_rows = self._execute_read(
+            producer_rows = self._execute_read(
                 "SELECT n.node_id FROM nodes n "
                 "WHERE n.name = ? AND n.file_id IS NOT NULL",
                 [model],
             ).fetchall()
 
-        if not node_rows:
+        if not producer_rows:
             return {
                 "model": model,
                 "model_found": False,
@@ -1697,24 +1704,30 @@ class GraphDB:
                 "summary": {"total_breaking": 0, "total_warnings": 0, "total_safe": 0},
             }
 
-        node_ids = [r[0] for r in node_rows]
-        placeholders = ", ".join("?" for _ in node_ids)
+        # Downstream discovery spans every node with this name — real or
+        # shadow, any repo. Consumer files in other repos point their
+        # ref() edges at a local shadow (same name), so restricting the
+        # target set to the producer repo's node would miss them (#131).
+        same_name_rows = self._execute_read(
+            "SELECT node_id FROM nodes WHERE name = ?",
+            [model],
+        ).fetchall()
+        target_ids = [r[0] for r in same_name_rows]
+        placeholders = ", ".join("?" for _ in target_ids)
 
-        # Fetch downstream models via edges, excluding the model itself.
-        # The explicit non-dataflow filter makes the exclusion robust to
-        # callers that resolve node_rows by kind (e.g. only 'table'): the
-        # file-stem query node is no longer in node_ids, so the existing
-        # NOT IN clause would otherwise let defines/inserts_into self-loop
-        # edges surface as phantom downstream consumers (#127).
+        # Fetch downstream models via edges, excluding the model itself
+        # (by name, so shadow self-loops in other repos are also dropped).
+        # The explicit non-dataflow filter keeps defines / inserts_into
+        # file-stem self-loops out of the downstream set (#127).
         ds_rows = self._execute_read(
             "SELECT DISTINCT n2.name, n2.kind "
             "FROM edges e "
             "JOIN nodes n2 ON e.source_id = n2.node_id "
             "JOIN nodes nt ON nt.node_id = e.target_id "
             f"WHERE e.target_id IN ({placeholders}) "
-            f"AND e.source_id NOT IN ({placeholders}) "
+            "AND n2.name <> ? "
             f"AND {self._non_dataflow_edge_filter('e', 'n2', 'nt')}",
-            node_ids + node_ids,
+            target_ids + [model],
         ).fetchall()
         all_downstream = [{"name": r[0], "kind": r[1]} for r in ds_rows]
 
@@ -1754,22 +1767,17 @@ class GraphDB:
                 })
                 continue
 
-            # Query column_usage for downstream references to this column
-            where = ["cu.table_name = ?", "cu.column_name = ?"]
-            params: list = [model, col_name]
-            if repo:
-                where.append("r.name = ?")
-                params.append(repo)
-
+            # Query column_usage for downstream references to this column.
+            # The consumer side is intentionally unscoped — repo filter only
+            # gates the producer lookup above, not which consumers are
+            # considered (#131).
             usage_sql = (
                 "SELECT DISTINCT n.name AS node_name, n.kind AS node_kind, cu.usage_type "
                 "FROM column_usage cu "
                 "JOIN nodes n ON cu.node_id = n.node_id "
-                "LEFT JOIN files f ON cu.file_id = f.file_id "
-                "LEFT JOIN repos r ON f.repo_id = r.repo_id "
-                f"WHERE {' AND '.join(where)}"
+                "WHERE cu.table_name = ? AND cu.column_name = ?"
             )
-            usage_rows = self._execute_read(usage_sql, params).fetchall()
+            usage_rows = self._execute_read(usage_sql, [model, col_name]).fetchall()
 
             # Group usage_types per downstream model
             model_usage: dict[tuple[str, str], list[str]] = {}
@@ -2948,7 +2956,10 @@ class GraphDB:
         if not start_nodes:
             return {"root": None, "paths": [], "depth_summary": {}, "repos_affected": []}
 
-        start_ids = [r[0] for r in start_nodes]
+        # Did _find_trace_start_nodes fall back to query-local aliases?
+        # (it only returns them when nothing else matches the name)
+        start_kinds = {r[2] for r in start_nodes}
+        include_query_local_starts = bool(start_kinds) and start_kinds.issubset(_QUERY_LOCAL_KINDS)
 
         # "both" — run downstream and upstream separately and merge
         if direction == "both":
@@ -2983,18 +2994,21 @@ class GraphDB:
                 "repos_affected": list(set(down["repos_affected"] + up["repos_affected"])),
             }
 
-        # Trace from ALL matching start nodes via recursive CTE.
-        all_paths: list[dict] = []
-        seen_names: set[str] = set()
-        for sid in start_ids:
-            paths = self._trace_cte(
-                sid, direction, max_depth, limit, include_snippets, exclude_edges
-            )
-            for p in paths:
-                if p["name"] not in seen_names and not self._is_noise_node(p):
-                    seen_names.add(p["name"])
-                    all_paths.append(p)
-        paths = all_paths[:limit]
+        # Trace via the name-quotient graph (shadows with the same name
+        # collapse into one logical hop). One CTE call covers all start
+        # nodes with the given name — the recursive step naturally
+        # unifies same-name shadows regardless of which repo they live in.
+        raw_paths = self._trace_cte(
+            name,
+            kind,
+            direction,
+            max_depth,
+            limit,
+            include_snippets,
+            exclude_edges,
+            include_query_local_starts=include_query_local_starts,
+        )
+        paths = [p for p in raw_paths if not self._is_noise_node(p)][:limit]
 
         depth_summary: dict[int, int] = {}
         repos_affected: set[str] = set()
@@ -3054,20 +3068,42 @@ class GraphDB:
 
     def _trace_cte(
         self,
-        start_id: int,
+        start_name: str,
+        start_kind: str | None,
         direction: str,
         max_depth: int,
         limit: int,
         include_snippets: bool,
         exclude_edges: set[tuple[str, str]] | None = None,
+        include_query_local_starts: bool = False,
     ) -> list[dict]:
-        """Trace dependencies using recursive CTE (fallback when DuckPGQ unavailable)."""
-        if direction == "downstream":
-            source_col, target_col = "source_id", "target_id"
-        else:
-            source_col, target_col = "target_id", "source_id"
+        """Trace dependencies via a name-quotient recursive CTE.
 
-        # Pre-resolve exclude_edges name pairs to ID pairs
+        Nodes sharing a name across repos (typically shadow ref() targets
+        created by consumer files) collapse into a single logical hop: at
+        each step we follow edges where either endpoint has the current
+        name, not a specific node_id. Pre-fix, a consumer in one repo
+        could reference a producer in another only via a local shadow,
+        and the walk terminated at repo boundaries (#131). Post-fix the
+        shadows act as equivalences, so the walk teleports between repos
+        through shared names.
+
+        Output rows are deduped by ``(repo, name)`` and the earliest
+        depth wins; the representative node per ``(repo, name)`` prefers
+        real (non-phantom) nodes, then kind rank (table > view > query),
+        then ``node_id`` for stability.
+        """
+        if direction == "downstream":
+            # Walk outgoing edges: seed matches source.name; emit target.
+            seed_side_col, hop_side = "ns", "nt"
+            recurse_match_col = "ns.name"
+        else:
+            # Walk incoming edges: seed matches target.name; emit source.
+            seed_side_col, hop_side = "nt", "ns"
+            recurse_match_col = "nt.name"
+
+        # Pre-resolve exclude_edges name pairs to ID pairs — same as before,
+        # so PR-impact v2 base-graph approximation continues to work.
         exclude_clause = ""
         if exclude_edges:
             excluded_id_pairs: set[tuple[int, int]] = set()
@@ -3087,67 +3123,110 @@ class GraphDB:
         # collides with a node authored by the same file (issues #122, #127).
         dataflow_clause = f"AND {self._non_dataflow_edge_filter('e', 'ns', 'nt')}"
 
+        # Seed-kind filter: apply only on the starting side so the walk
+        # doesn't seed from a CTE or subquery aliased to the start name
+        # unless explicitly allowed. The recursive step deliberately
+        # ignores kind so table/query shadows still chain together.
+        seed_kind_clauses: list[str] = []
+        seed_kind_params: list = []
+        if start_kind:
+            seed_kind_clauses.append(f"{seed_side_col}.kind = ?")
+            seed_kind_params.append(start_kind)
+        elif not include_query_local_starts:
+            placeholders = ",".join("?" * len(_QUERY_LOCAL_KINDS))
+            seed_kind_clauses.append(f"{seed_side_col}.kind NOT IN ({placeholders})")
+            seed_kind_params.extend(_QUERY_LOCAL_KINDS)
+        seed_kind_clause = (" AND " + " AND ".join(seed_kind_clauses)) if seed_kind_clauses else ""
+
+        kind_rank = _kind_rank_sql("n.kind")
+
         recursive_sql = f"""
         WITH RECURSIVE trace AS (
             SELECT
-                e.{target_col} as node_id,
+                {hop_side}.node_id AS hop_node_id,
+                {hop_side}.name AS hop_name,
                 e.relationship,
                 e.context,
-                1 as depth,
-                ARRAY[e.{source_col}] as path
+                1 AS depth,
+                [{seed_side_col}.name]::VARCHAR[] AS path_names
             FROM edges e
             JOIN nodes ns ON ns.node_id = e.source_id
             JOIN nodes nt ON nt.node_id = e.target_id
-            WHERE e.{source_col} = ?
+            WHERE {seed_side_col}.name = ?
+            {seed_kind_clause}
             {dataflow_clause}
             {exclude_clause}
+            AND NOT array_contains([{seed_side_col}.name]::VARCHAR[], {hop_side}.name)
 
             UNION ALL
 
             SELECT
-                e.{target_col},
+                {hop_side}.node_id,
+                {hop_side}.name,
                 e.relationship,
                 e.context,
                 t.depth + 1,
-                array_append(t.path, e.{source_col})
+                array_append(t.path_names, {hop_side}.name)
             FROM edges e
             JOIN nodes ns ON ns.node_id = e.source_id
             JOIN nodes nt ON nt.node_id = e.target_id
-            JOIN trace t ON e.{source_col} = t.node_id
+            JOIN trace t ON {recurse_match_col} = t.hop_name
             WHERE t.depth < ?
-            AND NOT array_contains(t.path, e.{target_col})
+            AND NOT array_contains(t.path_names, {hop_side}.name)
             {dataflow_clause}
             {exclude_clause}
+        ),
+        ranked AS (
+            SELECT
+                t.hop_name,
+                n.kind AS rep_kind,
+                n.language AS rep_language,
+                t.relationship,
+                t.context,
+                t.depth,
+                f.path AS file_path,
+                r.name AS repo_name,
+                n.line_start, n.line_end,
+                ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(r.name, ''), t.hop_name
+                    ORDER BY
+                        t.depth ASC,
+                        CASE WHEN n.file_id IS NULL THEN 1 ELSE 0 END,
+                        {kind_rank},
+                        n.node_id
+                ) AS rn
+            FROM trace t
+            JOIN nodes n ON n.node_id = t.hop_node_id
+            LEFT JOIN files f ON n.file_id = f.file_id
+            LEFT JOIN repos r ON f.repo_id = r.repo_id
         )
-        SELECT DISTINCT
-            t.node_id, t.relationship, t.context, t.depth,
-            n.name, n.kind, n.language,
-            f.path as file_path, r.name as repo_name,
-            n.line_start, n.line_end
-        FROM trace t
-        JOIN nodes n ON t.node_id = n.node_id
-        LEFT JOIN files f ON n.file_id = f.file_id
-        LEFT JOIN repos r ON f.repo_id = r.repo_id
-        ORDER BY t.depth, n.name
+        SELECT
+            hop_name, rep_kind, rep_language,
+            relationship, context, depth,
+            file_path, repo_name, line_start, line_end
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY depth, hop_name, COALESCE(repo_name, '')
         LIMIT ?
         """
 
-        rows = self._execute_read(recursive_sql, [start_id, max_depth, limit]).fetchall()
+        params: list = [start_name] + seed_kind_params + [max_depth, limit]
+        rows = self._execute_read(recursive_sql, params).fetchall()
 
         paths: list[dict] = []
         for r in rows:
             entry = {
-                "name": r[4],
-                "kind": r[5],
-                "language": r[6],
-                "relationship": r[1],
-                "context": r[2],
-                "depth": r[3],
-                "file": r[7],
-                "repo": r[8],
+                "name": r[0],
+                "kind": r[1],
+                "language": r[2],
+                "relationship": r[3],
+                "context": r[4],
+                "depth": r[5],
+                "file": r[6],
+                "repo": r[7],
             }
             if include_snippets:
-                snippet = self._read_snippet(r[8], r[7], r[9], r[10])
+                snippet = self._read_snippet(r[7], r[6], r[8], r[9])
                 if snippet:
                     entry["snippet"] = snippet
             paths.append(entry)
