@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
-from sqlprism.cli import cli
+from sqlprism.cli import _build_repo_configs, cli
 
 
 def test_reindex_with_sql_file(tmp_path):
@@ -391,3 +392,221 @@ def test_init_help_mentions_yaml():
     assert result.exit_code == 0
     assert "yaml" in result.output.lower()
     assert "default: yaml" in result.output.lower()
+
+
+# ── Regression tests for #137 review feedback ──
+
+
+def test_reindex_repo_filter_accepts_dbt_only_repo(tmp_path):
+    """reindex --repo <name> resolves names from dbt_repos or sqlmesh_repos too.
+
+    Regression for the acknowledged behavior change in #137: previously the
+    SQL-repos lookup ran first and exited non-zero when the name lived only
+    in dbt_repos/sqlmesh_repos.
+    """
+    dbt_dir = tmp_path / "dbtproj"
+    dbt_dir.mkdir()
+    config = {
+        "db_path": str(tmp_path / "test.duckdb"),
+        "dbt_repos": {"only_dbt": {"project_path": str(dbt_dir)}},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    # Stub the dbt render path — we just need dispatch to land on reindex_dbt.
+    stats = {
+        "models_compiled": 2,
+        "nodes_added": 0,
+        "edges_added": 0,
+        "column_usage_added": 0,
+    }
+    with patch("sqlprism.core.indexer.Indexer") as mock_indexer_cls:
+        instance = mock_indexer_cls.return_value
+        instance.reindex_dbt.return_value = stats
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["reindex", "--config", str(config_path), "--repo", "only_dbt"],
+        )
+
+    assert result.exit_code == 0, f"stdout={result.output}"
+    assert instance.reindex_dbt.called
+    assert instance.reindex_dbt.call_args.kwargs["repo_name"] == "only_dbt"
+    assert "Indexing dbt project only_dbt" in result.output
+    assert "models=2" in result.output
+
+
+def test_reindex_handler_prints_dbt_stats_line(tmp_path):
+    """The dispatched dbt handler prints the expected stats summary line."""
+    dbt_dir = tmp_path / "dbtproj"
+    dbt_dir.mkdir()
+    config = {
+        "db_path": str(tmp_path / "test.duckdb"),
+        "dbt_repos": {"proj": {"project_path": str(dbt_dir)}},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    stats = {
+        "models_compiled": 7,
+        "nodes_added": 12,
+        "edges_added": 19,
+        "column_usage_added": 34,
+    }
+    with patch("sqlprism.core.indexer.Indexer") as mock_indexer_cls:
+        mock_indexer_cls.return_value.reindex_dbt.return_value = stats
+        runner = CliRunner()
+        result = runner.invoke(cli, ["reindex", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "models=7" in result.output
+    assert "nodes=12" in result.output
+    assert "edges=19" in result.output
+    assert "column_usage=34" in result.output
+
+
+def test_reindex_handler_prints_sqlmesh_stats_line(tmp_path):
+    """The dispatched sqlmesh handler prints the expected stats summary line."""
+    sm_dir = tmp_path / "smproj"
+    sm_dir.mkdir()
+    config = {
+        "db_path": str(tmp_path / "test.duckdb"),
+        "sqlmesh_repos": {"proj": {"project_path": str(sm_dir)}},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    stats = {
+        "models_rendered": 5,
+        "nodes_added": 8,
+        "edges_added": 11,
+        "column_usage_added": 22,
+    }
+    with patch("sqlprism.core.indexer.Indexer") as mock_indexer_cls:
+        mock_indexer_cls.return_value.reindex_sqlmesh.return_value = stats
+        runner = CliRunner()
+        result = runner.invoke(cli, ["reindex", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "Indexing sqlmesh project proj" in result.output
+    assert "models=5" in result.output
+    assert "nodes=8" in result.output
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["query", "search", "orders"],
+        ["query", "references", "orders"],
+        ["query", "column-usage", "orders"],
+        ["query", "trace", "orders"],
+        ["query", "lineage"],
+    ],
+)
+def test_query_subcommand_db_missing_writes_to_stderr(tmp_path, cmd):
+    """`_open_graph_for_read` default routes 'No index found' to stderr for query subcommands."""
+    missing_db = tmp_path / "nonexistent.duckdb"
+    runner = CliRunner()
+    result = runner.invoke(cli, [*cmd, "--db", str(missing_db)])
+    assert result.exit_code == 1
+    assert "No index found" in result.stderr
+    assert "No index found" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        ["status"],
+        ["conventions", "refresh"],
+        ["conventions", "diff"],
+        ["conventions", "init"],
+    ],
+)
+def test_legacy_stdout_commands_keep_db_missing_on_stdout(tmp_path, cmd):
+    """status + conventions.* preserve the legacy 'No index found' → stdout routing."""
+    missing_db = tmp_path / "nonexistent.duckdb"
+    runner = CliRunner()
+    result = runner.invoke(cli, [*cmd, "--db", str(missing_db)])
+    assert result.exit_code == 1
+    assert "No index found" in result.stdout
+    assert "No index found" not in result.stderr
+
+
+def test_conventions_refresh_no_config_with_db_ok(tmp_path):
+    """conventions refresh works with --db alone when no config file is present."""
+    missing_db = tmp_path / "nonexistent.duckdb"
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        # No sqlprism.yml, no --config flag, just --db → require_config=False path.
+        result = runner.invoke(cli, ["conventions", "refresh", "--db", str(missing_db)])
+    # DB is missing, so exit 1 with the expected message on stdout.
+    assert result.exit_code == 1
+    assert "No index found" in result.stdout
+
+
+def test_conventions_init_error_order_db_takes_precedence(tmp_path):
+    """When both DB and output file are missing/present, DB-missing wins."""
+    missing_db = tmp_path / "nonexistent.duckdb"
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        Path("sqlprism.conventions.yml").write_text("# pre-existing\n")
+        result = runner.invoke(cli, ["conventions", "init", "--db", str(missing_db)])
+    assert result.exit_code == 1
+    # The DB-missing message must win — not the "already exists" message.
+    assert "No index found" in result.stdout
+    assert "already exists" not in result.output
+
+
+def test_build_repo_configs_skips_hash_prefixed_entries():
+    """Names starting with '#' are YAML-template comments and must be skipped."""
+    merged = _build_repo_configs({
+        "repos": {"real": "/path", "#commented": "/ignored"},
+        "dbt_repos": {"#my-dbt": {"project_path": "/nope"}},
+        "sqlmesh_repos": {"#my-sm": {"project_path": "/nope"}},
+    })
+    assert "real" in merged
+    assert "#commented" not in merged
+    assert "#my-dbt" not in merged
+    assert "#my-sm" not in merged
+
+
+def test_build_repo_configs_rejects_string_dbt_entry():
+    """dbt/sqlmesh entries must be mappings — friendly error instead of KeyError."""
+    import click as _click
+
+    with pytest.raises(_click.ClickException) as exc:
+        _build_repo_configs({"dbt_repos": {"bad": "/just-a-string"}})
+    assert "dbt" in str(exc.value.message)
+    assert "project_path" in str(exc.value.message)
+
+
+def test_reindex_closes_graphdb_on_error_exit(tmp_path, monkeypatch):
+    """sys.exit inside `_open_graph_for_write` still closes the graph via __exit__."""
+    from sqlprism.core import graph as graph_mod
+
+    config = {
+        "db_path": str(tmp_path / "test.duckdb"),
+        "repos": {"real": str(tmp_path)},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    close_calls: list[int] = []
+    real_close = graph_mod.GraphDB.close
+
+    def tracking_close(self):
+        close_calls.append(1)
+        real_close(self)
+
+    monkeypatch.setattr(graph_mod.GraphDB, "close", tracking_close)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["reindex", "--config", str(config_path), "--repo", "nonexistent"],
+    )
+    assert result.exit_code != 0
+    assert "not in config" in result.output
+    # The context manager's __exit__ must close exactly once, even though
+    # sys.exit(1) fired from inside the `with` block.
+    assert len(close_calls) == 1
