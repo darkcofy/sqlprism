@@ -277,7 +277,7 @@ SQLPrism optionally integrates with [DuckPGQ](https://github.com/cwida/duckpgq) 
 
 ```bash
 uv sync
-uv run pytest                          # run tests (510+ tests)
+uv run pytest                          # run tests (630+ tests)
 uv run pytest --cov=sqlprism           # run with coverage report
 uv run pytest --cov=sqlprism --cov-report=html:coverage_html  # HTML report
 ```
