@@ -2756,6 +2756,94 @@ def test_reindex_sqlmesh_cross_repo_select_star_lineage_true_mesh(tmp_path):
     assert ("stg_orders", "customer_id") in hops, \
         f"expected (stg_orders, customer_id) in chain, got {hops}"
 
+    # Upstream INT types must persist cross-repo — catches the regression
+    # where columns fall back to TEXT from the column_usage path.
+    upstream_repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["platform"]
+    ).fetchone()[0]
+    catalog = db.get_table_columns(upstream_repo_id)
+    assert catalog.get("stg_orders", {}).get("customer_id") == "INT", \
+        f"expected INT type to survive, got {catalog.get('stg_orders')}"
+
+
+@pytest.mark.xfail(
+    reason="Blocked by #125 — reindex_dbt never produces ColumnDefResult from "
+           "schema.yml / catalog.json, so upstream dbt types can't feed a "
+           "downstream sibling repo's schema catalog. Preserves the dbt-mesh "
+           "regression signal the original #124/#125 xfail carried.",
+    strict=True,
+)
+def test_reindex_dbt_cross_repo_select_star_lineage_true_mesh(tmp_path):
+    """True dbt→sqlmesh mesh — pinned as xfail until #125 persists dbt columns."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    # ── Upstream: minimal dbt project with a single staging model ──
+    upstream = tmp_path / "platform"
+    upstream.mkdir()
+    (upstream / "dbt_project.yml").write_text("name: platform\n")
+    (upstream / ".venv").mkdir()
+    compiled = upstream / "target" / "compiled" / "platform" / "models" / "staging"
+    compiled.mkdir(parents=True)
+    (compiled / "stg_orders.sql").write_text(
+        "SELECT customer_id, order_id FROM raw.orders"
+    )
+    manifest = {
+        "nodes": {
+            "model.platform.stg_orders": {
+                "resource_type": "model",
+                "package_name": "platform",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {},
+    }
+    (upstream / "target" / "manifest.json").write_text(json.dumps(manifest))
+    # schema.yml declares column types — #125 gap: this isn't persisted today.
+    (upstream / "models" / "staging").mkdir(parents=True)
+    (upstream / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: stg_orders\n"
+        "    columns:\n"
+        "      - name: customer_id\n        data_type: INT\n"
+        "      - name: order_id\n        data_type: INT\n"
+    )
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        indexer.reindex_dbt(repo_name="platform", project_path=str(upstream), dialect="duckdb")
+
+    # ── Downstream: sqlmesh repo selecting * from the dbt model ──
+    downstream_path = tmp_path / "finance"
+    downstream_path.mkdir()
+    downstream_models = {
+        '"finance"."orders"': (
+            "WITH orders AS (SELECT * FROM stg_orders) "
+            "SELECT customer_id FROM orders"
+        ),
+    }
+    with _mock_render_raw(indexer, downstream_models, {}):
+        indexer.reindex_sqlmesh("finance", downstream_path)
+
+    rows = db._execute_read(
+        "SELECT DISTINCT hop_table, hop_column "
+        "FROM column_lineage cl "
+        "JOIN files f ON cl.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? AND cl.output_node = ? AND cl.output_column = ?",
+        ["finance", "orders", "customer_id"],
+    ).fetchall()
+    hops = {(r[0], r[1]) for r in rows}
+    assert ("stg_orders", "customer_id") in hops, \
+        f"expected (stg_orders, customer_id) in chain, got {hops}"
+
 
 async def test_trace_column_lineage_mcp_tool_traverses_select_star(tmp_path):
     """AC #1: the MCP ``trace_column_lineage`` tool (not just the raw table)
@@ -2836,10 +2924,10 @@ def test_reindex_sqlmesh_populates_columns_table(tmp_path, caplog):
         ["platform"],
     ).fetchall()
 
-    assert len(rows) == 2, f"expected two column rows, got {rows}"
-    names = {(r[0], r[1], r[2], r[3]) for r in rows}
-    assert ("stg_orders", "customer_id", "INT", "sqlmesh_schema") in names
-    assert ("stg_orders", "order_id", "INT", "sqlmesh_schema") in names
+    assert rows == [
+        ("stg_orders", "customer_id", "INT", "sqlmesh_schema"),
+        ("stg_orders", "order_id", "INT", "sqlmesh_schema"),
+    ]
 
     assert not any(
         "Column def skipped: cannot resolve node" in rec.getMessage()
@@ -2886,7 +2974,7 @@ def test_insert_parse_result_resolves_query_kind_for_columns():
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    db = GraphDB()
+    db = GraphDB(":memory:")
     indexer = Indexer(db)
     repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sqlmesh")
 
@@ -2926,7 +3014,7 @@ def test_insert_parse_result_strips_qualified_column_def_names():
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
-    db = GraphDB()
+    db = GraphDB(":memory:")
     indexer = Indexer(db)
     repo_id = db.upsert_repo("platform", "/tmp/platform", repo_type="sqlmesh")
 

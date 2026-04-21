@@ -18,6 +18,7 @@ from pathlib import Path
 
 from sqlprism.core.conventions import ConventionEngine, TagAssignment
 from sqlprism.core.graph import GraphDB
+from sqlprism.core.naming import parse_qualified_name
 from sqlprism.languages import SQL_EXTENSIONS, is_sql_file
 from sqlprism.languages.sql import SqlParser
 from sqlprism.types import ParseResult
@@ -911,16 +912,37 @@ class Indexer:
         if result.column_usage:
             cu_rows = []
             for cu in result.column_usage:
-                # Try schema-aware lookup first, then fall back to schema=None
-                cu_node_id = node_id_map.get((cu.node_name, cu.node_kind, None))
-                if not cu_node_id:
-                    # Try all schemas for this (name, kind)
+                # Normalise fully-qualified names so quoted sqlmesh-style
+                # node_names resolve to their parser-stored base-name node.
+                cu_base, cu_schema = parse_qualified_name(cu.node_name)
+                cu_candidates = [cu_base] if cu_base == cu.node_name else [cu_base, cu.node_name]
+                cu_node_id = None
+                for cand in cu_candidates:
+                    # Schema-aware match first, then schema-agnostic.
+                    if cu_schema:
+                        cu_node_id = node_id_map.get((cand, cu.node_kind, cu_schema))
+                        if cu_node_id:
+                            break
+                    cu_node_id = node_id_map.get((cand, cu.node_kind, None))
+                    if cu_node_id:
+                        break
                     for key, nid in node_id_map.items():
-                        if key[0] == cu.node_name and key[1] == cu.node_kind:
+                        if key[0] == cand and key[1] == cu.node_kind:
                             cu_node_id = nid
                             break
+                    if cu_node_id:
+                        break
                 if not cu_node_id:
-                    cu_node_id = self.graph.resolve_node(cu.node_name, cu.node_kind, repo_id)
+                    for cand in cu_candidates:
+                        if cu_schema:
+                            cu_node_id = self.graph.resolve_node(
+                                cand, cu.node_kind, repo_id, schema=cu_schema,
+                            )
+                            if cu_node_id:
+                                break
+                        cu_node_id = self.graph.resolve_node(cand, cu.node_kind, repo_id)
+                        if cu_node_id:
+                            break
                 if cu_node_id:
                     cu_rows.append(
                         (
@@ -974,33 +996,11 @@ class Indexer:
 
         # ── Batch insert column definitions ──
         if result.columns:
-            # sqlmesh emits fully-qualified quoted names like
-            # '"platform"."stg_orders"', but the parser stores the bare base
-            # name. Normalise so both forms resolve to the same node.
-            # ``query`` is included because rendered sqlmesh models are bare
-            # ``SELECT`` statements — the file-level node ends up as kind=query.
-            allowed_kinds = ("table", "view", "source", "query")
             col_rows = []
             for col_def in result.columns:
-                raw_name = col_def.node_name
-                base_name = raw_name.replace('"."', ".").strip('"').rsplit(".", 1)[-1]
-                candidates = [base_name] if base_name == raw_name else [base_name, raw_name]
-                node_id = None
-                for name in candidates:
-                    for key, nid in node_id_map.items():
-                        if key[0] == name and key[1] in allowed_kinds:
-                            node_id = nid
-                            break
-                    if node_id:
-                        break
-                if not node_id:
-                    for name in candidates:
-                        for kind in allowed_kinds:
-                            node_id = self.graph.resolve_node(name, kind, repo_id)
-                            if node_id:
-                                break
-                        if node_id:
-                            break
+                node_id = self._resolve_column_def_node(
+                    col_def.node_name, node_id_map, repo_id,
+                )
                 if not node_id:
                     logger.warning(
                         "Column def skipped: cannot resolve node '%s' for column '%s'",
@@ -1021,6 +1021,56 @@ class Indexer:
             if col_rows:
                 self.graph.insert_columns_batch(col_rows)
             stats["columns_added"] += len(col_rows)
+
+    # Kinds a ``ColumnDefResult`` may legitimately target. ``query`` is
+    # included because rendered sqlmesh models are bare ``SELECT``s — the
+    # file-level node ends up as kind=query.
+    _COLUMN_DEF_KINDS = ("table", "view", "source", "query")
+
+    def _resolve_column_def_node(
+        self,
+        raw_name: str,
+        local_map: dict[tuple[str, str, str | None], int],
+        repo_id: int,
+    ) -> int | None:
+        """Resolve a ``ColumnDefResult`` target node to a node_id.
+
+        Parses fully-qualified forms like ``"platform"."stg_orders"`` into
+        a base name + schema and uses the schema as an exact-match filter
+        before falling back to schema-agnostic lookup. Restricted to the
+        current repo — a cross-repo match would silently attach column
+        rows to another repo's node.
+        """
+        base, schema = parse_qualified_name(raw_name)
+        candidates = [base] if base == raw_name else [base, raw_name]
+
+        # Local map lookup — prefer schema-aware match, then schema-agnostic.
+        for name in candidates:
+            for probe_schema in (schema, None) if schema else (None,):
+                for kind in self._COLUMN_DEF_KINDS:
+                    nid = local_map.get((name, kind, probe_schema))
+                    if nid is not None:
+                        return nid
+            for key, nid in local_map.items():
+                if key[0] == name and key[1] in self._COLUMN_DEF_KINDS:
+                    return nid
+
+        # Graph fallback — same-repo only. resolve_node's internal
+        # kind-relaxed fallback covers table/view/source/query in one call,
+        # so we don't iterate kinds here.
+        for name in candidates:
+            if schema:
+                nid = self.graph.resolve_node(
+                    name, "table", repo_id, schema=schema, same_repo_only=True,
+                )
+                if nid:
+                    return nid
+            nid = self.graph.resolve_node(
+                name, "table", repo_id, same_repo_only=True,
+            )
+            if nid:
+                return nid
+        return None
 
     def _resolve_edge_endpoint(
         self,

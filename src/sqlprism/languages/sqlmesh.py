@@ -19,6 +19,7 @@ import textwrap
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+from sqlprism.core.naming import parse_qualified_name
 from sqlprism.languages.sql import SqlParser
 from sqlprism.languages.utils import build_env, enrich_nodes, find_venv_dir
 from sqlprism.types import ColumnDefResult, ParseResult
@@ -122,8 +123,8 @@ def _model_table_keys(model_name: str) -> list[str]:
     Downstream SQL may reference either the fully-qualified form or the bare
     base name, so populate both so ``qualify_columns`` resolves in either case.
     """
+    base, _schema = parse_qualified_name(model_name)
     stripped = model_name.replace('"."', ".").strip('"')
-    base = stripped.rsplit(".", 1)[-1]
     return [stripped] if stripped == base else [stripped, base]
 
 

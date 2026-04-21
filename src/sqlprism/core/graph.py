@@ -825,6 +825,7 @@ class GraphDB:
         kind: str,
         repo_id: int | None = None,
         schema: str | None = None,
+        same_repo_only: bool = False,
     ) -> int | None:
         """Find a node by name and kind.
 
@@ -849,9 +850,13 @@ class GraphDB:
             name: Unqualified entity name.
             kind: Node kind to match.
             repo_id: Prefer nodes from this repo. Falls back to cross-repo
-                search if not found.
+                search if not found (unless ``same_repo_only`` is set).
             schema: Optional schema qualifier. When provided, only nodes
                 with a matching ``schema`` column are returned.
+            same_repo_only: Skip cross-repo steps 2 and 4. Callers that
+                persist data against the resolved node (e.g. column-def
+                inserts) must use this to avoid attaching rows to a
+                different repo's node.
 
         Returns:
             The ``node_id`` if found, otherwise ``None``.
@@ -873,13 +878,14 @@ class GraphDB:
             if row:
                 return row[0]
 
-        # 2. Exact kind match cross-repo
-        row = self._execute_read(
-            "SELECT n.node_id FROM nodes n WHERE n.name = ? AND n.kind = ?" + schema_clause + " LIMIT 1",
-            [name, kind] + schema_params,
-        ).fetchone()
-        if row:
-            return row[0]
+        if not same_repo_only:
+            # 2. Exact kind match cross-repo
+            row = self._execute_read(
+                "SELECT n.node_id FROM nodes n WHERE n.name = ? AND n.kind = ?" + schema_clause + " LIMIT 1",
+                [name, kind] + schema_params,
+            ).fetchone()
+            if row:
+                return row[0]
 
         # 3. Kind-relaxed: match by name only, prefer real nodes (file_id IS NOT NULL).
         # Secondary rank (when requested kind doesn't match): table > view > query;
@@ -897,6 +903,9 @@ class GraphDB:
             ).fetchone()
             if row:
                 return row[0]
+
+        if same_repo_only:
+            return None
 
         # 4. Kind-relaxed cross-repo
         row = self._execute_read(
