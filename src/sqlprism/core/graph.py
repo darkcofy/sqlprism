@@ -1657,6 +1657,14 @@ class GraphDB:
         name, and omitting those would hide the headline use case of
         cross-repo impact analysis (#131).
 
+        **Name-collision caveat**: downstream discovery matches on node
+        *name*, so two repos that independently define unrelated models
+        with the same name will be conflated — consumers of repo B's
+        ``users`` are reported as impacts on repo A's ``users``. This is
+        the same tradeoff made by the trace traversal; naming should be
+        globally unique within a federated project or impact results
+        will include false positives.
+
         Args:
             model: The model/table name whose columns are changing.
             changes: List of change dicts.  Supported actions:
@@ -1713,6 +1721,20 @@ class GraphDB:
             [model],
         ).fetchall()
         target_ids = [r[0] for r in same_name_rows]
+        if not target_ids:
+            # Producer existed at the first lookup but no same-name nodes
+            # remain — nothing reachable, return an empty shape rather
+            # than building `IN ()` which DuckDB rejects.
+            return {
+                "model": model,
+                "model_found": True,
+                "changes_analyzed": len(changes),
+                "impacts": [
+                    {"change": c, "breaking": [], "warnings": [], "safe": []}
+                    for c in changes
+                ],
+                "summary": {"total_breaking": 0, "total_warnings": 0, "total_safe": 0},
+            }
         placeholders = ", ".join("?" for _ in target_ids)
 
         # Fetch downstream models via edges, excluding the model itself
@@ -2932,7 +2954,12 @@ class GraphDB:
             kind: Optional node kind filter for the starting node.
             direction: ``"downstream"``, ``"upstream"``, or ``"both"``.
             max_depth: Maximum hops to follow (capped at 10).
-            repo: Optional repo name filter.
+            repo: Accepted for API parity with other query methods but
+                **not applied to traversal** — the walk is over the
+                name-quotient graph, which deliberately crosses repo
+                boundaries so cross-project shadow refs resolve (#131).
+                Results attribute each hop to its representative node's
+                repo, and ``repos_affected`` reports every repo touched.
             include_snippets: Attach source code snippets when ``True``.
             limit: Maximum result rows.
             exclude_edges: Optional set of ``(source_name, target_name)``
@@ -2998,12 +3025,16 @@ class GraphDB:
         # collapse into one logical hop). One CTE call covers all start
         # nodes with the given name — the recursive step naturally
         # unifies same-name shadows regardless of which repo they live in.
+        #
+        # Over-fetch so the post-SQL ``_is_noise_node`` filter can drop
+        # dbt-test/CTE rows without truncating the final result below
+        # ``limit`` when noisy rows happen to sort ahead of useful ones.
         raw_paths = self._trace_cte(
             name,
             kind,
             direction,
             max_depth,
-            limit,
+            limit * 2,
             include_snippets,
             exclude_edges,
             include_query_local_starts=include_query_local_starts,
@@ -3148,6 +3179,9 @@ class GraphDB:
                 e.relationship,
                 e.context,
                 1 AS depth,
+                -- path_names tracks names (not node_ids) so same-name
+                -- shadows collapse for cycle detection — the semantic
+                -- pivot that makes cross-repo shadow refs resolve (#131).
                 [{seed_side_col}.name]::VARCHAR[] AS path_names
             FROM edges e
             JOIN nodes ns ON ns.node_id = e.source_id
@@ -3176,29 +3210,47 @@ class GraphDB:
             {dataflow_clause}
             {exclude_clause}
         ),
-        ranked AS (
+        -- Pick ONE representative node per hop_name globally — so that
+        -- a hop reached through a shadow in repo B still attributes to
+        -- the defining node in repo A (where it actually lives). This
+        -- is what a user expects: the walk reports "stg_order_items in
+        -- platform", not "stg_order_items via finance-shadow-of-it".
+        -- Rank: real over phantom, kind rank (table > view > query),
+        -- deterministic node_id.
+        best_node AS (
             SELECT
-                t.hop_name,
-                n.kind AS rep_kind,
-                n.language AS rep_language,
-                t.relationship,
-                t.context,
-                t.depth,
+                n.name, n.kind, n.language, n.line_start, n.line_end,
                 f.path AS file_path,
                 r.name AS repo_name,
-                n.line_start, n.line_end,
                 ROW_NUMBER() OVER (
-                    PARTITION BY COALESCE(r.name, ''), t.hop_name
+                    PARTITION BY n.name
                     ORDER BY
-                        t.depth ASC,
                         CASE WHEN n.file_id IS NULL THEN 1 ELSE 0 END,
                         {kind_rank},
                         n.node_id
-                ) AS rn
-            FROM trace t
-            JOIN nodes n ON n.node_id = t.hop_node_id
+                ) AS node_rn
+            FROM nodes n
             LEFT JOIN files f ON n.file_id = f.file_id
             LEFT JOIN repos r ON f.repo_id = r.repo_id
+        ),
+        ranked AS (
+            SELECT
+                t.hop_name,
+                best.kind AS rep_kind,
+                best.language AS rep_language,
+                t.relationship,
+                t.context,
+                t.depth,
+                best.file_path,
+                best.repo_name,
+                best.line_start, best.line_end,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.hop_name
+                    ORDER BY t.depth ASC
+                ) AS rn
+            FROM trace t
+            LEFT JOIN best_node best
+                ON best.name = t.hop_name AND best.node_rn = 1
         )
         SELECT
             hop_name, rep_kind, rep_language,
