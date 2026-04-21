@@ -2713,15 +2713,9 @@ def test_reindex_sqlmesh_cross_repo_select_star_lineage_via_sql_upstream(tmp_pat
         f"expected (stg_orders, customer_id) in chain, got {hops}"
 
 
-@pytest.mark.xfail(
-    reason="Blocked by #124 (sqlmesh column defs dropped on insert) and #125 "
-           "(dbt column defs never produced). The in-parse schema catalog "
-           "doesn't reach a sibling repo through the graph until columns are "
-           "persisted on the upstream side.",
-    strict=True,
-)
 def test_reindex_sqlmesh_cross_repo_select_star_lineage_true_mesh(tmp_path):
-    """True sqlmesh→sqlmesh mesh — pinned as xfail until #124 persists columns."""
+    """True sqlmesh→sqlmesh mesh — upstream column persistence (#124) carries
+    types into the downstream schema catalog via the graph."""
     from sqlprism.core.graph import GraphDB
     from sqlprism.core.indexer import Indexer
 
@@ -2739,6 +2733,94 @@ def test_reindex_sqlmesh_cross_repo_select_star_lineage_true_mesh(tmp_path):
     with _mock_render_raw(indexer, upstream_models, upstream_schemas):
         indexer.reindex_sqlmesh("platform", upstream_path)
 
+    downstream_path = tmp_path / "finance"
+    downstream_path.mkdir()
+    downstream_models = {
+        '"finance"."orders"': (
+            "WITH orders AS (SELECT * FROM stg_orders) "
+            "SELECT customer_id FROM orders"
+        ),
+    }
+    with _mock_render_raw(indexer, downstream_models, {}):
+        indexer.reindex_sqlmesh("finance", downstream_path)
+
+    rows = db._execute_read(
+        "SELECT DISTINCT hop_table, hop_column "
+        "FROM column_lineage cl "
+        "JOIN files f ON cl.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? AND cl.output_node = ? AND cl.output_column = ?",
+        ["finance", "orders", "customer_id"],
+    ).fetchall()
+    hops = {(r[0], r[1]) for r in rows}
+    assert ("stg_orders", "customer_id") in hops, \
+        f"expected (stg_orders, customer_id) in chain, got {hops}"
+
+    # Upstream INT types must persist cross-repo — catches the regression
+    # where columns fall back to TEXT from the column_usage path.
+    upstream_repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["platform"]
+    ).fetchone()[0]
+    catalog = db.get_table_columns(upstream_repo_id)
+    assert catalog.get("stg_orders", {}).get("customer_id") == "INT", \
+        f"expected INT type to survive, got {catalog.get('stg_orders')}"
+
+
+@pytest.mark.xfail(
+    reason="Blocked by #125 — reindex_dbt never produces ColumnDefResult from "
+           "schema.yml / catalog.json, so upstream dbt types can't feed a "
+           "downstream sibling repo's schema catalog. Preserves the dbt-mesh "
+           "regression signal the original #124/#125 xfail carried.",
+    strict=True,
+)
+def test_reindex_dbt_cross_repo_select_star_lineage_true_mesh(tmp_path):
+    """True dbt→sqlmesh mesh — pinned as xfail until #125 persists dbt columns."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    # ── Upstream: minimal dbt project with a single staging model ──
+    upstream = tmp_path / "platform"
+    upstream.mkdir()
+    (upstream / "dbt_project.yml").write_text("name: platform\n")
+    (upstream / ".venv").mkdir()
+    compiled = upstream / "target" / "compiled" / "platform" / "models" / "staging"
+    compiled.mkdir(parents=True)
+    (compiled / "stg_orders.sql").write_text(
+        "SELECT customer_id, order_id FROM raw.orders"
+    )
+    manifest = {
+        "nodes": {
+            "model.platform.stg_orders": {
+                "resource_type": "model",
+                "package_name": "platform",
+                "name": "stg_orders",
+                "path": "staging/stg_orders.sql",
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {},
+    }
+    (upstream / "target" / "manifest.json").write_text(json.dumps(manifest))
+    # schema.yml declares column types — #125 gap: this isn't persisted today.
+    (upstream / "models" / "staging").mkdir(parents=True)
+    (upstream / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\nmodels:\n"
+        "  - name: stg_orders\n"
+        "    columns:\n"
+        "      - name: customer_id\n        data_type: INT\n"
+        "      - name: order_id\n        data_type: INT\n"
+    )
+    with patch("sqlprism.languages.dbt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        indexer.reindex_dbt(repo_name="platform", project_path=str(upstream), dialect="duckdb")
+
+    # ── Downstream: sqlmesh repo selecting * from the dbt model ──
     downstream_path = tmp_path / "finance"
     downstream_path.mkdir()
     downstream_models = {
@@ -2810,3 +2892,173 @@ async def test_trace_column_lineage_mcp_tool_traverses_select_star(tmp_path):
     payload = repr(result)
     assert "stg_orders" in payload, f"stg_orders missing from trace: {payload}"
     assert "customer_id" in payload, f"customer_id missing from trace: {payload}"
+
+
+def test_reindex_sqlmesh_populates_columns_table(tmp_path, caplog):
+    """sqlmesh column_schemas land in the `columns` table under source='sqlmesh_schema'."""
+    import logging
+
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    raw_models = {
+        '"platform"."stg_orders"': "SELECT customer_id, order_id FROM raw.orders",
+    }
+    column_schemas = {
+        '"platform"."stg_orders"': {"customer_id": "INT", "order_id": "INT"},
+    }
+
+    with caplog.at_level(logging.WARNING, logger="sqlprism.core.indexer"):
+        with _mock_render_raw(indexer, raw_models, column_schemas):
+            indexer.reindex_sqlmesh("platform", tmp_path)
+
+    rows = db._execute_read(
+        "SELECT n.name, c.column_name, c.data_type, c.source "
+        "FROM columns c JOIN nodes n ON c.node_id = n.node_id "
+        "JOIN files f ON n.file_id = f.file_id "
+        "JOIN repos r ON f.repo_id = r.repo_id "
+        "WHERE r.name = ? ORDER BY c.column_name",
+        ["platform"],
+    ).fetchall()
+
+    assert rows == [
+        ("stg_orders", "customer_id", "INT", "sqlmesh_schema"),
+        ("stg_orders", "order_id", "INT", "sqlmesh_schema"),
+    ]
+
+    assert not any(
+        "Column def skipped: cannot resolve node" in rec.getMessage()
+        for rec in caplog.records
+    ), f"unexpected skip warning(s): {[r.getMessage() for r in caplog.records]}"
+
+    db.close()
+
+
+def test_sqlmesh_columns_visible_in_schema_catalog(tmp_path):
+    """GraphDB.get_table_columns returns real sqlmesh types, not the TEXT fallback."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+
+    raw_models = {
+        '"platform"."stg_orders"': "SELECT customer_id, order_id FROM raw.orders",
+    }
+    column_schemas = {
+        '"platform"."stg_orders"': {"customer_id": "INT", "order_id": "INT"},
+    }
+
+    with _mock_render_raw(indexer, raw_models, column_schemas):
+        indexer.reindex_sqlmesh("platform", tmp_path)
+
+    repo_id = db._execute_read(
+        "SELECT repo_id FROM repos WHERE name = ?", ["platform"]
+    ).fetchone()[0]
+
+    catalog = db.get_table_columns(repo_id)
+
+    assert "stg_orders" in catalog, f"stg_orders missing from catalog: {catalog}"
+    assert catalog["stg_orders"].get("customer_id") == "INT", \
+        f"expected customer_id=INT, got {catalog['stg_orders']}"
+    assert catalog["stg_orders"].get("order_id") == "INT"
+
+    db.close()
+
+
+def test_insert_parse_result_resolves_query_kind_for_columns():
+    """A kind='query' node is a valid target for a ColumnDefResult insert."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+    repo_id = db.upsert_repo("test", "/tmp/test", repo_type="sqlmesh")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "stg_orders.sql", "sql", "abc")
+
+    result = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="query", name="stg_orders")],
+        columns=[
+            ColumnDefResult(
+                node_name="stg_orders", column_name="customer_id",
+                data_type="INT", position=0, source="sqlmesh_schema",
+            ),
+        ],
+    )
+    stats = {
+        "nodes_added": 0, "edges_added": 0, "column_usage_added": 0,
+        "columns_added": 0, "lineage_chains": 0,
+    }
+
+    with db.write_transaction():
+        indexer._insert_parse_result(result, file_id, repo_id, stats)
+
+    rows = db._execute_read(
+        "SELECT n.name, n.kind, c.column_name, c.data_type, c.source "
+        "FROM columns c JOIN nodes n ON c.node_id = n.node_id"
+    ).fetchall()
+    assert rows == [("stg_orders", "query", "customer_id", "INT", "sqlmesh_schema")]
+    assert stats["columns_added"] == 1
+
+    db.close()
+
+
+def test_insert_parse_result_strips_qualified_column_def_names():
+    """Fully-qualified ColumnDefResult.node_name resolves to an existing base-name node."""
+    from sqlprism.core.graph import GraphDB
+    from sqlprism.core.indexer import Indexer
+
+    db = GraphDB(":memory:")
+    indexer = Indexer(db)
+    repo_id = db.upsert_repo("platform", "/tmp/platform", repo_type="sqlmesh")
+
+    with db.write_transaction():
+        file_id = db.insert_file(repo_id, "stg_orders.sql", "sql", "abc")
+
+    # First pass: create the node under the bare base name.
+    seed = ParseResult(
+        language="sql",
+        nodes=[NodeResult(kind="query", name="stg_orders")],
+    )
+    seed_stats = {
+        "nodes_added": 0, "edges_added": 0, "column_usage_added": 0,
+        "columns_added": 0, "lineage_chains": 0,
+    }
+    with db.write_transaction():
+        indexer._insert_parse_result(seed, file_id, repo_id, seed_stats)
+
+    # Second pass: ColumnDefResult uses the fully-qualified form.
+    with db.write_transaction():
+        file_id2 = db.insert_file(repo_id, "stg_orders_cols.sql", "sql", "def")
+    defs = ParseResult(
+        language="sql",
+        columns=[
+            ColumnDefResult(
+                node_name='"platform"."stg_orders"', column_name="customer_id",
+                data_type="INT", position=0, source="sqlmesh_schema",
+            ),
+        ],
+    )
+    stats = {
+        "nodes_added": 0, "edges_added": 0, "column_usage_added": 0,
+        "columns_added": 0, "lineage_chains": 0,
+    }
+    with db.write_transaction():
+        indexer._insert_parse_result(defs, file_id2, repo_id, stats)
+
+    node_id = db._execute_read(
+        "SELECT node_id FROM nodes WHERE name = 'stg_orders' AND kind = 'query'"
+    ).fetchone()[0]
+    rows = db._execute_read(
+        "SELECT node_id, column_name, data_type, source FROM columns"
+    ).fetchall()
+    assert rows == [(node_id, "customer_id", "INT", "sqlmesh_schema")]
+    assert stats["columns_added"] == 1
+
+    db.close()
