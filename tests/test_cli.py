@@ -506,8 +506,12 @@ def test_reindex_handler_prints_sqlmesh_stats_line(tmp_path):
 def test_query_subcommand_db_missing_writes_to_stderr(tmp_path, cmd):
     """`_open_graph_for_read` default routes 'No index found' to stderr for query subcommands."""
     missing_db = tmp_path / "nonexistent.duckdb"
+    config_path = tmp_path / "sqlprism.json"
+    config_path.write_text(json.dumps({"repos": {}}))
     runner = CliRunner()
-    result = runner.invoke(cli, [*cmd, "--db", str(missing_db)])
+    result = runner.invoke(
+        cli, [*cmd, "--config", str(config_path), "--db", str(missing_db)]
+    )
     assert result.exit_code == 1
     assert "No index found" in result.stderr
     assert "No index found" not in result.stdout
@@ -525,8 +529,12 @@ def test_query_subcommand_db_missing_writes_to_stderr(tmp_path, cmd):
 def test_legacy_stdout_commands_keep_db_missing_on_stdout(tmp_path, cmd):
     """status + conventions.* preserve the legacy 'No index found' → stdout routing."""
     missing_db = tmp_path / "nonexistent.duckdb"
+    config_path = tmp_path / "sqlprism.json"
+    config_path.write_text(json.dumps({"repos": {}}))
     runner = CliRunner()
-    result = runner.invoke(cli, [*cmd, "--db", str(missing_db)])
+    result = runner.invoke(
+        cli, [*cmd, "--config", str(config_path), "--db", str(missing_db)]
+    )
     assert result.exit_code == 1
     assert "No index found" in result.stdout
     assert "No index found" not in result.stderr
