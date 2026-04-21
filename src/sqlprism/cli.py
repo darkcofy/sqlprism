@@ -754,30 +754,31 @@ _REINDEX_HANDLERS: dict[str, Callable[..., list[str]]] = {
 }
 
 
+# (config_key, repo_type, path_key) — path_key is None for "sql" because
+# those configs already carry a "path" field directly.
+_REPO_TYPE_SPECS: tuple[tuple[str, str, str | None], ...] = (
+    ("repos", "sql", None),
+    ("dbt_repos", "dbt", "project_path"),
+    ("sqlmesh_repos", "sqlmesh", "project_path"),
+)
+
+
 def _build_repo_configs(config: dict) -> dict:
     """Merge repos, dbt_repos, sqlmesh_repos into a single dict with repo_type tags.
 
     Preserves full config for dbt/sqlmesh so reindex_files() can access
     renderer params (profiles_dir, env_file, target, variables, etc.).
     """
-    result = {}
-    for name, cfg in config.get("repos", {}).items():
-        if isinstance(cfg, dict):
-            result[name] = {**cfg, "repo_type": "sql"}
-        else:
-            result[name] = {"path": cfg, "repo_type": "sql"}
-    for name, cfg in config.get("dbt_repos", {}).items():
-        if isinstance(cfg, dict):
-            path = cfg["project_path"]
-            result[name] = {**cfg, "path": path, "repo_type": "dbt"}
-        else:
-            result[name] = {"path": cfg, "repo_type": "dbt"}
-    for name, cfg in config.get("sqlmesh_repos", {}).items():
-        if isinstance(cfg, dict):
-            path = cfg["project_path"]
-            result[name] = {**cfg, "path": path, "repo_type": "sqlmesh"}
-        else:
-            result[name] = {"path": cfg, "repo_type": "sqlmesh"}
+    result: dict[str, dict] = {}
+    for config_key, repo_type, path_key in _REPO_TYPE_SPECS:
+        for name, cfg in config.get(config_key, {}).items():
+            if isinstance(cfg, dict):
+                entry = {**cfg, "repo_type": repo_type}
+                if path_key is not None:
+                    entry["path"] = cfg[path_key]
+                result[name] = entry
+            else:
+                result[name] = {"path": cfg, "repo_type": repo_type}
     return result
 
 
